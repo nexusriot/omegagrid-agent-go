@@ -64,6 +64,16 @@ CRITICAL RULES:
   (e.g. "check SSL cert", "convert currency"), use skill_creator to create a new
   skill first, then call it.`
 
+// Attachment is a binary artifact produced by a tool (e.g. a QR code image).
+// It is carried through the streaming pipeline and handed to the final consumer
+// (Telegram bot, HTTP client, etc.) without going through the LLM.
+type Attachment struct {
+	Type     string `json:"type"`      // "image"
+	Filename string `json:"filename"`  // "qr_code.png"
+	MimeType string `json:"mime_type"` // "image/png"
+	Base64   string `json:"base64"`    // raw base64 data
+}
+
 // Skill is the tool-table entry.  Built-ins (vector_add, vector_search,
 // schedule_task) and Python sidecar skills are merged into one map.
 type Skill struct {
@@ -93,26 +103,28 @@ type RunRequest struct {
 
 // RunResult is what Run returns (mirrors the Python dict).
 type RunResult struct {
-	SessionID int                `json:"session_id"`
-	Answer    string             `json:"answer"`
-	Meta      map[string]any     `json:"meta"`
-	Memories  []memory.MemoryHit `json:"memories"`
-	DebugLog  string             `json:"debug_log"`
+	SessionID   int                `json:"session_id"`
+	Answer      string             `json:"answer"`
+	Meta        map[string]any     `json:"meta"`
+	Memories    []memory.MemoryHit `json:"memories"`
+	DebugLog    string             `json:"debug_log"`
+	Attachments []Attachment       `json:"attachments,omitempty"`
 }
 
 // Event is one streamed step in RunStream.
 type Event struct {
-	Event     string         `json:"event"`
-	Step      int            `json:"step,omitempty"`
-	Tool      string         `json:"tool,omitempty"`
-	Args      map[string]any `json:"args,omitempty"`
-	Why       string         `json:"why,omitempty"`
-	Result    string         `json:"result,omitempty"`
-	ElapsedS  float64        `json:"elapsed_s,omitempty"`
-	SessionID int            `json:"session_id,omitempty"`
-	Answer    string         `json:"answer,omitempty"`
-	Meta      map[string]any `json:"meta,omitempty"`
-	Error     string         `json:"error,omitempty"`
+	Event       string         `json:"event"`
+	Step        int            `json:"step,omitempty"`
+	Tool        string         `json:"tool,omitempty"`
+	Args        map[string]any `json:"args,omitempty"`
+	Why         string         `json:"why,omitempty"`
+	Result      string         `json:"result,omitempty"`
+	ElapsedS    float64        `json:"elapsed_s,omitempty"`
+	SessionID   int            `json:"session_id,omitempty"`
+	Answer      string         `json:"answer,omitempty"`
+	Meta        map[string]any `json:"meta,omitempty"`
+	Error       string         `json:"error,omitempty"`
+	Attachments []Attachment   `json:"attachments,omitempty"`
 }
 
 // Run executes the agent loop end-to-end and returns one final result.
@@ -195,6 +207,12 @@ func (s *Service) Run(req RunRequest) (*RunResult, error) {
 			state.debug = append(state.debug, fmt.Sprintf("[%s] ERROR unknown name '%s'", kind, toolName))
 		}
 
+		// Extract binary attachments (images etc.) before feeding result to LLM.
+		if atts, cleaned := extractAttachments(toolName, result); len(atts) > 0 {
+			state.attachments = append(state.attachments, atts...)
+			result = cleaned
+		}
+
 		// Persist tool result and feed back into the LLM context
 		_ = s.Memory.AddMessage(state.sid, "tool", result)
 		assistantJSON, _ := json.Marshal(data)
@@ -246,10 +264,11 @@ func (s *Service) RunStream(req RunRequest, out chan<- Event) {
 			answer := finalAnswer(data)
 			_ = s.Memory.AddMessage(state.sid, "assistant", answer)
 			out <- Event{
-				Event:     "final",
-				SessionID: state.sid,
-				Answer:    answer,
-				Meta:      s.buildMeta(state, step, false),
+				Event:       "final",
+				SessionID:   state.sid,
+				Answer:      answer,
+				Meta:        s.buildMeta(state, step, false),
+				Attachments: state.attachments,
 			}
 			return
 		}
@@ -259,10 +278,11 @@ func (s *Service) RunStream(req RunRequest, out chan<- Event) {
 			meta := s.buildMeta(state, step, false)
 			meta["fallback"] = true
 			out <- Event{
-				Event:     "final",
-				SessionID: state.sid,
-				Answer:    answer,
-				Meta:      meta,
+				Event:       "final",
+				SessionID:   state.sid,
+				Answer:      answer,
+				Meta:        meta,
+				Attachments: state.attachments,
 			}
 			return
 		}
@@ -295,6 +315,12 @@ func (s *Service) RunStream(req RunRequest, out chan<- Event) {
 			result = map[string]any{"error": "Unknown tool/skill: " + toolName, "available": keys(state.tools)}
 		}
 
+		// Extract binary attachments before feeding result to LLM.
+		if atts, cleaned := extractAttachments(toolName, result); len(atts) > 0 {
+			state.attachments = append(state.attachments, atts...)
+			result = cleaned
+		}
+
 		out <- Event{Event: "tool_result", Step: step, Tool: toolName, Result: truncate(fmt.Sprint(result), 300), ElapsedS: round3(elapsed)}
 
 		_ = s.Memory.AddMessage(state.sid, "tool", result)
@@ -311,19 +337,20 @@ func (s *Service) RunStream(req RunRequest, out chan<- Event) {
 	_ = s.Memory.AddMessage(state.sid, "assistant", answer)
 	meta := s.buildMeta(state, req.MaxSteps, false)
 	meta["max_steps_hit"] = true
-	out <- Event{Event: "final", SessionID: state.sid, Answer: answer, Meta: meta}
+	out <- Event{Event: "final", SessionID: state.sid, Answer: answer, Meta: meta, Attachments: state.attachments}
 }
 
 type runState struct {
-	sid        int
-	timings    map[string]float64
-	timer      *observability.Timer
-	debug      []string
-	messages   []llm.Message
-	memories   []memory.MemoryHit
-	tools      map[string]Skill
-	skillNames map[string]bool
-	toolNames  map[string]bool // includes built-in tools, used by normalizeToolCall
+	sid         int
+	timings     map[string]float64
+	timer       *observability.Timer
+	debug       []string
+	messages    []llm.Message
+	memories    []memory.MemoryHit
+	attachments []Attachment
+	tools       map[string]Skill
+	skillNames  map[string]bool
+	toolNames   map[string]bool // includes built-in tools, used by normalizeToolCall
 }
 
 func (s *Service) startSession(req RunRequest) (*runState, error) {
@@ -466,11 +493,12 @@ func (s *Service) startSession(req RunRequest) (*runState, error) {
 func (s *Service) fallbackResult(st *runState, answer string, step int, fallback bool) *RunResult {
 	meta := s.buildMeta(st, step, fallback)
 	return &RunResult{
-		SessionID: st.sid,
-		Answer:    answer,
-		Meta:      meta,
-		Memories:  st.memories,
-		DebugLog:  strings.Join(st.debug, "\n"),
+		SessionID:   st.sid,
+		Answer:      answer,
+		Meta:        meta,
+		Memories:    st.memories,
+		DebugLog:    strings.Join(st.debug, "\n"),
+		Attachments: st.attachments,
 	}
 }
 
@@ -683,4 +711,51 @@ func asFloat(v any) float64 {
 
 func round3(v float64) float64 {
 	return float64(int64(v*1000+0.5)) / 1000
+}
+
+// extractAttachments inspects a tool result for binary artifacts (images) and
+// returns them as Attachment values.  The original result map is modified
+// in-place: the heavy base64 payload is replaced with a short human-readable
+// summary so the LLM context doesn't blow up.
+func extractAttachments(toolName string, result any) ([]Attachment, any) {
+	m, ok := result.(map[string]any)
+	if !ok {
+		return nil, result
+	}
+
+	b64, hasB64 := m["image_base64"].(string)
+	if !hasB64 || b64 == "" {
+		return nil, result
+	}
+
+	format, _ := m["image_format"].(string)
+	if format == "" {
+		format = "png"
+	}
+	mime := "image/" + format
+	filename := toolName + "." + format
+
+	sizeBytes := 0
+	if v, ok := m["size_bytes"]; ok {
+		sizeBytes = int(asFloat(v))
+	}
+
+	att := Attachment{
+		Type:     "image",
+		Filename: filename,
+		MimeType: mime,
+		Base64:   b64,
+	}
+
+	// Replace the heavy fields with a compact summary for the LLM context.
+	delete(m, "image_base64")
+	delete(m, "data_uri")
+	m["_image_attached"] = true
+	if sizeBytes > 0 {
+		m["_image_summary"] = fmt.Sprintf("%s image generated (%s, %d bytes) — will be delivered to user as a file", toolName, format, sizeBytes)
+	} else {
+		m["_image_summary"] = fmt.Sprintf("%s image generated (%s) — will be delivered to user as a file", toolName, format)
+	}
+
+	return []Attachment{att}, m
 }

@@ -1,6 +1,7 @@
 package telegram
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -309,6 +310,11 @@ func (b *Bot) processAgentText(chatID int64, text string, askMode bool) {
 	}
 
 	b.setSession(chatID, final.SessionID)
+
+	// Send binary attachments (images, etc.) as separate Telegram messages
+	// before the text answer so the user sees the media first.
+	b.sendAttachments(chatID, final.Attachments)
+
 	out := final.Answer
 	if askMode {
 		model, _ := final.Meta["model"].(string)
@@ -348,6 +354,36 @@ func renderStatus(events []Event) string {
 func (b *Bot) send(chatID int64, text string) {
 	if _, err := b.api.Send(tgbotapi.NewMessage(chatID, text)); err != nil {
 		log.Printf("send: %v", err)
+	}
+}
+
+// sendAttachments decodes base64 binary artifacts and sends them as Telegram
+// photos (or documents for non-image types).
+func (b *Bot) sendAttachments(chatID int64, attachments []Attachment) {
+	for _, att := range attachments {
+		raw, err := base64.StdEncoding.DecodeString(att.Base64)
+		if err != nil {
+			log.Printf("attachment decode error (%s): %v", att.Filename, err)
+			continue
+		}
+		fb := tgbotapi.FileBytes{Name: att.Filename, Bytes: raw}
+
+		if att.Type == "image" {
+			photo := tgbotapi.NewPhoto(chatID, fb)
+			if _, err := b.api.Send(photo); err != nil {
+				log.Printf("send photo (%s): %v", att.Filename, err)
+				// Fall back to sending as document if photo fails.
+				doc := tgbotapi.NewDocument(chatID, fb)
+				if _, err := b.api.Send(doc); err != nil {
+					log.Printf("send document fallback (%s): %v", att.Filename, err)
+				}
+			}
+		} else {
+			doc := tgbotapi.NewDocument(chatID, fb)
+			if _, err := b.api.Send(doc); err != nil {
+				log.Printf("send document (%s): %v", att.Filename, err)
+			}
+		}
 	}
 }
 

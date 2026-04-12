@@ -26,18 +26,27 @@ func NewAgentClient(baseURL string) *AgentClient {
 	}
 }
 
+// Attachment mirrors agent.Attachment.
+type Attachment struct {
+	Type     string `json:"type"`
+	Filename string `json:"filename"`
+	MimeType string `json:"mime_type"`
+	Base64   string `json:"base64"`
+}
+
 // Event mirrors agent.Event for the few fields the bot actually displays.
 type Event struct {
-	Event     string         `json:"event"`
-	Step      int            `json:"step"`
-	Tool      string         `json:"tool"`
-	Why       string         `json:"why"`
-	Result    string         `json:"result"`
-	ElapsedS  float64        `json:"elapsed_s"`
-	SessionID int            `json:"session_id"`
-	Answer    string         `json:"answer"`
-	Meta      map[string]any `json:"meta"`
-	Error     string         `json:"error"`
+	Event       string         `json:"event"`
+	Step        int            `json:"step"`
+	Tool        string         `json:"tool"`
+	Why         string         `json:"why"`
+	Result      string         `json:"result"`
+	ElapsedS    float64        `json:"elapsed_s"`
+	SessionID   int            `json:"session_id"`
+	Answer      string         `json:"answer"`
+	Meta        map[string]any `json:"meta"`
+	Error       string         `json:"error"`
+	Attachments []Attachment   `json:"attachments,omitempty"`
 }
 
 type queryRequest struct {

@@ -16,10 +16,10 @@ type queryRequest struct {
 	TelegramChatID *int64 `json:"telegram_chat_id,omitempty"`
 }
 
-func (req queryRequest) toAgentReq() agent.RunRequest {
+func (req queryRequest) toAgentReq(defaultMaxSteps int) agent.RunRequest {
 	maxSteps := req.MaxSteps
 	if maxSteps == 0 {
-		maxSteps = 10
+		maxSteps = defaultMaxSteps
 	}
 	remember := true
 	if req.Remember != nil {
@@ -44,7 +44,7 @@ func (d *Deps) handleQuery(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "query is required")
 		return
 	}
-	res, err := d.Agent.Run(req.toAgentReq())
+	res, err := d.Agent.Run(req.toAgentReq(d.Cfg.AgentMaxSteps))
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{
 			"error": err.Error(),
@@ -81,7 +81,7 @@ func (d *Deps) handleQueryStream(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 
 	events := make(chan agent.Event, 16)
-	go d.Agent.RunStream(req.toAgentReq(), events)
+	go d.Agent.RunStream(req.toAgentReq(d.Cfg.AgentMaxSteps), events)
 
 	ctx := r.Context()
 	for {

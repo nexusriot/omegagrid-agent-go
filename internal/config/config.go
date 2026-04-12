@@ -30,8 +30,9 @@ type Config struct {
 	OpenAIReasoning      string
 
 	// Agent loop
-	ContextTail int
-	MemoryHits  int
+	ContextTail   int
+	MemoryHits    int
+	AgentMaxSteps int
 
 	// Scheduler
 	SchedulerDB         string
@@ -56,6 +57,7 @@ func Load() Config {
 		OpenAIReasoning:  strings.ToLower(strings.TrimSpace(os.Getenv("OPENAI_REASONING_EFFORT"))),
 		ContextTail:      atoiOr(os.Getenv("AGENT_CONTEXT_TAIL"), 30),
 		MemoryHits:       atoiOr(os.Getenv("AGENT_MEMORY_HITS"), 5),
+		AgentMaxSteps:    atoiOr(os.Getenv("AGENT_MAX_STEPS"), 25),
 		SchedulerTickSec: atoiOr(os.Getenv("SCHEDULER_TICK_SEC"), 60),
 		TelegramBotToken: os.Getenv("TELEGRAM_BOT_TOKEN"),
 	}

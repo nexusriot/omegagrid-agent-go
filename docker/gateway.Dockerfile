@@ -1,3 +1,5 @@
+# The compiled React UI is served by the separate frontend service (nginx).
+# This image only needs the Go binary.
 FROM golang:1.25-bookworm AS build
 WORKDIR /src
 COPY go.mod go.sum* ./

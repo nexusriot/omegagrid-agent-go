@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import os
 from typing import Any, Dict
 
 import requests
 
 from skills.base import BaseSkill
+
+_TIMEOUT = float(os.environ.get("SKILL_HTTP_TIMEOUT", "30"))
 
 
 class WeatherSkill(BaseSkill):
@@ -17,13 +20,18 @@ class WeatherSkill(BaseSkill):
     }
 
     def execute(self, city: str, **kwargs) -> Dict[str, Any]:
-        # Step 1: geocode the city name
-        geo = requests.get(
-            "https://geocoding-api.open-meteo.com/v1/search",
-            params={"name": city, "count": 1, "language": "en"},
-            timeout=10,
-        )
-        geo.raise_for_status()
+        try:
+            geo = requests.get(
+                "https://geocoding-api.open-meteo.com/v1/search",
+                params={"name": city, "count": 1, "language": "en"},
+                timeout=_TIMEOUT,
+            )
+            geo.raise_for_status()
+        except requests.exceptions.Timeout:
+            return {"error": f"Geocoding timed out after {_TIMEOUT}s — try again or increase SKILL_HTTP_TIMEOUT"}
+        except requests.exceptions.RequestException as exc:
+            return {"error": f"Geocoding request failed: {exc}"}
+
         results = geo.json().get("results")
         if not results:
             return {"error": f"City '{city}' not found"}
@@ -33,19 +41,24 @@ class WeatherSkill(BaseSkill):
         resolved_name = loc.get("name", city)
         country = loc.get("country", "")
 
-        # Step 2: fetch current weather
-        weather = requests.get(
-            "https://api.open-meteo.com/v1/forecast",
-            params={
-                "latitude": lat,
-                "longitude": lon,
-                "current_weather": True,
-                "hourly": "relative_humidity_2m",
-                "timezone": "auto",
-            },
-            timeout=10,
-        )
-        weather.raise_for_status()
+        try:
+            weather = requests.get(
+                "https://api.open-meteo.com/v1/forecast",
+                params={
+                    "latitude": lat,
+                    "longitude": lon,
+                    "current_weather": True,
+                    "hourly": "relative_humidity_2m",
+                    "timezone": "auto",
+                },
+                timeout=_TIMEOUT,
+            )
+            weather.raise_for_status()
+        except requests.exceptions.Timeout:
+            return {"error": f"Weather API timed out after {_TIMEOUT}s — try again or increase SKILL_HTTP_TIMEOUT"}
+        except requests.exceptions.RequestException as exc:
+            return {"error": f"Weather request failed: {exc}"}
+
         data = weather.json()
         cw = data.get("current_weather", {})
 

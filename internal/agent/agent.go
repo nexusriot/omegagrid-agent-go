@@ -62,7 +62,11 @@ CRITICAL RULES:
 - Keep tool args minimal and valid.
 - SELF-EXTENSION: If the user asks for a capability that NO existing skill covers
   (e.g. "check SSL cert", "convert currency"), use skill_creator to create a new
-  skill first, then call it.`
+  skill first, then call it.
+- PROMPT-ONLY SKILLS: When a skill result contains skill_type="prompt_only", the
+  skill has no external data source — YOU generate the output. Follow the
+  "instructions" field directly and immediately return type="final" with your
+  generated answer. Do NOT call the same skill again.`
 
 // Attachment is a binary artifact produced by a tool (e.g. a QR code image).
 // It is carried through the streaming pipeline and handed to the final consumer
@@ -220,7 +224,7 @@ func (s *Service) Run(req RunRequest) (*RunResult, error) {
 		state.messages = append(state.messages,
 			llm.Message{Role: "assistant", Content: string(assistantJSON)},
 			llm.Message{Role: "tool", Content: string(toolJSON)},
-			llm.Message{Role: "user", Content: "Continue using the tool result."},
+			llm.Message{Role: "user", Content: "Tool result received. If you now have all the information needed, return type=\"final\". Otherwise call another tool."},
 		)
 	}
 
@@ -329,7 +333,7 @@ func (s *Service) RunStream(req RunRequest, out chan<- Event) {
 		state.messages = append(state.messages,
 			llm.Message{Role: "assistant", Content: string(assistantJSON)},
 			llm.Message{Role: "tool", Content: string(toolJSON)},
-			llm.Message{Role: "user", Content: "Continue using the tool result."},
+			llm.Message{Role: "user", Content: "Tool result received. If you now have all the information needed, return type=\"final\". Otherwise call another tool."},
 		)
 	}
 

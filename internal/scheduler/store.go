@@ -98,7 +98,7 @@ func (s *Store) list(query string) ([]*Task, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []*Task
+	out := make([]*Task, 0) // never nil — serialises as [] not null
 	for rows.Next() {
 		t, err := scanTask(rows)
 		if err != nil {

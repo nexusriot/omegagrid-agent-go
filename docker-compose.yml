@@ -3,6 +3,12 @@
 # project dependencies.
 #
 #     docker compose up --build
+#
+# Services & ports:
+#   frontend    :${FRONTEND_PORT:-80}   React UI + nginx gateway proxy
+#   gateway     :8000                   Go API (internal; also exposed for direct access)
+#   sidecar     :8001                   Python skills & memory (internal)
+#   telegram-bot (no port)              Telegram bot
 
 services:
 
@@ -66,6 +72,15 @@ services:
       - ./data:/app/data
     ports:
       - "${BACKEND_PORT:-8000}:8000"
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend.Dockerfile
+    depends_on:
+      - gateway
+    ports:
+      - "${FRONTEND_PORT:-80}:80"
 
   telegram-bot:
     build:

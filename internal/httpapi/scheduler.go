@@ -6,6 +6,7 @@ import (
 	"strconv"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/nexusriot/omegagrid-agent-go/internal/scheduler"
 )
 
 type createTaskRequest struct {
@@ -24,6 +25,10 @@ func (d *Deps) handleSchedulerCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Name == "" || req.CronExpr == "" || req.Skill == "" {
 		writeError(w, http.StatusBadRequest, "name, cron_expr and skill are required")
+		return
+	}
+	if err := scheduler.ValidateCron(req.CronExpr); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid cron_expr: "+err.Error())
 		return
 	}
 	task, err := d.Scheduler.Create(req.Name, req.CronExpr, req.Skill, req.Args, req.NotifyTelegramChatID)

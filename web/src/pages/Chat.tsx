@@ -19,6 +19,7 @@ export default function Chat() {
 
   const qc = useQueryClient()
   const [input, setInput] = useState('')
+  const [pendingQuery, setPendingQuery] = useState<string | null>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
 
@@ -35,12 +36,20 @@ export default function Chat() {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, stream.steps, stream.finalData])
 
-  // Invalidate history once stream finishes
+  // Invalidate history once stream finishes, and clear the optimistic user message.
   useEffect(() => {
     if (!stream.isStreaming && stream.finalData) {
       qc.invalidateQueries({ queryKey: ['messages', sessionId] })
+      setPendingQuery(null)
     }
   }, [stream.isStreaming, stream.finalData, sessionId, qc])
+
+  // Clear optimistic message on abort (no finalData).
+  useEffect(() => {
+    if (!stream.isStreaming && !stream.finalData) {
+      setPendingQuery(null)
+    }
+  }, [stream.isStreaming, stream.finalData])
 
   const handleAbort = useCallback(() => {
     stream.abortFn?.()
@@ -51,6 +60,8 @@ export default function Chat() {
     const q = input.trim()
     if (!q || stream.isStreaming) return
     setInput('')
+
+    setPendingQuery(q)
 
     const ctrl = streamQuery(
       { query: q, session_id: sessionId ?? 0, remember: true },
@@ -118,7 +129,9 @@ export default function Chat() {
           {stream.isStreaming && (
             <div className="flex items-center gap-2 text-xs text-gray-500">
               <Loader2 size={12} className="animate-spin text-accent" />
-              <span>Thinking…</span>
+              <span>
+                {stream.steps.length > 0 ? `Step ${stream.steps.length}…` : 'Thinking…'}
+              </span>
             </div>
           )}
         </header>
@@ -141,6 +154,13 @@ export default function Chat() {
           {visibleMessages.map((m) => (
             <ChatBubble key={m.id} message={m} />
           ))}
+
+          {/* Optimistic user message — shown immediately on send, before history reloads */}
+          {pendingQuery && (
+            <ChatBubble
+              message={{ id: -1, session_id: sessionId ?? 0, ts: Date.now() / 1000, role: 'user', content: pendingQuery }}
+            />
+          )}
 
           {/* Live stream steps — only shown while streaming; cleared on endStream() */}
           {stream.isStreaming && (

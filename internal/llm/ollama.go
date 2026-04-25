@@ -38,7 +38,10 @@ func (o *OllamaChat) CompleteJSON(messages []Message) (string, float64, error) {
 		"format":   "json",
 		"options":  map[string]any{"temperature": 0.2},
 	}
-	body, _ := json.Marshal(payload)
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return "", 0, fmt.Errorf("marshal request: %w", err)
+	}
 	resp, err := o.client.Post(o.baseURL+"/api/chat", "application/json", bytes.NewReader(body))
 	if err != nil {
 		return "", time.Since(t0).Seconds(), fmt.Errorf("ollama post: %w", err)

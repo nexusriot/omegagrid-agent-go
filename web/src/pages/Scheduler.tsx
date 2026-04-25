@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   Clock, Plus, Trash2, Play, Pause, Loader2, X, ChevronDown, CheckCircle2,
@@ -7,6 +7,60 @@ import {
 import { toast } from 'sonner'
 import { fetchTasks, createTask, deleteTask, enableTask, disableTask, fetchSkills } from '../api/client'
 import type { SchedulerTask, CreateTaskRequest } from '../api/types'
+
+function cronFieldMatches(field: string, value: number, lo: number): boolean {
+  for (const part of field.split(',')) {
+    const trimmed = part.trim()
+    let step = 1
+    let base = trimmed
+    const slashIdx = trimmed.indexOf('/')
+    if (slashIdx >= 0) {
+      step = parseInt(trimmed.slice(slashIdx + 1), 10)
+      if (isNaN(step) || step <= 0) continue
+      base = trimmed.slice(0, slashIdx)
+    }
+    if (base === '*') {
+      if ((value - lo) % step === 0) return true
+      continue
+    }
+    const dashIdx = base.indexOf('-')
+    if (dashIdx >= 0) {
+      const lo2 = parseInt(base.slice(0, dashIdx), 10)
+      const hi2 = parseInt(base.slice(dashIdx + 1), 10)
+      if (!isNaN(lo2) && !isNaN(hi2) && value >= lo2 && value <= hi2 && (value - lo2) % step === 0) return true
+      continue
+    }
+    const n = parseInt(base, 10)
+    if (!isNaN(n) && n === value && step === 1) return true
+  }
+  return false
+}
+
+function cronMatches(parts: string[], d: Date): boolean {
+  return (
+    cronFieldMatches(parts[0], d.getMinutes(), 0) &&
+    cronFieldMatches(parts[1], d.getHours(), 0) &&
+    cronFieldMatches(parts[2], d.getDate(), 1) &&
+    cronFieldMatches(parts[3], d.getMonth() + 1, 1) &&
+    cronFieldMatches(parts[4], d.getDay(), 0)
+  )
+}
+
+function nextCronFires(expr: string, count: number): Date[] | null {
+  const parts = expr.trim().split(/\s+/)
+  if (parts.length !== 5) return null
+  const results: Date[] = []
+  const d = new Date()
+  d.setSeconds(0, 0)
+  d.setMinutes(d.getMinutes() + 1)
+  let attempts = 0
+  while (results.length < count && attempts < 60 * 24 * 400) {
+    attempts++
+    if (cronMatches(parts, d)) results.push(new Date(d))
+    d.setMinutes(d.getMinutes() + 1)
+  }
+  return results.length === count ? results : null
+}
 
 function fmtTs(ts: number | null): string {
   if (!ts) return '—'
@@ -27,6 +81,11 @@ function CreateModal({ onClose }: { onClose: () => void }) {
     name: '', cron_expr: '0 9 * * *', skill: '', args: {},
   })
   const [argsRaw, setArgsRaw] = useState('{}')
+  const [nextRuns, setNextRuns] = useState<Date[]>(() => nextCronFires('0 9 * * *', 3) ?? [])
+
+  useEffect(() => {
+    setNextRuns(nextCronFires(form.cron_expr, 3) ?? [])
+  }, [form.cron_expr])
 
   const mut = useMutation({
     mutationFn: () => {
@@ -64,6 +123,19 @@ function CreateModal({ onClose }: { onClose: () => void }) {
             <label className="mb-1 block text-xs text-gray-500">Cron expression</label>
             <input value={form.cron_expr} onChange={field('cron_expr')} placeholder="0 9 * * *" className={`${inputCls} font-mono`} />
             <p className="mt-1 text-[10px] text-gray-600">minute hour day month weekday</p>
+            {nextRuns.length > 0 && (
+              <div className="mt-1.5 space-y-0.5">
+                {nextRuns.map((d, i) => (
+                  <div key={i} className="flex items-center gap-1.5 text-[10px] text-emerald-500/70">
+                    <span className="text-gray-600">{i === 0 ? 'Next:' : '     '}</span>
+                    <span>{d.toLocaleString()}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+            {nextRuns.length === 0 && form.cron_expr.trim() !== '' && (
+              <p className="mt-1 text-[10px] text-red-400/70">No fires found — check expression</p>
+            )}
           </div>
           <div>
             <label className="mb-1 block text-xs text-gray-500">Skill</label>

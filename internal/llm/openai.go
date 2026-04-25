@@ -74,8 +74,14 @@ func (o *OpenAIChat) completeChatCompletions(messages []Message) (string, float6
 		"temperature":     0.2,
 		"response_format": map[string]string{"type": "json_object"},
 	}
-	body, _ := json.Marshal(payload)
-	req, _ := http.NewRequest(http.MethodPost, o.baseURL+"/chat/completions", bytes.NewReader(body))
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return "", 0, fmt.Errorf("marshal request: %w", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, o.baseURL+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return "", 0, fmt.Errorf("build request: %w", err)
+	}
 	o.authHeaders(req)
 	resp, err := o.client.Do(req)
 	if err != nil {
@@ -115,8 +121,14 @@ func (o *OpenAIChat) completeResponses(messages []Message) (string, float64, err
 	if o.reasoning != "" {
 		payload["reasoning"] = map[string]string{"effort": o.reasoning}
 	}
-	body, _ := json.Marshal(payload)
-	req, _ := http.NewRequest(http.MethodPost, o.baseURL+"/responses", bytes.NewReader(body))
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return "", 0, fmt.Errorf("marshal request: %w", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, o.baseURL+"/responses", bytes.NewReader(body))
+	if err != nil {
+		return "", 0, fmt.Errorf("build request: %w", err)
+	}
 	o.authHeaders(req)
 	resp, err := o.client.Do(req)
 	if err != nil {

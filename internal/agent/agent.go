@@ -219,8 +219,15 @@ func (s *Service) Run(req RunRequest) (*RunResult, error) {
 
 		// Persist tool result and feed back into the LLM context
 		_ = s.Memory.AddMessage(state.sid, "tool", result)
-		assistantJSON, _ := json.Marshal(data)
-		toolJSON, _ := json.Marshal(result)
+		var assistantJSON, toolJSON []byte
+		if assistantJSON, err = json.Marshal(data); err != nil {
+			assistantJSON = []byte(`{"type":"tool_call"}`)
+			state.debug = append(state.debug, fmt.Sprintf("[agent] marshal tool_call: %v", err))
+		}
+		if toolJSON, err = json.Marshal(result); err != nil {
+			toolJSON = []byte(`{"error":"marshal failed"}`)
+			state.debug = append(state.debug, fmt.Sprintf("[agent] marshal tool_result: %v", err))
+		}
 		state.messages = append(state.messages,
 			llm.Message{Role: "assistant", Content: string(assistantJSON)},
 			llm.Message{Role: "tool", Content: string(toolJSON)},
@@ -328,8 +335,13 @@ func (s *Service) RunStream(req RunRequest, out chan<- Event) {
 		out <- Event{Event: "tool_result", Step: step, Tool: toolName, Result: truncate(fmt.Sprint(result), 300), ElapsedS: round3(elapsed)}
 
 		_ = s.Memory.AddMessage(state.sid, "tool", result)
-		assistantJSON, _ := json.Marshal(data)
-		toolJSON, _ := json.Marshal(result)
+		var assistantJSON, toolJSON []byte
+		if assistantJSON, err = json.Marshal(data); err != nil {
+			assistantJSON = []byte(`{"type":"tool_call"}`)
+		}
+		if toolJSON, err = json.Marshal(result); err != nil {
+			toolJSON = []byte(`{"error":"marshal failed"}`)
+		}
 		state.messages = append(state.messages,
 			llm.Message{Role: "assistant", Content: string(assistantJSON)},
 			llm.Message{Role: "tool", Content: string(toolJSON)},

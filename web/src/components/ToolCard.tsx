@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { ChevronDown, ChevronRight, Wrench, CheckCircle2, Clock } from 'lucide-react'
 import type { StreamStep } from '../store/chat'
 
@@ -7,8 +7,12 @@ function prettyJSON(v: unknown): string {
 }
 
 export default function ToolCard({ step }: { step: StreamStep }) {
-  const [open, setOpen] = useState(false)
   const { toolCall: tc, toolResult: tr } = step
+  // Start expanded so the user sees the tool being invoked, auto-collapse on completion.
+  const [open, setOpen] = useState(true)
+  useEffect(() => {
+    if (tr) setOpen(false)
+  }, [tr])
 
   if (!tc) {
     // Pure "thinking" indicator

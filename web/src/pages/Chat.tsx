@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback, useMemo } from 'react'
+import { useEffect, useRef, useState, useCallback } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Send, Square, Loader2, BotMessageSquare, Sparkles } from 'lucide-react'
 import { toast } from 'sonner'
@@ -19,54 +19,51 @@ export default function Chat() {
 
   const qc = useQueryClient()
   const [input, setInput] = useState('')
+  const [justSent, setJustSent] = useState('')
   const bottomRef = useRef<HTMLDivElement>(null)
-  const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const pendingBubbleRef = useRef<HTMLDivElement>(null)
 
-  // Load message history for the active session.
-  // refetchOnWindowFocus disabled so a mid-stream tab-switch doesn't reload
-  // history and displace the pending user message.
+  // Load history for the active session.
+  // - New session: sessionId is null → query disabled → messages = [].
+  // - Existing session: sessionId is stable throughout streaming (only updated
+  //   in endStream, not in setFinal) → query key unchanged → no mid-stream refetch.
+  // Both cases mean `messages` is stable while streaming and safe to read directly.
   const { data: messages = [] } = useQuery({
     queryKey: ['messages', sessionId],
     queryFn: () => fetchMessages(sessionId!),
-    enabled: sessionId !== null,
-    staleTime: 5_000,
+    enabled: sessionId != null,
+    staleTime: 0,
     refetchOnWindowFocus: false,
   })
 
-  // Freeze history the moment streaming starts. We do this synchronously in the
-  // render body (not useEffect) so the pending user message appears on the very
-  // first streaming render — no one-render delay / flicker.
-  const frozenSnapshotRef = useRef<typeof messages>([])
-  const wasStreamingRef = useRef(false)
-  if (stream.isStreaming && !wasStreamingRef.current) {
-    frozenSnapshotRef.current = messages
-  }
-  wasStreamingRef.current = stream.isStreaming
-
-  // During streaming: frozen pre-stream history + pending user message appended.
-  // After streaming: fresh server messages (loaded via invalidation in the effect below).
-  const displayMessages = useMemo(() => {
-    if (!stream.isStreaming) return messages
-    if (!stream.pendingMessage) return frozenSnapshotRef.current
-    return [
-      ...frozenSnapshotRef.current,
-      { id: -1, session_id: sessionId ?? 0, ts: Date.now() / 1000, role: 'user' as const, content: stream.pendingMessage },
-    ]
-  // frozenSnapshotRef is intentionally excluded — it's a ref written before this memo runs
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [stream.isStreaming, stream.pendingMessage, messages, sessionId])
-
-  // Auto-scroll on new content
+  // Scroll to bottom whenever messages change.
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [displayMessages, stream.steps, stream.finalData])
+  }, [messages])
 
-  // Invalidate history once stream finishes.
+  // Scroll to pending bubble when streaming starts, anchoring it at the top of the
+  // viewport while ToolCards (which start expanded) expand below it.
+  useEffect(() => {
+    if (stream.isStreaming && pendingBubbleRef.current) {
+      pendingBubbleRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    }
+  }, [stream.isStreaming])
+
+  // Clear just-sent message when streaming ends.
+  useEffect(() => {
+    if (!stream.isStreaming && justSent) {
+      setJustSent('')
+    }
+  }, [stream.isStreaming])
+
+  // Reload history after streaming finishes. Use sessionId from finalData
+  // to ensure the query goes to the correct (newly created) session.
   useEffect(() => {
     if (!stream.isStreaming && stream.finalData) {
-      qc.invalidateQueries({ queryKey: ['messages', sessionId] })
+      const sid = stream.finalData.session_id
+      qc.invalidateQueries({ queryKey: ['messages', sid] })
     }
-  }, [stream.isStreaming, stream.finalData, sessionId, qc])
+  }, [stream.isStreaming, stream.finalData, qc])
 
   const handleAbort = useCallback(() => {
     stream.abortFn?.()
@@ -77,15 +74,16 @@ export default function Chat() {
     const q = input.trim()
     if (!q || stream.isStreaming) return
     setInput('')
+    setJustSent(q)
 
     const ctrl = streamQuery(
       { query: q, session_id: sessionId ?? 0, remember: true },
       (ev: StreamEvent) => {
         switch (ev.event) {
-          case 'thinking':   addThinking(ev.data.step);   break
-          case 'tool_call':  addToolCall(ev.data);         break
-          case 'tool_result':addToolResult(ev.data);       break
-          case 'final':      setFinal(ev.data);            break
+          case 'thinking':    addThinking(ev.data.step);  break
+          case 'tool_call':   addToolCall(ev.data);        break
+          case 'tool_result': addToolResult(ev.data);      break
+          case 'final':       setFinal(ev.data);           break
           case 'error':
             setStreamError(ev.data.message)
             toast.error(ev.data.message)
@@ -98,13 +96,11 @@ export default function Chat() {
       },
     )
 
+    // startStream sets stream.pendingMessage = q and stream.isStreaming = true
+    // in a single atomic Zustand update, so they are always consistent.
     startStream(() => ctrl.abort(), q)
-
-    // If no session yet, one will be assigned via setFinal → ev.session_id
-    if (!sessionId) {
-      // session_id 0 triggers new session; update once final arrives
-    }
-  }, [input, sessionId, stream.isStreaming, addThinking, addToolCall, addToolResult, setFinal, setStreamError, endStream, startStream, qc])
+  }, [input, sessionId, stream.isStreaming, addThinking, addToolCall, addToolResult,
+      setFinal, setStreamError, endStream, startStream, qc])
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -113,7 +109,7 @@ export default function Chat() {
     }
   }
 
-  const visibleMessages = displayMessages.filter(
+  const visibleMessages = messages.filter(
     (m) => m.role !== 'raw_model_json' && m.role !== 'tool',
   )
 
@@ -126,6 +122,7 @@ export default function Chat() {
 
       {/* Main chat area */}
       <div className="flex flex-1 flex-col overflow-hidden">
+
         {/* Header */}
         <header className="flex h-12 items-center justify-between border-b border-surface-border px-4 shrink-0">
           <div className="flex items-center gap-2">
@@ -137,15 +134,15 @@ export default function Chat() {
           {stream.isStreaming && (
             <div className="flex items-center gap-2 text-xs text-gray-500">
               <Loader2 size={12} className="animate-spin text-accent" />
-              <span>
-                {stream.steps.length > 0 ? `Step ${stream.steps.length}…` : 'Thinking…'}
-              </span>
+              <span>{stream.steps.length > 0 ? `Step ${stream.steps.length}…` : 'Thinking…'}</span>
             </div>
           )}
         </header>
 
         {/* Messages */}
         <div className="flex-1 overflow-y-auto px-6 py-6">
+
+          {/* Empty state */}
           {isEmpty && (
             <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
               <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-accent/10 text-accent">
@@ -158,12 +155,26 @@ export default function Chat() {
             </div>
           )}
 
-          {/* History messages */}
+          {/* Conversation history */}
           {visibleMessages.map((m) => (
             <ChatBubble key={m.id} message={m} />
           ))}
 
-          {/* Live stream steps — only shown while streaming; cleared on endStream() */}
+          {/* Pending user bubble
+              stream.pendingMessage is set atomically with stream.isStreaming=true
+              inside startStream(), so it appears in the very same Zustand render
+              that starts the stream — before any SSE events arrive.
+              It is cleared atomically with isStreaming=false inside endStream().
+          */}
+          {justSent && (
+            <div ref={pendingBubbleRef} className="flex justify-end mb-4">
+              <div className="max-w-[75%] rounded-2xl rounded-tr-sm bg-accent px-4 py-3 text-sm text-white shadow-lg shadow-accent/20">
+                {justSent}
+              </div>
+            </div>
+          )}
+
+          {/* Live tool-call steps */}
           {stream.isStreaming && (
             <div className="mb-4">
               {stream.steps.map((s) => (
@@ -192,12 +203,10 @@ export default function Chat() {
         <div className="border-t border-surface-border px-4 py-3 shrink-0">
           <div className="flex items-end gap-2 rounded-2xl border border-surface-border bg-surface-overlay px-4 py-3 focus-within:border-accent/50 transition-colors">
             <textarea
-              ref={textareaRef}
               rows={1}
               value={input}
               onChange={(e) => {
                 setInput(e.target.value)
-                // auto-resize
                 e.target.style.height = 'auto'
                 e.target.style.height = Math.min(e.target.scrollHeight, 160) + 'px'
               }}

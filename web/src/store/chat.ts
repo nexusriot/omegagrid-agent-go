@@ -9,6 +9,7 @@ export interface StreamStep {
 
 export interface StreamState {
   isStreaming: boolean
+  pendingMessage: string | null
   steps: StreamStep[]
   finalData: FinalEvent | null
   errorMsg: string | null
@@ -22,7 +23,7 @@ interface ChatStore {
 
   // Streaming
   stream: StreamState
-  startStream: (abort: () => void) => void
+  startStream: (abort: () => void, query: string) => void
   addThinking: (step: number) => void
   addToolCall: (ev: ToolCallEvent) => void
   addToolResult: (ev: ToolResultEvent) => void
@@ -41,16 +42,18 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
   stream: {
     isStreaming: false,
+    pendingMessage: null,
     steps: [],
     finalData: null,
     errorMsg: null,
     abortFn: null,
   },
 
-  startStream: (abort) =>
+  startStream: (abort, query) =>
     set({
       stream: {
         isStreaming: true,
+        pendingMessage: query,
         steps: [],
         finalData: null,
         errorMsg: null,
@@ -92,7 +95,8 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
   setFinal: (ev) =>
     set((s) => ({
-      sessionId: ev.session_id,
+      // sessionId is updated in endStream, not here, so that the messages query
+      // key stays stable during streaming and doesn't trigger a premature refetch.
       stream: { ...s.stream, finalData: ev },
     })),
 
@@ -102,9 +106,13 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     })),
 
   endStream: () => {
-    const { refreshSessionList } = get()
+    const { stream, refreshSessionList } = get()
     refreshSessionList()
-    set((s) => ({ stream: { ...s.stream, isStreaming: false, abortFn: null, steps: [] } }))
+    const newSessionId = stream.finalData?.session_id
+    set((s) => ({
+      ...(newSessionId !== undefined ? { sessionId: newSessionId } : {}),
+      stream: { ...s.stream, isStreaming: false, pendingMessage: null, abortFn: null, steps: [] },
+    }))
   },
 
   sessionListKey: 0,

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from 'react'
+import { useEffect, useRef, useState, useCallback, useMemo } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Send, Square, Loader2, BotMessageSquare, Sparkles } from 'lucide-react'
 import { toast } from 'sonner'
@@ -12,44 +12,61 @@ import type { StreamEvent } from '../api/types'
 
 export default function Chat() {
   const {
-    sessionId, setSessionId,
+    sessionId,
     stream, startStream, addThinking, addToolCall, addToolResult,
     setFinal, setStreamError, endStream,
   } = useChatStore()
 
   const qc = useQueryClient()
   const [input, setInput] = useState('')
-  const [pendingQuery, setPendingQuery] = useState<string | null>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
 
-  // Load message history for the active session
+  // Load message history for the active session.
+  // refetchOnWindowFocus disabled so a mid-stream tab-switch doesn't reload
+  // history and displace the pending user message.
   const { data: messages = [] } = useQuery({
     queryKey: ['messages', sessionId],
     queryFn: () => fetchMessages(sessionId!),
     enabled: sessionId !== null,
     staleTime: 5_000,
+    refetchOnWindowFocus: false,
   })
+
+  // Freeze history the moment streaming starts. We do this synchronously in the
+  // render body (not useEffect) so the pending user message appears on the very
+  // first streaming render — no one-render delay / flicker.
+  const frozenSnapshotRef = useRef<typeof messages>([])
+  const wasStreamingRef = useRef(false)
+  if (stream.isStreaming && !wasStreamingRef.current) {
+    frozenSnapshotRef.current = messages
+  }
+  wasStreamingRef.current = stream.isStreaming
+
+  // During streaming: frozen pre-stream history + pending user message appended.
+  // After streaming: fresh server messages (loaded via invalidation in the effect below).
+  const displayMessages = useMemo(() => {
+    if (!stream.isStreaming) return messages
+    if (!stream.pendingMessage) return frozenSnapshotRef.current
+    return [
+      ...frozenSnapshotRef.current,
+      { id: -1, session_id: sessionId ?? 0, ts: Date.now() / 1000, role: 'user' as const, content: stream.pendingMessage },
+    ]
+  // frozenSnapshotRef is intentionally excluded — it's a ref written before this memo runs
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stream.isStreaming, stream.pendingMessage, messages, sessionId])
 
   // Auto-scroll on new content
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages, stream.steps, stream.finalData])
+  }, [displayMessages, stream.steps, stream.finalData])
 
-  // Invalidate history once stream finishes, and clear the optimistic user message.
+  // Invalidate history once stream finishes.
   useEffect(() => {
     if (!stream.isStreaming && stream.finalData) {
       qc.invalidateQueries({ queryKey: ['messages', sessionId] })
-      setPendingQuery(null)
     }
   }, [stream.isStreaming, stream.finalData, sessionId, qc])
-
-  // Clear optimistic message on abort (no finalData).
-  useEffect(() => {
-    if (!stream.isStreaming && !stream.finalData) {
-      setPendingQuery(null)
-    }
-  }, [stream.isStreaming, stream.finalData])
 
   const handleAbort = useCallback(() => {
     stream.abortFn?.()
@@ -60,8 +77,6 @@ export default function Chat() {
     const q = input.trim()
     if (!q || stream.isStreaming) return
     setInput('')
-
-    setPendingQuery(q)
 
     const ctrl = streamQuery(
       { query: q, session_id: sessionId ?? 0, remember: true },
@@ -83,20 +98,13 @@ export default function Chat() {
       },
     )
 
-    startStream(() => ctrl.abort())
+    startStream(() => ctrl.abort(), q)
 
     // If no session yet, one will be assigned via setFinal → ev.session_id
     if (!sessionId) {
       // session_id 0 triggers new session; update once final arrives
     }
   }, [input, sessionId, stream.isStreaming, addThinking, addToolCall, addToolResult, setFinal, setStreamError, endStream, startStream, qc])
-
-  // Update sessionId from stream final event
-  useEffect(() => {
-    if (stream.finalData && stream.finalData.session_id !== sessionId) {
-      setSessionId(stream.finalData.session_id)
-    }
-  }, [stream.finalData, sessionId, setSessionId])
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -105,7 +113,7 @@ export default function Chat() {
     }
   }
 
-  const visibleMessages = messages.filter(
+  const visibleMessages = displayMessages.filter(
     (m) => m.role !== 'raw_model_json' && m.role !== 'tool',
   )
 
@@ -154,13 +162,6 @@ export default function Chat() {
           {visibleMessages.map((m) => (
             <ChatBubble key={m.id} message={m} />
           ))}
-
-          {/* Optimistic user message — shown immediately on send, before history reloads */}
-          {pendingQuery && (
-            <ChatBubble
-              message={{ id: -1, session_id: sessionId ?? 0, ts: Date.now() / 1000, role: 'user', content: pendingQuery }}
-            />
-          )}
 
           {/* Live stream steps — only shown while streaming; cleared on endStream() */}
           {stream.isStreaming && (

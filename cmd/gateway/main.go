@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -19,7 +18,6 @@ import (
 	"github.com/nexusriot/omegagrid-agent-go/internal/memory"
 	"github.com/nexusriot/omegagrid-agent-go/internal/scheduler"
 	"github.com/nexusriot/omegagrid-agent-go/internal/skills"
-	webui "github.com/nexusriot/omegagrid-agent-go/web"
 )
 
 func main() {
@@ -74,13 +72,6 @@ func main() {
 		MemoryHits:   cfg.MemoryHits,
 	}
 
-	// Serve the compiled React UI from the embedded web/dist FS.
-	// The sub-FS strips the leading "dist/" so paths are relative to the web root.
-	uiFS, err := fs.Sub(webui.FS, "dist")
-	if err != nil {
-		log.Fatalf("web ui embed: %v", err)
-	}
-
 	deps := httpapi.Deps{
 		Cfg:       cfg,
 		Agent:     ag,
@@ -88,7 +79,6 @@ func main() {
 		Skills:    sk,
 		Chat:      chat,
 		Scheduler: store,
-		WebUI:     uiFS,
 	}
 
 	addr := fmt.Sprintf(":%d", cfg.BackendPort)

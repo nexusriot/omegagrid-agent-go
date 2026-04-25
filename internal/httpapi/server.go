@@ -5,7 +5,6 @@ package httpapi
 
 import (
 	"encoding/json"
-	"io/fs"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -28,9 +27,6 @@ type Deps struct {
 	Skills    *skills.Client
 	Chat      llm.ChatClient
 	Scheduler *scheduler.Store
-	// WebUI is the compiled React app embedded FS (web/dist).
-	// When nil the /ui/* route is omitted.
-	WebUI fs.FS
 }
 
 func NewRouter(d Deps) http.Handler {
@@ -63,17 +59,6 @@ func NewRouter(d Deps) http.Handler {
 		r.Post("/scheduler/tasks/{id}/disable", d.handleSchedulerDisable)
 		r.Delete("/scheduler/tasks/{id}", d.handleSchedulerDelete)
 	})
-
-	// Serve the compiled React UI at /ui/*.
-	// Redirect bare / to /ui/ for convenience.
-	if d.WebUI != nil {
-		fileServer := http.FileServer(http.FS(d.WebUI))
-		r.Get("/", func(w http.ResponseWriter, r *http.Request) {
-			http.Redirect(w, r, "/ui/", http.StatusFound)
-		})
-		r.Handle("/ui", http.RedirectHandler("/ui/", http.StatusMovedPermanently))
-		r.Handle("/ui/*", http.StripPrefix("/ui", fileServer))
-	}
 
 	return r
 }

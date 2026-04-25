@@ -1,5 +1,7 @@
+//go:build embedui
+
 // Package webui embeds the compiled React/Vite frontend.
-// Run `npm run build` inside the web/ directory before building the Go binary.
+// Build with: cd web && npm run build && go build -tags embedui ...
 package webui
 
 import "embed"

@@ -45,14 +45,14 @@ internal/
   observability/       Mark-based timer (surfaces in RunResult.Meta)
   scheduler/           SQLite store, cron matcher, runner, schedule_task skill
   skills/              HTTP client → sidecar skill registry
+  search/              Native web_search skill (DuckDuckGo HTML scrape, no API key)
   telegram/            Bot poller, command handlers, SQLite auth allowlist
-web/
+web/                   React frontend — built by frontend container, served by nginx
   src/
     api/               TypeScript REST client, SSE stream helper, API types
     components/        Layout, SessionList, ChatBubble, ToolCard
     pages/             Chat, Memory, Skills, Scheduler, Health
     store/             Zustand chat + stream state
-  embed.go             //go:embed dist — bakes built UI into Go binary (local dev)
   package.json         Vite + React 18 + TypeScript + Tailwind project
 sidecar/
   main.py              FastAPI shim (skills, memory, history)
@@ -94,12 +94,12 @@ PYTHONPATH=$PWD/sidecar/python SKILLS_DIR=$PWD/sidecar/python/skills \
 DATA_DIR=$PWD/data \
     uvicorn sidecar.main:app --host 127.0.0.1 --port 8001
 
-# 2. Go gateway  (serves UI at /ui/ via embedded web/dist)
+# 2. Go gateway  (serves /api/* and /health on :8000 — no UI)
 SIDECAR_URL=http://127.0.0.1:8001 \
 LLM_PROVIDER=ollama OLLAMA_URL=http://127.0.0.1:11434 \
 DATA_DIR=$PWD/data \
     go run ./cmd/gateway
-# → http://localhost:8000/ui/
+# → http://localhost:8000/api/...
 
 # 3. Web dev server with hot-reload  (proxies /api → :8000)
 make dev-web
@@ -137,13 +137,13 @@ make dev-web    # cd web && npm run dev  (Vite dev server, hot-reload)
 - Agent tool-calling loop with JSON recovery
 - Ollama + OpenAI (chat_completions & responses) LLM clients
 - Cron scheduler (SQLite store, matcher, runner)
-- Native `schedule_task` skill
+- Native `schedule_task` skill (talks to the Go scheduler store directly)
+- Native `web_search` skill (DuckDuckGo HTML scrape, no API key required)
 - Telegram bot with SQLite auth allowlist
-- React web UI optionally embedded via `//go:embed` for local dev
 
 **Python** (vendored under `sidecar/python/`):
 
-- 23 built-in skills: weather, datetime, HTTP, shell, SSH, web scrape, DNS, port scan, WHOIS, CIDR, base64, hash, math, IP info, UUID, password, QR code, cron explainer, HTTP health
+- 21 built-in skills: weather, datetime, HTTP request, shell, SSH, web scrape, DNS, port scan, ping check, HTTP health, WHOIS, CIDR, base64, hash, math, IP info, UUID, password, QR code, cron explainer
 - `skill_creator` — hot-register new skills at runtime without a restart
 - Markdown pipeline skills (YAML frontmatter + multi-step chaining)
 - `HistoryStore` — SQLite sessions + messages
@@ -180,3 +180,13 @@ make dev-web    # cd web && npm run dev  (Vite dev server, hot-reload)
 | `SKILL_HTTP_TIMEOUT` | `30` | Timeout for HTTP-based skills (seconds) |
 | `SKILL_SHELL_ENABLED` | `false` | Enable `shell_command` skill |
 | `SKILL_SSH_ENABLED` | `false` | Enable `ssh_command` skill |
+| `GATEWAY_URL` | `http://127.0.0.1:8000` | Telegram bot → gateway base URL |
+
+## Frontend / gateway separation
+
+The gateway binary is a pure JSON API: it serves only `/health` and `/api/*`
+and contains no static-file serving, no UI redirect, and no `//go:embed`
+assets.  The React UI is built and served exclusively by the **frontend**
+nginx service, which also reverse-proxies `/api/*` and `/health` back to
+the gateway.  For UI development without Docker, run `make dev-web`
+(Vite at `:5173`, proxying `/api` to the gateway on `:8000`).

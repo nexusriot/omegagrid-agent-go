@@ -62,7 +62,7 @@ omegagrid-agent-go/
 │   ├── agent/agent.go           # Tool-calling loop (Run / RunStream)
 │   ├── config/config.go         # Env-driven configuration
 │   ├── httpapi/                 # chi router + REST handlers
-│   │   ├── server.go            #   router, CORS, middleware, optional embedded UI
+│   │   ├── server.go            #   router, CORS, middleware
 │   │   ├── chat.go              #   POST /api/query, /api/query/stream
 │   │   ├── health.go            #   GET /health
 │   │   ├── history.go           #   sessions CRUD
@@ -80,13 +80,13 @@ omegagrid-agent-go/
 │   │   ├── runner.go            #   Background goroutine executing due tasks
 │   │   ├── skill.go             #   Native schedule_task skill
 │   │   └── store.go             #   SQLite task CRUD
+│   ├── search/skill.go          #   Native web_search skill (DuckDuckGo HTML scrape)
 │   ├── skills/client.go         #   HTTP client → sidecar skill endpoints
 │   └── telegram/
 │       ├── agent_client.go      #   Calls gateway /api/query[/stream]
 │       ├── auth.go              #   SQLite-backed Telegram user allowlist
 │       └── bot.go               #   Update poller + command handlers
 ├── web/                         # React frontend (Vite + TypeScript + Tailwind)
-│   ├── embed.go                 #   package webui; //go:embed dist (for local dev)
 │   ├── package.json
 │   ├── vite.config.ts           #   base: '/ui/', dev proxy → :8000
 │   ├── tailwind.config.ts       #   custom dark palette + animations
@@ -237,6 +237,7 @@ if MaxSteps exceeded:
 | `vector_add` | Store a durable fact or preference | `Memory.AddMemory()` → sidecar `/memory/add` |
 | `vector_search` | Semantic search over stored memories | `Memory.SearchMemory()` → sidecar `/memory/search` |
 | `schedule_task` | Create/list/delete/enable/disable cron tasks | Native Go via `scheduler.ScheduleTaskSkill` |
+| `web_search` | DuckDuckGo HTML search (no API key); returns title/url/snippet | Native Go via `search.WebSearchSkill` |
 
 All sidecar skills (weather, dns_lookup, shell_command, etc.) are merged into
 the tool table dynamically via `Skills.List()` on each run, so hot-registered
@@ -419,14 +420,11 @@ Built on [go-chi/chi v5](https://github.com/go-chi/chi).
 | `POST` | `/api/scheduler/tasks/{id}/enable` | `handleSchedulerEnable` | Direct to scheduler store |
 | `POST` | `/api/scheduler/tasks/{id}/disable` | `handleSchedulerDisable` | Direct to scheduler store |
 | `DELETE` | `/api/scheduler/tasks/{id}` | `handleSchedulerDelete` | Direct to scheduler store |
-| `GET` | `/` | redirect | → `/ui/` (when WebUI is set) |
-| `GET` | `/ui/*` | `http.FileServer` | Embedded React app (when WebUI is set) |
 
-The `/ui/*` route and root redirect are only registered when `Deps.WebUI` is
-non-nil.  In Docker deployments the gateway binary has an empty `web/dist/`
-(placeholder only) and the frontend nginx service handles all UI traffic.
-In local dev (`make build`) the real `web/dist/` is embedded and served
-directly by the gateway.
+The gateway router serves only `/health` and `/api/*`.  The gateway binary
+contains no static-file serving and no UI assets; all browser UI traffic is
+served by the separate nginx **frontend** service, which proxies `/api/*`
+and `/health` back to the gateway.
 
 #### SSE streaming
 
@@ -548,20 +546,12 @@ Stream events update Zustand state which React components observe:
 - `final` → set `finalData`, trigger history refetch, refresh session list
 - `error` → set `errorMsg`, show toast
 
-#### Embedded UI (local dev)
+#### Gateway / UI separation
 
-`web/embed.go` (package `webui`) contains:
-
-```go
-//go:embed dist
-var FS embed.FS
-```
-
-`cmd/gateway/main.go` calls `fs.Sub(webui.FS, "dist")` and passes the
-resulting `fs.FS` to `httpapi.Deps.WebUI`.  The gateway then serves the app
-at `/ui/*` directly, making `http://localhost:8000/ui/` work with no nginx.
-In Docker the gateway image carries only the placeholder `dist/.gitkeep` and
-the nginx frontend service handles all UI traffic.
+The gateway binary contains no UI assets and no static-file serving.  The
+React app is built and served exclusively by the nginx frontend container.
+For local UI development without Docker, run `make dev-web` (Vite dev
+server at `:5173/ui/`, proxying `/api` to the gateway on `:8000`).
 
 ---
 
@@ -586,7 +576,9 @@ Embeddings backend is selected by `LLM_PROVIDER`:
 
 ### 4.2 Skill registry
 
-23 skills registered at startup (`schedule_task` excluded — lives in Go):
+21 hard-coded skills + the `skill_creator` and any markdown skills are
+registered at startup.  `schedule_task` and `web_search` are excluded —
+they are native Go skills registered by the gateway.
 
 | Skill | Summary |
 |---|---|
@@ -757,9 +749,12 @@ response body and the browser receives no events until the connection closes.
 
 | Scenario | UI served by | API reached via |
 |---|---|---|
-| `make build` + `go run ./cmd/gateway` | Go binary (`//go:embed dist`) at `:8000/ui/` | Direct to `:8000` |
+| `make build` + `go run ./cmd/gateway` | (gateway is API-only — no UI) | Direct to `:8000/api/*` |
 | `make dev-web` | Vite dev server at `:5173/ui/` | Vite proxy → `:8000` |
 | `docker compose up --build` | nginx at `:80/ui/` | nginx proxy → `gateway:8000` |
+
+For browser UI work without Docker, use `make dev-web`; for full-stack runs
+use Docker Compose.
 
 ---
 
@@ -904,8 +899,8 @@ the `Store` struct, and the Python sidecar excludes `schedule_task.py`.
 - **Single origin for the browser** — all traffic (static files + API) goes
   through the same nginx host:port, eliminating CORS entirely.
 
-The gateway binary still embeds the UI via `//go:embed` for convenience when
-running locally without Docker (`make build`).
+The gateway binary contains no UI assets at all — the nginx frontend is
+the only path that serves the UI in any deployment.
 
 ### Why distroless runtime images
 

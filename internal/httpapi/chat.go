@@ -3,7 +3,9 @@ package httpapi
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
+	"time"
 
 	"github.com/nexusriot/omegagrid-agent-go/internal/agent"
 )
@@ -16,10 +18,15 @@ type queryRequest struct {
 	TelegramChatID *int64 `json:"telegram_chat_id,omitempty"`
 }
 
+const maxStepsHardLimit = 100
+
 func (req queryRequest) toAgentReq(defaultMaxSteps int) agent.RunRequest {
 	maxSteps := req.MaxSteps
-	if maxSteps == 0 {
+	if maxSteps <= 0 {
 		maxSteps = defaultMaxSteps
+	}
+	if maxSteps > maxStepsHardLimit {
+		maxSteps = maxStepsHardLimit
 	}
 	remember := true
 	if req.Remember != nil {
@@ -46,8 +53,9 @@ func (d *Deps) handleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := d.Agent.Run(req.toAgentReq(d.Cfg.AgentMaxSteps))
 	if err != nil {
+		log.Printf("agent run error: %v", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]any{
-			"error": err.Error(),
+			"error": "Agent failed to process the request.",
 			"hint":  "Check that your LLM and embedding models are available and running.",
 		})
 		return
@@ -92,15 +100,29 @@ func (d *Deps) handleQueryStream(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
-			payload, _ := json.Marshal(ev)
+			payload, merr := json.Marshal(ev)
+			if merr != nil {
+				fmt.Fprintf(w, "event: error\ndata: {\"error\":\"internal marshal error\"}\n\n")
+				flusher.Flush()
+				return
+			}
 			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev.Event, payload)
 			flusher.Flush()
 			if ev.Event == "final" || ev.Event == "error" {
-				// Drain any remaining buffered events before returning so we
-				// don't deadlock the goroutine writing to the channel.
-				for range events {
+				// Drain remaining buffered events so the RunStream goroutine
+				// can finish writing before we return. Capped to prevent hang
+				// if the goroutine stalls before closing the channel.
+				drain := time.After(5 * time.Second)
+				for {
+					select {
+					case _, ok := <-events:
+						if !ok {
+							return
+						}
+					case <-drain:
+						return
+					}
 				}
-				return
 			}
 		}
 	}

@@ -98,13 +98,19 @@ func (r *Runner) runTask(t *Task) {
 	var resultStr string
 	res, err := r.exec(t.Skill, t.Args)
 	if err != nil {
-		errMap := map[string]string{"error": err.Error()}
-		b, _ := json.Marshal(errMap)
-		resultStr = string(b)
 		log.Printf("task #%d failed: %v", t.ID, err)
+		if b, merr := json.Marshal(map[string]string{"error": err.Error()}); merr == nil {
+			resultStr = string(b)
+		} else {
+			resultStr = `{"error":"` + err.Error() + `"}`
+		}
 	} else {
-		b, _ := json.MarshalIndent(res, "", "  ")
-		resultStr = string(b)
+		if b, merr := json.MarshalIndent(res, "", "  "); merr == nil {
+			resultStr = string(b)
+		} else {
+			log.Printf("task #%d marshal result failed: %v", t.ID, merr)
+			resultStr = fmt.Sprintf("%v", res)
+		}
 	}
 
 	if err := r.store.UpdateLastRun(t.ID, resultStr); err != nil {
@@ -125,7 +131,11 @@ func sendTelegram(token string, chatID int64, text string) {
 	if len(text) > 4096 {
 		text = text[:4096]
 	}
-	body, _ := json.Marshal(map[string]any{"chat_id": chatID, "text": text})
+	body, err := json.Marshal(map[string]any{"chat_id": chatID, "text": text})
+	if err != nil {
+		log.Printf("telegram marshal error: %v", err)
+		return
+	}
 	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token)
 	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Post(url, "application/json", bytes.NewReader(body))

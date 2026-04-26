@@ -68,10 +68,18 @@ class MarkdownSkill(BaseSkill):
             return self._execute_pipeline(kwargs)
         if self.endpoint:
             return self._execute_single(kwargs)
+        # Prompt-only: body contains generation instructions for the LLM.
+        # The LLM IS the execution engine — it must generate the answer itself.
         return {
-            "info": "This is a prompt-only skill (no endpoint configured).",
+            "skill_type": "prompt_only",
             "instructions": self.body or "(none)",
-            "parameters_received": kwargs,
+            "parameters": kwargs,
+            "directive": (
+                "This skill has no external endpoint — YOU are the execution engine. "
+                "Use the instructions above to generate the answer yourself, "
+                "then return it immediately as your type='final' answer. "
+                "Do NOT call this skill again."
+            ),
         }
 
 

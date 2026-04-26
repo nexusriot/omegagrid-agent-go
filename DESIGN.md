@@ -5,38 +5,37 @@
 OmegaGrid Agent Go is a Go rewrite of the omegagrid-agent platform.  The
 gateway, agent loop, scheduler, and Telegram bot are compiled Go binaries.
 Skills, vector memory, and conversation history remain in Python, served by a
-lightweight FastAPI **sidecar**.  All Python source is vendored under
-`sidecar/python/`, making the repository fully self-contained.
+lightweight FastAPI **sidecar**.  A React web UI is served by a dedicated
+**frontend** nginx service.  All source is vendored in this repository, making
+`docker compose up --build` the single command needed to run the full stack.
 
 ```
- Users / Telegram
-       │
-       ▼
-┌──────────────────┐       HTTP        ┌────────────────────┐
-│  telegram-bot    │  ───────────────► │    Go gateway      │
-│  (Go binary)     │  SSE (streaming)  │  :8000             │
-└──────────────────┘                   │                    │
-                                       │  ┌──────────────┐  │
-                                       │  │ agent loop   │  │
-                                       │  │ (tool-call)  │  │
-                                       │  └──────┬───────┘  │
-                                       │         │          │
-                                       │  ┌──────▼───────┐  │
-                                       │  │ scheduler    │  │
-                                       │  │ (cron/sqlite)│  │
-                                       │  └──────────────┘  │
-                                       └────────┬───────────┘
-                                    HTTP │            │ HTTP
-                           ┌─────────────┘            └──────────────┐
-                           ▼                                         ▼
-                  ┌─────────────────┐                     ┌──────────────────┐
-                  │ Python sidecar  │                     │  Ollama / OpenAI │
-                  │ :8001           │                     │  (LLM backend)   │
-                  │                 │                     └──────────────────┘
-                  │  skills         │
-                  │  vector memory  │
-                  │  history store  │
-                  └─────────────────┘
+ Browser
+    │ HTTP :80
+    ▼
+┌─────────────────────┐       HTTP        ┌────────────────────────────────┐
+│  frontend           │  ───────────────► │    Go gateway  :8000           │
+│  nginx:1.27-alpine  │  proxies /api/*   │                                │
+│  serves /ui/*       │  and /health      │  ┌──────────────┐              │
+└─────────────────────┘                   │  │ agent loop   │              │
+                                          │  │ (tool-call)  │              │
+┌─────────────────────┐       HTTP        │  └──────┬───────┘              │
+│  telegram-bot       │  ───────────────► │         │                      │
+│  (Go binary)        │  /api/query[/str] │  ┌──────▼───────┐              │
+└─────────────────────┘                   │  │ scheduler    │              │
+                                          │  │ (cron/sqlite)│              │
+                                          │  └──────────────┘              │
+                                          └──────────────┬─────────────────┘
+                                               HTTP │         │ HTTP
+                                      ┌─────────────┘         └────────────────┐
+                                      ▼                                         ▼
+                             ┌─────────────────┐                    ┌──────────────────┐
+                             │ Python sidecar  │                    │ Ollama / OpenAI  │
+                             │ :8001           │                    │ (LLM backend)    │
+                             │  skills         │                    └──────────────────┘
+                             │  vector memory  │
+                             │  history store  │
+                             └─────────────────┘
 ```
 
 ### Design principles
@@ -48,6 +47,7 @@ lightweight FastAPI **sidecar**.  All Python source is vendored under
 | **Loose coupling** | Go ↔ Python via plain JSON-over-HTTP; either side can be restarted independently. |
 | **Self-contained repo** | No sibling project required.  Python code vendored.  `docker compose up --build` from any checkout. |
 | **Identical agent contract** | System prompt, JSON envelope, tool-calling protocol match the original `core/agent.py` exactly. |
+| **Frontend as a peer service** | The web UI is an independent nginx container; it never shares a process or filesystem with the gateway. |
 
 ---
 
@@ -61,7 +61,7 @@ omegagrid-agent-go/
 ├── internal/
 │   ├── agent/agent.go           # Tool-calling loop (Run / RunStream)
 │   ├── config/config.go         # Env-driven configuration
-│   ├── httpapi/                  # chi router + REST handlers
+│   ├── httpapi/                 # chi router + REST handlers
 │   │   ├── server.go            #   router, CORS, middleware
 │   │   ├── chat.go              #   POST /api/query, /api/query/stream
 │   │   ├── health.go            #   GET /health
@@ -80,11 +80,37 @@ omegagrid-agent-go/
 │   │   ├── runner.go            #   Background goroutine executing due tasks
 │   │   ├── skill.go             #   Native schedule_task skill
 │   │   └── store.go             #   SQLite task CRUD
+│   ├── search/skill.go          #   Native web_search skill (DuckDuckGo HTML scrape)
 │   ├── skills/client.go         #   HTTP client → sidecar skill endpoints
 │   └── telegram/
 │       ├── agent_client.go      #   Calls gateway /api/query[/stream]
 │       ├── auth.go              #   SQLite-backed Telegram user allowlist
 │       └── bot.go               #   Update poller + command handlers
+├── web/                         # React frontend (Vite + TypeScript + Tailwind)
+│   ├── package.json
+│   ├── vite.config.ts           #   base: '/ui/', dev proxy → :8000
+│   ├── tailwind.config.ts       #   custom dark palette + animations
+│   └── src/
+│       ├── main.tsx             #   React entry, QueryClient, Toaster
+│       ├── App.tsx              #   BrowserRouter + route table
+│       ├── index.css            #   Tailwind directives + scrollbar + selection
+│       ├── api/
+│       │   ├── types.ts         #   TypeScript types matching Go API structs
+│       │   ├── client.ts        #   Typed REST helpers (fetch + json<T>)
+│       │   └── stream.ts        #   fetch-based SSE parser (supports POST)
+│       ├── store/
+│       │   └── chat.ts          #   Zustand: session ID + live stream steps
+│       ├── components/
+│       │   ├── Layout.tsx       #   Icon rail nav sidebar
+│       │   ├── SessionList.tsx  #   Scrollable session list + New button
+│       │   ├── ChatBubble.tsx   #   Markdown-rendered message bubbles + copy
+│       │   └── ToolCard.tsx     #   Collapsible tool call card (args + result)
+│       └── pages/
+│           ├── Chat.tsx         #   Streaming chat, session sidebar, abort
+│           ├── Memory.tsx       #   Vector search + manual add
+│           ├── Skills.tsx       #   Skill catalog with param schemas
+│           ├── Scheduler.tsx    #   Cron task CRUD
+│           └── Health.tsx       #   Gateway status, auto-refresh
 ├── sidecar/
 │   ├── main.py                  # FastAPI shim (skills, memory, history)
 │   ├── requirements.txt
@@ -93,10 +119,14 @@ omegagrid-agent-go/
 │       ├── memory/              #   HistoryStore (sqlite), VectorStore (ChromaDB)
 │       └── llm/                 #   Embeddings clients (Ollama, OpenAI)
 ├── docker/
-│   ├── gateway.Dockerfile
-│   ├── telegram.Dockerfile
-│   └── sidecar.Dockerfile
-├── docker-compose.yml
+│   ├── frontend.Dockerfile      # node:20-alpine build → nginx:1.27-alpine
+│   ├── gateway.Dockerfile       # golang:1.25-bookworm → distroless
+│   ├── telegram.Dockerfile      # golang:1.25-bookworm → distroless
+│   ├── sidecar.Dockerfile       # python:3.11-slim
+│   └── nginx.conf               # SPA fallback + /api proxy + SSE tuning
+├── docker-compose.yml           # 4-service stack
+├── Makefile                     # web / build / build-all / dev-web
+├── .dockerignore
 ├── .env.example
 └── go.mod
 ```
@@ -112,15 +142,16 @@ All configuration is environment-driven, matching the original `.env` pattern.
 | Group | Variables | Defaults |
 |---|---|---|
 | Gateway | `BACKEND_PORT`, `DATA_DIR`, `SIDECAR_URL` | 8000, `/app/data`, `http://127.0.0.1:8001` |
+| Frontend | `FRONTEND_PORT` | 80 (Docker Compose only) |
 | LLM | `LLM_PROVIDER`, `OLLAMA_URL`, `OLLAMA_MODEL`, `OLLAMA_TIMEOUT`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_CHAT_MODEL`, `OPENAI_TIMEOUT`, `OPENAI_API_MODE`, `OPENAI_REASONING_EFFORT` | ollama, `http://127.0.0.1:11434`, `llama3:latest`, 120s |
-| Agent | `AGENT_CONTEXT_TAIL`, `AGENT_MEMORY_HITS` | 30, 5 |
-| Scheduler | `SCHEDULER_DB`, `SCHEDULER_TICK_SEC`, `TELEGRAM_BOT_TOKEN` | `{DATA_DIR}/scheduler.sqlite3`, 60 |
+| Agent | `AGENT_CONTEXT_TAIL`, `AGENT_MEMORY_HITS`, `AGENT_MAX_STEPS` | 30, 5, 25 |
+| Scheduler | `SCHEDULER_DB`, `SCHEDULER_TICK_SEC` | `{DATA_DIR}/scheduler.sqlite3`, 60 |
 | Telegram | `TELEGRAM_BOT_TOKEN`, `BOT_AUTH_ENABLED`, `BOT_ADMIN_ID`, `BOT_AUTH_DB` | — |
 | Skills | `SKILL_HTTP_TIMEOUT`, `SKILL_SHELL_ENABLED`, `SKILL_SSH_ENABLED` | 30, false, false |
 | Memory | `AGENT_VECTOR_COLLECTION`, `AGENT_DEDUP_DISTANCE`, `OLLAMA_EMBED_MODEL`, `OPENAI_EMBED_MODEL` | `memories`, 0.08, `nomic-embed-text`, `text-embedding-3-small` |
 
 `LLM_PROVIDER` determines both the chat client and the embeddings backend.
-When set to `openai-codex` or when the model name starts with `codex-`, the
+When set to `openai-codex` or when the model name contains `codex`, the
 OpenAI client automatically switches to the `/responses` API endpoint.
 
 ### 3.2 LLM clients (`internal/llm`)
@@ -206,6 +237,7 @@ if MaxSteps exceeded:
 | `vector_add` | Store a durable fact or preference | `Memory.AddMemory()` → sidecar `/memory/add` |
 | `vector_search` | Semantic search over stored memories | `Memory.SearchMemory()` → sidecar `/memory/search` |
 | `schedule_task` | Create/list/delete/enable/disable cron tasks | Native Go via `scheduler.ScheduleTaskSkill` |
+| `web_search` | DuckDuckGo HTML search (no API key); returns title/url/snippet | Native Go via `search.WebSearchSkill` |
 
 All sidecar skills (weather, dns_lookup, shell_command, etc.) are merged into
 the tool table dynamically via `Skills.List()` on each run, so hot-registered
@@ -213,10 +245,9 @@ skills (via `skill_creator`) appear without a restart.
 
 #### System prompt
 
-The system prompt is a verbatim copy of the original `core/agent.py` prompt.
-It instructs the LLM to:
+The system prompt instructs the LLM to:
 
-1. Always output strict JSON (tool_call or final).
+1. Always output strict JSON (`tool_call` or `final`).
 2. Use `vector_add` / `vector_search` for persistent memory.
 3. Call tools instead of hallucinating answers.
 4. Use `skill_creator` to self-extend when no existing skill fits.
@@ -267,6 +298,10 @@ Thin HTTP client calling the sidecar:
 | `AddMessage(sid, role, content)` | `POST /sessions/{sid}/messages` | Persist one message |
 | `AddMemory(text, meta)` | `POST /memory/add` | Store vector memory (with dedup) |
 | `SearchMemory(query, k)` | `POST /memory/search` | Semantic search |
+
+The sidecar decodes `content_json` from SQLite before returning, so the
+`/messages` response carries a plain `content` string — no further parsing
+needed in callers.
 
 ### 3.5 Skills client (`internal/skills`)
 
@@ -320,9 +355,7 @@ func Matches(cronExpr string, dt time.Time) bool
 | `N-M` | Range (inclusive) |
 | `A,B,C` | Comma-separated list |
 
-Day of week: 0 = Sunday (matches Python `datetime.weekday()` remapped via
-`%7`).  Invalid expressions return `false` (safe default, never accidentally
-fires).
+Day of week: 0 = Sunday.  Invalid expressions return `false` (safe default).
 
 #### Runner (`runner.go`)
 
@@ -343,8 +376,7 @@ avoid double-firing if the tick period is shorter than a minute.
 
 #### Native skill (`skill.go`)
 
-`ScheduleTaskSkill` is a Go struct implementing the same interface as sidecar
-skills.  It exposes five actions:
+`ScheduleTaskSkill` exposes five actions:
 
 | Action | Parameters | Returns |
 |---|---|---|
@@ -354,10 +386,8 @@ skills.  It exposes five actions:
 | `enable` | `task_id` | `{enabled: true}` |
 | `disable` | `task_id` | `{disabled: true}` |
 
-This skill is registered as a **native** Go skill in `cmd/gateway/main.go`
-and injected into the agent's `NativeSkills` map, bypassing the sidecar
-entirely.  The original Python `schedule_task.py` is excluded from the
-vendored tree.
+Registered as a **native** Go skill in `cmd/gateway/main.go`, bypassing the
+sidecar entirely.
 
 ### 3.7 HTTP gateway (`internal/httpapi`)
 
@@ -384,17 +414,22 @@ Built on [go-chi/chi v5](https://github.com/go-chi/chi).
 | `POST` | `/api/memory/search` | `handleMemorySearch` | Proxy to sidecar |
 | `GET` | `/api/skills` | `handleListSkills` | Proxy to sidecar |
 | `GET` | `/api/tools` | `handleListTools` | Built-in tool schemas |
-| `POST` | `/api/scheduler/tasks` | `handleCreateTask` | Direct to scheduler store |
-| `GET` | `/api/scheduler/tasks` | `handleListTasks` | Direct to scheduler store |
-| `GET` | `/api/scheduler/tasks/{id}` | `handleGetTask` | Direct to scheduler store |
-| `POST` | `/api/scheduler/tasks/{id}/enable` | `handleEnableTask` | Direct to scheduler store |
-| `POST` | `/api/scheduler/tasks/{id}/disable` | `handleDisableTask` | Direct to scheduler store |
-| `DELETE` | `/api/scheduler/tasks/{id}` | `handleDeleteTask` | Direct to scheduler store |
+| `POST` | `/api/scheduler/tasks` | `handleSchedulerCreate` | Direct to scheduler store |
+| `GET` | `/api/scheduler/tasks` | `handleSchedulerList` | Direct to scheduler store |
+| `GET` | `/api/scheduler/tasks/{id}` | `handleSchedulerGet` | Direct to scheduler store |
+| `POST` | `/api/scheduler/tasks/{id}/enable` | `handleSchedulerEnable` | Direct to scheduler store |
+| `POST` | `/api/scheduler/tasks/{id}/disable` | `handleSchedulerDisable` | Direct to scheduler store |
+| `DELETE` | `/api/scheduler/tasks/{id}` | `handleSchedulerDelete` | Direct to scheduler store |
+
+The gateway router serves only `/health` and `/api/*`.  The gateway binary
+contains no static-file serving and no UI assets; all browser UI traffic is
+served by the separate nginx **frontend** service, which proxies `/api/*`
+and `/health` back to the gateway.
 
 #### SSE streaming
 
 `handleQueryStream` uses `http.Flusher` to push events as they arrive from
-the agent's `RunStream()` channel.  Wire format:
+the agent's `RunStream()` channel:
 
 ```
 event: thinking
@@ -414,7 +449,7 @@ data: {"session_id":42,"answer":"It's 15°C and cloudy in London.","meta":{"step
 
 #### Auth store (`auth.go`)
 
-Optional SQLite-backed allowlist.
+Optional SQLite-backed allowlist:
 
 ```sql
 CREATE TABLE IF NOT EXISTS users (
@@ -424,20 +459,9 @@ CREATE TABLE IF NOT EXISTS users (
 );
 ```
 
-| Method | Purpose |
-|---|---|
-| `IsEnabled()` | Whether auth is turned on at all |
-| `IsAdmin(id)` | Check against `BOT_ADMIN_ID` |
-| `IsAuthorized(id)` | Admin or in allowlist |
-| `AddUser(id)` | Insert into allowlist |
-| `Touch(id)` | Update `last_activity` timestamp |
-| `ListUsers()` | Return all allowed user IDs |
-
 Controlled by `BOT_AUTH_ENABLED` and `BOT_ADMIN_ID` environment variables.
 
 #### Agent client (`agent_client.go`)
-
-HTTP client calling the gateway:
 
 | Method | Endpoint | Behaviour |
 |---|---|---|
@@ -459,18 +483,8 @@ Long-polling update handler.
 | *(plain text)* | `handleText` | Treated as agent query |
 
 **Progressive status updates**: when streaming, the bot edits its status
-message every 1500 ms with the current step:
-
-```
-⚙️ Thinking (step 1)
-🛠️ Calling weather...
-🛠️ Calling dns_lookup...
-✅ weather done (0.3s)
-✅ dns_lookup done (0.1s)
-```
-
-Falls back to the synchronous `/api/query` endpoint if the stream encounters
-an error.
+message every 1500 ms with the current step.  Falls back to synchronous
+`/api/query` if the stream fails.
 
 ### 3.9 Observability (`internal/observability`)
 
@@ -482,9 +496,62 @@ func (t *Timer) Mark(name string)          // record time since last Mark
 func (t *Timer) AsMap() map[string]float64  // {name: seconds, total_s: total}
 ```
 
-Used inside the agent loop to track time spent on LLM calls, tool execution,
-memory searches, etc.  Timings surface in `RunResult.Meta` and in the
-streaming `final` event.
+Timings surface in `RunResult.Meta` and in the streaming `final` event.
+
+### 3.10 Web UI (`web/`)
+
+A single-page application built with **Vite + React 18 + TypeScript + Tailwind CSS**.
+
+#### Technology stack
+
+| Concern | Library |
+|---|---|
+| Routing | `react-router-dom` v6 (basename `/ui`) |
+| Server state | `@tanstack/react-query` v5 |
+| Client state | `zustand` v5 |
+| Streaming | Native `fetch` + `ReadableStream` SSE parser |
+| Markdown | `react-markdown` + `remark-gfm` |
+| Icons | `lucide-react` |
+| Toasts | `sonner` |
+| Styling | Tailwind CSS v3, custom dark palette |
+
+#### Pages
+
+| Route | Page | Key behaviour |
+|---|---|---|
+| `/ui/` | Chat | Streaming chat; SSE events rendered as tool-call cards; session sidebar; auto-scroll; abort button |
+| `/ui/memory` | Memory | Semantic search (configurable k); manual add with JSON metadata |
+| `/ui/skills` | Skills | Collapsible skill cards with full parameter schemas |
+| `/ui/scheduler` | Scheduler | Task list with enable/disable toggle; create-modal with skill picker |
+| `/ui/health` | Health | Provider/model status card; 30 s auto-refresh |
+
+#### SSE stream protocol
+
+The web client uses `fetch` (not `EventSource`) so the query can be a POST
+request with a JSON body.  The stream parser:
+
+```
+fetch POST /api/query/stream
+  → ReadableStream of bytes
+    → TextDecoder, buffered line accumulator
+      → split on \n\n boundaries
+        → extract "event:" and "data:" lines
+          → JSON.parse(data) → dispatch to Zustand store
+```
+
+Stream events update Zustand state which React components observe:
+- `thinking` → add a `StreamStep` slot
+- `tool_call` → fill the slot's `toolCall` field
+- `tool_result` → fill the slot's `toolResult` field
+- `final` → set `finalData`, trigger history refetch, refresh session list
+- `error` → set `errorMsg`, show toast
+
+#### Gateway / UI separation
+
+The gateway binary contains no UI assets and no static-file serving.  The
+React app is built and served exclusively by the nginx frontend container.
+For local UI development without Docker, run `make dev-web` (Vite dev
+server at `:5173/ui/`, proxying `/api` to the gateway on `:8000`).
 
 ---
 
@@ -509,7 +576,9 @@ Embeddings backend is selected by `LLM_PROVIDER`:
 
 ### 4.2 Skill registry
 
-23 skills registered at startup (schedule_task excluded):
+21 hard-coded skills + the `skill_creator` and any markdown skills are
+registered at startup.  `schedule_task` and `web_search` are excluded —
+they are native Go skills registered by the gateway.
 
 | Skill | Summary |
 |---|---|
@@ -538,35 +607,15 @@ Embeddings backend is selected by `LLM_PROVIDER`:
 
 #### Hot-registration
 
-`skill_creator` can create new skills at runtime by writing `.md` files to
-`SKILLS_DIR` and registering them in the live `SkillRegistry`.  The Go agent
-loop calls `Skills.List()` on every run, so newly created skills become
-available immediately without restarting anything.
+`skill_creator` writes `.md` files to `SKILLS_DIR` and registers them in the
+live `SkillRegistry`.  The Go agent loop calls `Skills.List()` on every run,
+so newly created skills appear without restarting anything.
 
 #### Markdown skills
 
-`.md` files with YAML frontmatter in `SKILLS_DIR` are loaded as skills:
-
-```markdown
----
-name: example_joke
-description: Tell a joke on a given topic
-parameters:
-  topic:
-    type: string
-    description: Joke topic
-    required: true
-steps:
-  - skill: http_request
-    args:
-      url: "https://api.example.com/joke?topic={{topic}}"
-      method: GET
----
-Optional body / instructions for the LLM.
-```
-
-Pipeline skills can chain multiple steps, referencing previous step results
-via `{{step.N.path.to.field}}`.
+`.md` files with YAML frontmatter in `SKILLS_DIR` are loaded as skills.
+Pipeline skills can chain multiple steps, referencing previous results via
+`{{step.N.path.to.field}}`.
 
 ### 4.3 Vector store
 
@@ -592,8 +641,8 @@ messages (id INTEGER PK, session_id FK, ts REAL, role TEXT, content_json TEXT)
   INDEX ON messages(session_id, ts)
 ```
 
-`load_tail(session_id, limit)` skips entries where `role = "raw_model_json"`
-(debug logging from the agent loop) to keep the LLM context window clean.
+`list_messages` decodes `content_json` before returning, so API consumers
+receive a plain `content` string.  `load_tail` skips `raw_model_json` entries.
 
 ### 4.5 Embeddings clients
 
@@ -617,9 +666,9 @@ Both return `(vector: List[float], elapsed_seconds: float)`.
     └── chroma-collections/
 ```
 
-All SQLite databases are auto-created on first access.  ChromaDB creates its
-directory structure automatically.  `DATA_DIR` defaults to `/app/data` in
-Docker and can be set to any writable path for local development.
+All SQLite databases are auto-created on first access.  In Docker all three
+services (gateway, sidecar, telegram-bot) share a bind-mounted `./data`
+volume.  The frontend service is stateless and needs no volume.
 
 ---
 
@@ -627,28 +676,43 @@ Docker and can be set to any writable path for local development.
 
 ### 6.1 Images
 
-| Image | Base | Size | Build |
+| Image | Base | Approx. size | Build stages |
 |---|---|---|---|
-| `omegagrid-agent-go-gateway` | `gcr.io/distroless/static-debian12` | ~16 MB | Multi-stage: `golang:1.22-bookworm` → distroless |
-| `omegagrid-agent-go-telegram-bot` | `gcr.io/distroless/static-debian12` | ~15 MB | Multi-stage: `golang:1.22-bookworm` → distroless |
-| `omegagrid-agent-go-sidecar` | `python:3.11-slim` | ~1.5 GB | pip install + vendored Python |
+| `frontend` | `nginx:1.27-alpine` | ~50 MB | `node:20-alpine` → nginx |
+| `gateway` | `gcr.io/distroless/static-debian12` | ~16 MB | `golang:1.25-bookworm` → distroless |
+| `telegram-bot` | `gcr.io/distroless/static-debian12` | ~15 MB | `golang:1.25-bookworm` → distroless |
+| `sidecar` | `python:3.11-slim` | ~1.5 GB | pip install + vendored Python |
 
 Go binaries are built with `CGO_ENABLED=0 -trimpath -ldflags="-s -w"` for
-minimal static binaries.  The `modernc.org/sqlite` driver is pure Go, so no
-CGO is needed.
+minimal static binaries.  The `modernc.org/sqlite` driver is pure Go — no CGO
+needed.
+
+The frontend Dockerfile build sequence:
+
+```
+node:20-alpine
+  COPY web/package.json web/package-lock.json → npm ci  (cached layer)
+  COPY web/                                   → npm run build
+  → /web/dist/{index.html,assets/}
+
+nginx:1.27-alpine
+  COPY /web/dist      → /usr/share/nginx/html/ui
+  COPY nginx.conf     → /etc/nginx/conf.d/default.conf
+```
 
 ### 6.2 Compose topology
 
 ```yaml
 services:
-  sidecar:     # :8001, no deps
-  gateway:     # :8000, depends_on sidecar
-  telegram-bot:# no port, depends_on gateway
+  sidecar:      # :8001, no deps
+  gateway:      # :8000, depends_on sidecar
+  frontend:     # :80,   depends_on gateway
+  telegram-bot: # no port, depends_on gateway
 ```
 
-All three services share a bind-mounted `./data` volume for SQLite databases
-and ChromaDB storage.  Build context is `.` (the `omegagrid-agent-go`
-directory itself) — no external paths required.
+gateway, sidecar, and telegram-bot share a bind-mounted `./data` volume.
+frontend is stateless (no volume).  Build context for all four services is `.`
+(the repo root) — no external paths required.
 
 ### 6.3 Networking
 
@@ -656,11 +720,41 @@ directory itself) — no external paths required.
 |---|---|---|
 | sidecar | `:8001` | Ollama / OpenAI (for embeddings) |
 | gateway | `:8000` | sidecar `:8001`, Ollama / OpenAI (for chat) |
+| frontend | `:80` | gateway `:8000` (nginx proxy for `/api/*`, `/health`) |
 | telegram-bot | — | gateway `:8000`, Telegram Bot API |
 
 Within compose, services reference each other by name (`http://sidecar:8001`,
-`http://gateway:8000`).  For Ollama running on the host,
-`http://host.docker.internal:11434` is the default.
+`http://gateway:8000`).  For Ollama on the host machine,
+`http://host.docker.internal:11434` is the recommended URL.
+
+### 6.4 nginx configuration (`docker/nginx.conf`)
+
+```nginx
+location /ui/ {
+    try_files $uri /ui/index.html;   # SPA fallback for client-side routing
+}
+
+location /api/ {
+    proxy_pass         http://gateway:8000;
+    proxy_buffering    off;           # required for SSE streaming
+    proxy_cache        off;
+    proxy_read_timeout 300s;          # allow long agent loops
+}
+```
+
+`proxy_buffering off` is critical for SSE: without it nginx buffers the
+response body and the browser receives no events until the connection closes.
+
+### 6.5 Local dev vs Docker difference
+
+| Scenario | UI served by | API reached via |
+|---|---|---|
+| `make build` + `go run ./cmd/gateway` | (gateway is API-only — no UI) | Direct to `:8000/api/*` |
+| `make dev-web` | Vite dev server at `:5173/ui/` | Vite proxy → `:8000` |
+| `docker compose up --build` | nginx at `:80/ui/` | nginx proxy → `gateway:8000` |
+
+For browser UI work without Docker, use `make dev-web`; for full-stack runs
+use Docker Compose.
 
 ---
 
@@ -674,7 +768,7 @@ Within compose, services reference each other by name (`http://sidecar:8001`,
 POST /api/query
 {
   "query": "What's the weather in London?",
-  "session_id": 0,          // 0 = create new
+  "session_id": 0,          // 0 = create new session
   "remember": true,
   "max_steps": 10,
   "telegram_chat_id": null
@@ -699,7 +793,7 @@ POST /api/query/stream
 ```
 POST /api/sessions/new           → {"session_id": 43}
 GET  /api/sessions?limit=50      → {"sessions": [{id, created_at, message_count}]}
-GET  /api/sessions/42/messages   → {"session_id": 42, "messages": [...]}
+GET  /api/sessions/42/messages   → {"session_id": 42, "messages": [{id, session_id, ts, role, content}]}
 ```
 
 #### Vector memory
@@ -733,7 +827,8 @@ DELETE /api/scheduler/tasks/{id}     remove
 #### Health
 
 ```
-GET /health → {"ok": true, "provider": "ollama", "chat_model": "llama3:latest", ...}
+GET /health → {"ok": true, "provider": "ollama", "chat_model": "llama3:latest",
+               "sidecar_url": "http://sidecar:8001", "scheduler_db": "..."}
 ```
 
 ### 7.2 Sidecar API (internal, called by gateway only)
@@ -745,11 +840,14 @@ POST /memory/add                  {text, meta} → {memory_id, skipped, ...}
 POST /memory/search               {query, k}   → {hits, timings}
 POST /sessions/new                              → {session_id}
 GET  /sessions                                  → {sessions}
-GET  /sessions/{id}/messages                    → {session_id, messages}
-GET  /sessions/{id}/tail?limit=30               → {messages}
+GET  /sessions/{id}/messages                    → {session_id, messages: [{id,session_id,ts,role,content}]}
+GET  /sessions/{id}/tail?limit=30               → {messages: [{role, content}]}
 POST /sessions/{id}/messages      {role, content} → {ok}
 GET  /health                                    → {ok, skill_count}
 ```
+
+Note: `messages` items carry a `content` string (already decoded from the
+SQLite `content_json` column by the history store).
 
 ---
 
@@ -760,10 +858,9 @@ GET  /health                                    → {ok, skill_count}
 - **Compiled binaries** — single ~16 MB static binary, no runtime deps.
 - **Goroutine-based concurrency** — scheduler runner, SSE streaming, and
   request handling are natural goroutine workloads.
-- **sqlite via pure Go** — `modernc.org/sqlite` needs no CGO, simplifying
+- **SQLite via pure Go** — `modernc.org/sqlite` needs no CGO, simplifying
   cross-compilation and distroless deployment.
-- **Fast startup** — sub-second cold start vs Python's multi-second import
-  chain.
+- **Fast startup** — sub-second cold start vs Python's multi-second import chain.
 
 ### Why Python stays for skills?
 
@@ -777,37 +874,45 @@ GET  /health                                    → {ok, skill_count}
 ### Why HTTP sidecar (not gRPC, not embedded Python)?
 
 - **Debugging** — `curl http://localhost:8001/skills` works out of the box.
-- **Independent scaling** — sidecar can be scaled or restarted without
-  touching the gateway.
-- **No CGO** — embedding Python via cgo would negate the static binary
-  advantage and complicate builds.
-- **Protocol simplicity** — plain JSON over HTTP; no code generation, no
-  schema files, no protobuf.
+- **Independent scaling** — sidecar can be restarted without touching the gateway.
+- **No CGO** — embedding Python via cgo would negate the static binary advantage.
+- **Protocol simplicity** — plain JSON over HTTP; no code generation, no protobuf.
 
 ### Why `schedule_task` is native Go
 
-The scheduler store (SQLite) lives on the Go side.  Making the scheduler
-skill call back into Go via the sidecar would create a circular dependency
-(gateway → sidecar → gateway).  Instead, `ScheduleTaskSkill` operates
-directly on the `Store` struct, and the Python sidecar excludes
-`schedule_task.py` entirely.
+The scheduler store (SQLite) lives on the Go side.  Making the skill call
+back into Go via the sidecar would create a circular dependency
+(gateway → sidecar → gateway).  `ScheduleTaskSkill` operates directly on
+the `Store` struct, and the Python sidecar excludes `schedule_task.py`.
+
+### Why the frontend is a separate nginx service (not embedded in the gateway)
+
+- **Separation of concerns** — the gateway binary focuses on API logic; nginx
+  focuses on static file serving and reverse proxying.
+- **Independent rebuild** — changing the UI does not require recompiling Go.
+  `docker compose build frontend` is enough.
+- **Better static serving** — nginx handles gzip, caching headers, and
+  concurrent file serving more efficiently than Go's `http.FileServer`.
+- **SSE buffering control** — nginx's `proxy_buffering off` directive gives
+  fine-grained control over streaming behaviour that is otherwise hard to
+  achieve through a Go reverse proxy.
+- **Single origin for the browser** — all traffic (static files + API) goes
+  through the same nginx host:port, eliminating CORS entirely.
+
+The gateway binary contains no UI assets at all — the nginx frontend is
+the only path that serves the UI in any deployment.
 
 ### Why distroless runtime images
 
-- **Minimal attack surface** — no shell, no package manager, no libc (the Go
-  binary is statically linked).
+- **Minimal attack surface** — no shell, no package manager, no libc.
 - **Small images** — ~2 MB base layer + the Go binary.
-- **Immutable** — nothing to patch or update in the runtime image; rebuild
-  from source to get updates.
+- **Immutable** — nothing to patch at runtime; rebuild from source to update.
 
 ### Why vendored Python
 
-- **Self-contained** — `docker compose up --build` works from any clone
-  location without a sibling `omegagrid-agent` directory.
-- **Version pinned** — the exact Python code shipped is committed to this
-  repo.  No drift between projects.
-- **CI-friendly** — tests can run against the vendored code without
-  multi-repo checkout logic.
+- **Self-contained** — `docker compose up --build` works from any clone.
+- **Version pinned** — exact Python code committed; no drift between projects.
+- **CI-friendly** — tests run against vendored code without multi-repo checkout.
 
 ---
 
@@ -823,6 +928,7 @@ directly on the `Store` struct, and the Python sidecar excludes
 | Telegram stream breaks | Bot falls back to synchronous `/api/query` endpoint. |
 | MaxSteps exceeded | Agent returns "could not finish" with partial debug log. |
 | SQLite directory missing | `os.MkdirAll` creates it before opening the database. |
+| Browser aborts SSE | `fetch` AbortController cancels the request; gateway detects `r.Context().Done()` and stops writing. |
 
 ---
 
@@ -832,8 +938,8 @@ directly on the `Store` struct, and the Python sidecar excludes
 
 1. Create `sidecar/python/skills/my_skill.py` extending `BaseSkill`.
 2. Import and register it in `sidecar/main.py` (`_build_skill_registry()`).
-3. Restart the sidecar (or use `skill_creator` to create a markdown skill at
-   runtime without restart).
+3. Restart the sidecar (or use `skill_creator` to hot-register a markdown
+   skill at runtime without restart).
 
 ### Adding a new LLM backend
 
@@ -843,12 +949,19 @@ directly on the `Store` struct, and the Python sidecar excludes
 
 ### Adding a new native Go skill
 
-1. Create `internal/scheduler/my_skill.go` (or a new package under
-   `internal/`) implementing `agent.Skill`.
-2. Register it in `cmd/gateway/main.go` as a native skill in the agent's
-   `NativeSkills` map.
+1. Create a file under `internal/` implementing `agent.Skill`.
+2. Register it in `cmd/gateway/main.go` in the `nativeSkills` map.
 
 ### Adding a new Telegram command
 
 1. Add a handler method on `telegram.Bot` in `internal/telegram/bot.go`.
 2. Wire it in the `handle()` switch statement.
+
+### Adding a new web UI page
+
+1. Create `web/src/pages/MyPage.tsx`.
+2. Add a `<Route path="/my-page" element={<MyPage />} />` to `src/App.tsx`.
+3. Add a nav entry (icon + label + path) to the `NAV` array in
+   `src/components/Layout.tsx`.
+4. Add REST helpers to `src/api/client.ts` if the page needs new endpoints.
+5. Run `npm run build` (or `make web`) to update `web/dist/`.

@@ -17,6 +17,7 @@ import (
 	"github.com/nexusriot/omegagrid-agent-go/internal/llm"
 	"github.com/nexusriot/omegagrid-agent-go/internal/memory"
 	"github.com/nexusriot/omegagrid-agent-go/internal/scheduler"
+	"github.com/nexusriot/omegagrid-agent-go/internal/search"
 	"github.com/nexusriot/omegagrid-agent-go/internal/skills"
 )
 
@@ -42,11 +43,21 @@ func main() {
 	scheduleSkill := &scheduler.ScheduleTaskSkill{Store: store}
 	scheduleSchema := scheduleSkill.SkillSchema()
 
+	// Native web_search skill (DuckDuckGo HTML — no API key required).
+	searchSkill := search.NewWebSearchSkill()
+	searchSchema := searchSkill.SkillSchema()
+
 	nativeSkills := map[string]agent.Skill{
 		"schedule_task": {
 			Schema: skillSchemaFromMap(scheduleSchema),
 			Execute: func(args map[string]any) (any, error) {
 				return scheduleSkill.Execute(args), nil
+			},
+		},
+		"web_search": {
+			Schema: skillSchemaFromMap(searchSchema),
+			Execute: func(args map[string]any) (any, error) {
+				return searchSkill.Execute(args), nil
 			},
 		},
 	}

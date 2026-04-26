@@ -66,7 +66,10 @@ func (s *Store) Create(name, cronExpr, skill string, args map[string]any, notify
 	if args == nil {
 		args = map[string]any{}
 	}
-	argsJSON, _ := json.Marshal(args)
+	argsJSON, err := json.Marshal(args)
+	if err != nil {
+		return nil, fmt.Errorf("marshal args: %w", err)
+	}
 	now := float64(time.Now().UnixNano()) / 1e9
 	res, err := s.db.Exec(
 		`INSERT INTO scheduled_tasks (name, cron_expr, skill, args_json, notify_telegram_chat_id, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
@@ -98,7 +101,7 @@ func (s *Store) list(query string) ([]*Task, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []*Task
+	out := make([]*Task, 0) // never nil — serialises as [] not null
 	for rows.Next() {
 		t, err := scanTask(rows)
 		if err != nil {

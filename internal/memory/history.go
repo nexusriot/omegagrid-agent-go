@@ -81,8 +81,13 @@ func (h *historyStore) listMessages(sessionID, limit, offset int) ([]StoredMessa
 	var out []StoredMessage
 	for rows.Next() {
 		var m StoredMessage
-		if err := rows.Scan(&m.ID, &m.SessionID, &m.TS, &m.Role, &m.Content); err != nil {
+		var cj string
+		if err := rows.Scan(&m.ID, &m.SessionID, &m.TS, &m.Role, &cj); err != nil {
 			return nil, err
+		}
+		m.Content = unwrapContent(cj)
+		if m.Content == "" {
+			continue // skip raw_model_json and empty entries
 		}
 		out = append(out, m)
 	}

@@ -8,7 +8,7 @@ func (d *Deps) handleHealth(w http.ResponseWriter, _ *http.Request) {
 		"provider":     d.Cfg.Provider,
 		"chat_base":    d.Chat.BaseURL(),
 		"chat_model":   d.Chat.Model(),
-		"sidecar_url":  d.Cfg.SidecarURL,
+		"skills_dir":   d.Cfg.SkillsDir,
 		"scheduler_db": d.Cfg.SchedulerDB,
 	})
 }

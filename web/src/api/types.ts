@@ -65,8 +65,12 @@ export interface HealthStatus {
   ok: boolean
   provider: string
   chat_model: string
-  sidecar_url: string
+  chat_base: string
+  skills_dir: string
   scheduler_db: string
+  embed_model: string
+  embed_ok: boolean
+  embed_error?: string
 }
 
 export interface QueryRequest {

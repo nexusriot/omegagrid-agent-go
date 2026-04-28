@@ -97,8 +97,10 @@ func (v *vectorStore) searchText(query string, k int) (*SearchResult, error) {
 	if k <= 0 {
 		k = 5
 	}
-	if v.col.Count() == 0 {
-		return &SearchResult{}, nil
+	if count := v.col.Count(); count == 0 {
+		return &SearchResult{Hits: []MemoryHit{}}, nil
+	} else if k > count {
+		k = count // chromem: nResults must be ≤ collection size
 	}
 
 	emb, err := v.embedClient.embed(query)
@@ -148,6 +150,13 @@ func coerceMeta(m map[string]any) map[string]string {
 		}
 	}
 	return out
+}
+
+// probeEmbed makes a minimal embed call to verify the embeddings backend is
+// reachable and the configured model is loaded.  Called by Client.EmbedHealthy.
+func (v *vectorStore) probeEmbed() error {
+	_, err := v.embedClient.embed("probe")
+	return err
 }
 
 func sha256Text(text string) string {

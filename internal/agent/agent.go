@@ -231,7 +231,7 @@ func (s *Service) Run(req RunRequest) (*RunResult, error) {
 		state.messages = append(state.messages,
 			llm.Message{Role: "assistant", Content: string(assistantJSON)},
 			llm.Message{Role: "tool", Content: string(toolJSON)},
-			llm.Message{Role: "user", Content: "Tool result received. If you now have all the information needed, return type=\"final\". Otherwise call another tool."},
+			llm.Message{Role: "user", Content: toolFollowup(toolName, result)},
 		)
 	}
 
@@ -345,7 +345,7 @@ func (s *Service) RunStream(req RunRequest, out chan<- Event) {
 		state.messages = append(state.messages,
 			llm.Message{Role: "assistant", Content: string(assistantJSON)},
 			llm.Message{Role: "tool", Content: string(toolJSON)},
-			llm.Message{Role: "user", Content: "Tool result received. If you now have all the information needed, return type=\"final\". Otherwise call another tool."},
+			llm.Message{Role: "user", Content: toolFollowup(toolName, result)},
 		)
 	}
 
@@ -727,6 +727,23 @@ func asFloat(v any) float64 {
 
 func round3(v float64) float64 {
 	return float64(int64(v*1000+0.5)) / 1000
+}
+
+// toolFollowup returns the user turn appended after each tool result.
+// When the result contains an error key the message explicitly forbids the
+// LLM from claiming success, preventing hallucinated "I stored it" replies.
+func toolFollowup(toolName string, result any) string {
+	if m, ok := result.(map[string]any); ok {
+		if errMsg, _ := m["error"].(string); errMsg != "" {
+			return fmt.Sprintf(
+				"Tool %q FAILED with error: %s\n"+
+					"You MUST tell the user that this operation failed. "+
+					"Do NOT claim it succeeded.",
+				toolName, errMsg,
+			)
+		}
+	}
+	return `Tool result received. If you now have all the information needed, return type="final". Otherwise call another tool.`
 }
 
 // extractAttachments inspects a tool result for binary artifacts (images) and

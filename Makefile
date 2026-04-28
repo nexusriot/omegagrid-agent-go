@@ -1,4 +1,13 @@
-.PHONY: web build build-all dev-web migrate-vector vector-export vector-import vector-migrate vet
+# Export host UID/GID so docker compose runs containers as the current user,
+# preventing root-owned files on the bind-mounted ./data volume.
+export UID := $(shell id -u)
+export GID := $(shell id -g)
+
+.PHONY: web build build-all dev-web migrate-vector vector-export vector-import vector-migrate vet init
+
+## Create ./data with correct ownership (run once before first docker compose up)
+init:
+	mkdir -p data/skills
 
 ## Build the React UI (outputs to web/dist)
 web:
@@ -26,11 +35,10 @@ dev-web:
 migrate-vector:
 	go build -o bin/migrate-vector ./cmd/migrate-vector
 
-## Step 1: dump ChromaDB → JSONL (run inside the sidecar container)
-##   docker compose exec sidecar python3 /app/cmd/migrate-vector/export.py \
-##       --persist /app/data/vector_db --collection memories --out /app/data/vector_db.jsonl
+## Step 1: dump ChromaDB → JSONL (docker — no local Python needed)
+##   docker compose -f docker-compose.migrate.yml run --rm migrate-export
 vector-export:
-	@echo "Run inside the sidecar container; see Makefile comment for the command."
+	@echo "Run via docker: docker compose -f docker-compose.migrate.yml run --rm migrate-export"
 
 ## Step 2: load JSONL → chromem-go (host)
 vector-import: migrate-vector

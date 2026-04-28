@@ -53,6 +53,11 @@ func buildEmbeddings(cfg config.Config) (embeddingsClient, error) {
 // Close releases database handles.
 func (c *Client) Close() error { return c.hist.close() }
 
+// EmbedHealthy returns nil when the configured embeddings backend responds
+// correctly, or the error if it is unreachable / the model is not loaded.
+// Safe to call on every /health poll — the probe embeds a single short word.
+func (c *Client) EmbedHealthy() error { return c.vec.probeEmbed() }
+
 type Message struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`

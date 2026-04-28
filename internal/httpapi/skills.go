@@ -2,8 +2,7 @@ package httpapi
 
 import "net/http"
 
-// handleListSkills proxies through to the sidecar so the frontend / clients
-// see the same skill list the agent sees.
+// handleListSkills returns all skills registered in the in-process skill registry.
 func (d *Deps) handleListSkills(w http.ResponseWriter, _ *http.Request) {
 	skills, err := d.Skills.List()
 	if err != nil {

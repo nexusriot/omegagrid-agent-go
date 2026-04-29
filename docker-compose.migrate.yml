@@ -1,0 +1,39 @@
+# One-shot ChromaDB → chromem-go migration.
+#
+# Run in order (each exits when done):
+#
+#   docker compose -f docker-compose.migrate.yml run --rm migrate-export
+#   docker compose -f docker-compose.migrate.yml run --rm migrate-import
+#
+# Or use the Makefile shortcut:
+#   make vector-migrate
+#
+# Both services mount ./data so the JSONL handoff file stays on the host.
+
+services:
+
+  # Step 1 — export ChromaDB → JSONL
+  migrate-export:
+    build:
+      context: .
+      dockerfile: docker/migrate.Dockerfile
+      target: exporter
+    command:
+      - "--persist=/data/vector_db"
+      - "--collection=${AGENT_VECTOR_COLLECTION:-memories}"
+      - "--out=/data/vector_db.jsonl"
+    volumes:
+      - ./data:/data
+
+  # Step 2 — import JSONL → chromem-go
+  migrate-import:
+    build:
+      context: .
+      dockerfile: docker/migrate.Dockerfile
+      target: importer
+    command:
+      - "--in=/data/vector_db.jsonl"
+      - "--db=/data/chromem"
+      - "--collection=${AGENT_VECTOR_COLLECTION:-memories}"
+    volumes:
+      - ./data:/data

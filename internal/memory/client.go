@@ -1,30 +1,62 @@
-// Package memory is a thin HTTP client to the Python sidecar's memory + history
-// service.  All persistence (sqlite history, ChromaDB vector store) lives in
-// Python; Go just calls these endpoints.
+// Package memory provides in-process history (SQLite) and semantic vector
+// (chromem-go) stores.  The public API is unchanged from the former HTTP-based
+// client so all callers compile without modification.
 package memory
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
-	"net/url"
 	"strings"
-	"time"
+
+	"github.com/nexusriot/omegagrid-agent-go/internal/config"
 )
 
+// Client wraps the in-process history and vector stores.
 type Client struct {
-	baseURL string
-	http    *http.Client
+	hist *historyStore
+	vec  *vectorStore
 }
 
-func New(baseURL string) *Client {
-	return &Client{
-		baseURL: strings.TrimRight(baseURL, "/"),
-		http:    &http.Client{Timeout: 60 * time.Second},
+// New initialises SQLite history and chromem-go vector stores.
+func New(cfg config.Config) (*Client, error) {
+	hist, err := newHistoryStore(cfg.AgentDB)
+	if err != nil {
+		return nil, fmt.Errorf("history store: %w", err)
+	}
+
+	embed, err := buildEmbeddings(cfg)
+	if err != nil {
+		_ = hist.close()
+		return nil, fmt.Errorf("embeddings client: %w", err)
+	}
+
+	vec, err := newVectorStore(cfg.VectorDir, cfg.VectorCollection, embed, cfg.DedupDistance)
+	if err != nil {
+		_ = hist.close()
+		return nil, fmt.Errorf("vector store: %w", err)
+	}
+
+	return &Client{hist: hist, vec: vec}, nil
+}
+
+func buildEmbeddings(cfg config.Config) (embeddingsClient, error) {
+	switch strings.ToLower(cfg.Provider) {
+	case "openai", "openai-codex", "codex":
+		if cfg.OpenAIAPIKey == "" {
+			return nil, fmt.Errorf("OPENAI_API_KEY required for openai embeddings")
+		}
+		return newOpenAIEmbeddings(cfg.OpenAIBaseURL, cfg.OpenAIAPIKey, cfg.OpenAIEmbedModel, cfg.OpenAITimeoutSec), nil
+	default:
+		return newOllamaEmbeddings(cfg.OllamaURL, cfg.OllamaEmbedModel, cfg.OllamaTimeoutSec), nil
 	}
 }
+
+// Close releases database handles.
+func (c *Client) Close() error { return c.hist.close() }
+
+// EmbedHealthy returns nil when the configured embeddings backend responds
+// correctly, or the error if it is unreachable / the model is not loaded.
+// Safe to call on every /health poll — the probe embeds a single short word.
+func (c *Client) EmbedHealthy() error { return c.vec.probeEmbed() }
 
 type Message struct {
 	Role    string `json:"role"`
@@ -45,53 +77,16 @@ type StoredMessage struct {
 	Content   string  `json:"content"`
 }
 
-func (c *Client) CreateSession() (int, error) {
-	var out struct {
-		SessionID int `json:"session_id"`
-	}
-	if err := c.postJSON("/sessions/new", nil, &out); err != nil {
-		return 0, err
-	}
-	return out.SessionID, nil
-}
-
-func (c *Client) ListSessions(limit int) ([]SessionInfo, error) {
-	var out struct {
-		Sessions []SessionInfo `json:"sessions"`
-	}
-	if err := c.getJSON(fmt.Sprintf("/sessions?limit=%d", limit), &out); err != nil {
-		return nil, err
-	}
-	return out.Sessions, nil
-}
-
+func (c *Client) CreateSession() (int, error)                   { return c.hist.createSession() }
+func (c *Client) ListSessions(limit int) ([]SessionInfo, error) { return c.hist.listSessions(limit) }
 func (c *Client) ListMessages(sessionID, limit, offset int) ([]StoredMessage, error) {
-	var out struct {
-		Messages []StoredMessage `json:"messages"`
-	}
-	path := fmt.Sprintf("/sessions/%d/messages?limit=%d&offset=%d", sessionID, limit, offset)
-	if err := c.getJSON(path, &out); err != nil {
-		return nil, err
-	}
-	return out.Messages, nil
+	return c.hist.listMessages(sessionID, limit, offset)
 }
-
 func (c *Client) LoadTail(sessionID, limit int) ([]Message, error) {
-	var out struct {
-		Messages []Message `json:"messages"`
-	}
-	path := fmt.Sprintf("/sessions/%d/tail?limit=%d", sessionID, limit)
-	if err := c.getJSON(path, &out); err != nil {
-		return nil, err
-	}
-	return out.Messages, nil
+	return c.hist.loadTail(sessionID, limit)
 }
-
-// AddMessage stores a single conversation message.  content may be a string
-// (plain text) or any JSON-serializable value (used for tool results).
 func (c *Client) AddMessage(sessionID int, role string, content any) error {
-	body := map[string]any{"role": role, "content": content}
-	return c.postJSON(fmt.Sprintf("/sessions/%d/messages", sessionID), body, nil)
+	return c.hist.addMessage(sessionID, role, content)
 }
 
 type MemoryHit struct {
@@ -107,63 +102,17 @@ type AddResult struct {
 	Reason   string `json:"reason"`
 }
 
-func (c *Client) AddMemory(text string, meta map[string]any) (*AddResult, error) {
-	var out AddResult
-	body := map[string]any{"text": text, "meta": meta}
-	if err := c.postJSON("/memory/add", body, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
-}
-
 type SearchResult struct {
 	Hits    []MemoryHit        `json:"hits"`
-	Timings map[string]float64 `json:"timings"`
+	Timings map[string]float64 `json:"timings,omitempty"`
+}
+
+func (c *Client) AddMemory(text string, meta map[string]any) (*AddResult, error) {
+	return c.vec.addText(text, meta, "")
 }
 
 func (c *Client) SearchMemory(query string, k int) (*SearchResult, error) {
-	var out SearchResult
-	body := map[string]any{"query": query, "k": k}
-	if err := c.postJSON("/memory/search", body, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
-}
-
-func (c *Client) postJSON(path string, body, out any) error {
-	var rdr io.Reader
-	if body != nil {
-		buf, _ := json.Marshal(body)
-		rdr = bytes.NewReader(buf)
-	}
-	req, _ := http.NewRequest(http.MethodPost, c.baseURL+path, rdr)
-	req.Header.Set("Content-Type", "application/json")
-	return c.do(req, out)
-}
-
-func (c *Client) getJSON(path string, out any) error {
-	full := c.baseURL + path
-	if _, err := url.Parse(full); err != nil {
-		return err
-	}
-	req, _ := http.NewRequest(http.MethodGet, full, nil)
-	return c.do(req, out)
-}
-
-func (c *Client) do(req *http.Request, out any) error {
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("sidecar %s %s: %d %s", req.Method, req.URL.Path, resp.StatusCode, truncate(string(raw), 200))
-	}
-	if out == nil {
-		return nil
-	}
-	return json.Unmarshal(raw, out)
+	return c.vec.searchText(query, k)
 }
 
 func truncate(s string, n int) string {

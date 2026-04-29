@@ -33,10 +33,10 @@ export const query = (req: QueryRequest) =>
   json<QueryResult>('/api/query', { method: 'POST', body: JSON.stringify(req) })
 
 export const searchMemory = (q: string, k = 10) =>
-  json<{ hits: MemoryHit[] }>('/api/memory/search', {
+  json<{ hits: MemoryHit[] | null }>('/api/memory/search', {
     method: 'POST',
     body: JSON.stringify({ query: q, k }),
-  }).then(r => r.hits)
+  }).then(r => r.hits ?? [])
 
 export const addMemory = (text: string, meta: Record<string, unknown> = {}) =>
   json<MemoryAddResult>('/api/memory/add', {

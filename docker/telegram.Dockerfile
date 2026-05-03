@@ -8,4 +8,5 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/telegram-bot ./cmd
 
 FROM gcr.io/distroless/static-debian12
 COPY --from=build /out/telegram-bot /telegram-bot
+USER nonroot
 ENTRYPOINT ["/telegram-bot"]

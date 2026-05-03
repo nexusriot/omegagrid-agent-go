@@ -43,10 +43,15 @@ export default function ChatBubble({ message }: Props) {
   const isUser = message.role === 'user'
   const isTool = message.role === 'tool'
 
-  // The API returns content as a plain string (already decoded by the sidecar).
-  // Guard against any residual JSON-encoded strings just in case.
+  // The API returns content as a plain string (already decoded by the history store).
+  // Guard against any residual JSON wrapping just in case ({"content":"..."} or "quoted").
   let content = message.content ?? ''
-  if (content.startsWith('"') && content.endsWith('"')) {
+  if (content.startsWith('{')) {
+    try {
+      const p = JSON.parse(content)
+      if (p && typeof p.content === 'string') content = p.content
+    } catch { /* use raw */ }
+  } else if (content.startsWith('"') && content.endsWith('"')) {
     try { content = JSON.parse(content) } catch { /* use raw */ }
   }
 

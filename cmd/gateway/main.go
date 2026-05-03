@@ -30,8 +30,18 @@ func main() {
 		log.Fatalf("llm init: %v", err)
 	}
 
-	mem := memory.New(cfg.SidecarURL)
-	sk := skills.New(cfg.SidecarURL)
+	// In-process memory store (SQLite history + chromem-go vector).
+	mem, err := memory.New(cfg)
+	if err != nil {
+		log.Fatalf("memory init: %v", err)
+	}
+	defer mem.Close()
+
+	// In-process skill registry (all 21 built-ins + markdown skills).
+	sk, err := skills.New(cfg)
+	if err != nil {
+		log.Fatalf("skills init: %v", err)
+	}
 
 	store, err := scheduler.NewStore(cfg.SchedulerDB)
 	if err != nil {
@@ -62,8 +72,7 @@ func main() {
 		},
 	}
 
-	// The scheduler runner needs to be able to invoke any skill — both
-	// sidecar (Python) and native (Go) — to fulfil scheduled jobs.
+	// Scheduler runner can invoke both native and registered skills.
 	exec := func(name string, args map[string]any) (any, error) {
 		if native, ok := nativeSkills[name]; ok {
 			return native.Execute(args)
@@ -100,7 +109,8 @@ func main() {
 	}
 
 	go func() {
-		log.Printf("gateway listening on %s (sidecar=%s, provider=%s, model=%s)", addr, cfg.SidecarURL, cfg.Provider, chat.Model())
+		log.Printf("gateway listening on %s (provider=%s, model=%s, skills-dir=%s)",
+			addr, cfg.Provider, chat.Model(), cfg.SkillsDir)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("listen: %v", err)
 		}
@@ -127,8 +137,8 @@ func buildChat(cfg config.Config) (llm.ChatClient, error) {
 	}
 }
 
-// skillSchemaFromMap converts the loose map[string]any returned by the native
-// skill into the typed skills.Skill struct used by the agent's prompt builder.
+// skillSchemaFromMap converts the loose map[string]any returned by native
+// skills into the typed skills.Skill struct used by the agent.
 func skillSchemaFromMap(m map[string]any) skills.Skill {
 	out := skills.Skill{
 		Name:        getString(m, "name"),

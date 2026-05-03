@@ -1,0 +1,12 @@
+# One command:
+make vector-migrate
+
+# Or manually step by step:
+docker compose -f docker-compose.migrate.yml run --rm --remove-orphans migrate-export
+docker compose -f docker-compose.migrate.yml run --rm --remove-orphans migrate-import
+
+# Verify counts match:
+wc -l data/vector_db.jsonl       # number of exported records
+
+# Once validated, clean up the intermediate file:
+rm data/vector_db.jsonl

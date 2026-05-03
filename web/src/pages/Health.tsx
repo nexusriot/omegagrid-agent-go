@@ -1,5 +1,5 @@
 import { useQuery } from '@tanstack/react-query'
-import { Activity, Server, Bot, Database, RefreshCw, CheckCircle2, XCircle, Loader2, type LucideIcon } from 'lucide-react'
+import { Activity, Server, Bot, FolderOpen, RefreshCw, CheckCircle2, XCircle, Loader2, Cpu, type LucideIcon } from 'lucide-react'
 import { fetchHealth } from '../api/client'
 import type { HealthStatus } from '../api/types'
 
@@ -30,11 +30,18 @@ function HealthCard({ status }: { status: HealthStatus }) {
       </div>
 
       <div className="px-4">
-        <Row label="Provider"    value={status.provider} />
-        <Row label="Chat model"  value={status.chat_model} mono />
-        <Row label="Sidecar URL" value={status.sidecar_url} mono />
+        <Row label="Provider"     value={status.provider} />
+        <Row label="Chat model"   value={status.chat_model} mono />
+        <Row label="LLM base URL" value={status.chat_base} mono />
+        <Row label="Embed model"  value={`${status.embed_model} ${status.embed_ok ? '✓' : '✗'}`} mono />
+        <Row label="Skills dir"   value={status.skills_dir} mono />
         <Row label="Scheduler DB" value={status.scheduler_db} mono />
       </div>
+      {!status.embed_ok && status.embed_error && (
+        <div className="mx-4 mb-3 rounded-lg border border-red-900/50 bg-red-950/20 px-3 py-2 text-[11px] text-red-400 font-mono break-all">
+          Embed error: {status.embed_error}
+        </div>
+      )}
     </div>
   )
 }
@@ -114,21 +121,21 @@ export default function Health() {
               />
               <StatCard
                 icon={Server}
-                label="Model"
+                label="Chat model"
                 value={data.chat_model}
                 sub="Active chat model"
               />
               <StatCard
-                icon={Database}
-                label="Sidecar"
-                value={new URL(data.sidecar_url).host}
-                sub="Skills & memory"
+                icon={Cpu}
+                label="Embed model"
+                value={data.embed_model}
+                sub={data.embed_ok ? 'Embeddings OK' : (data.embed_error ?? 'Unavailable')}
               />
               <StatCard
-                icon={Activity}
-                label="Status"
-                value={data.ok ? 'OK' : 'ERROR'}
-                sub="Overall system health"
+                icon={FolderOpen}
+                label="Skills"
+                value={data.skills_dir.split('/').pop() ?? data.skills_dir}
+                sub={data.skills_dir}
               />
             </div>
           </>

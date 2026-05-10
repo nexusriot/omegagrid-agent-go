@@ -45,12 +45,21 @@ All source is self-contained in this repository, making
 omegagrid-agent-go/
 ├── cmd/
 │   ├── gateway/main.go          # HTTP gateway entry point
+│   ├── cli/                     # `omega` CLI binary (local + remote modes)
+│   │   ├── main.go              #   Subcommand dispatch
+│   │   ├── client.go            #   Local-mode bootstrap + remote HTTP client
+│   │   ├── ask.go               #   omega ask  — agent queries with streaming
+│   │   ├── skills.go            #   omega skills list/describe/run
+│   │   ├── memory.go            #   omega memory search/add
+│   │   ├── schedule.go          #   omega schedule list/create/delete
+│   │   └── session.go           #   omega session list/export
 │   ├── telegram-bot/main.go     # Telegram bot entry point
 │   └── migrate-vector/          # One-shot ChromaDB → chromem-go migration
 │       ├── main.go              #   Go importer (reads JSONL → writes chromem-go)
 │       └── export.py            #   Python exporter (reads ChromaDB → writes JSONL)
 ├── internal/
-│   ├── agent/agent.go           # Tool-calling loop (Run / RunStream)
+│   ├── agent/agent.go           # Tool-calling loop (Run / RunStream); tool_calls batches
+│   ├── bootstrap/bootstrap.go   # Single New(cfg) wires every service (gateway + cli)
 │   ├── config/config.go         # Env-driven configuration
 │   ├── httpapi/                 # chi router + REST handlers
 │   │   ├── server.go            #   router, CORS, middleware
@@ -59,7 +68,7 @@ omegagrid-agent-go/
 │   │   ├── history.go           #   sessions CRUD
 │   │   ├── memory.go            #   POST /api/memory/{add,search}
 │   │   ├── scheduler.go         #   scheduler task CRUD
-│   │   └── skills.go            #   GET /api/skills, /api/tools
+│   │   └── skills.go            #   GET /api/skills, /api/tools, POST /api/skills/{name}/invoke
 │   ├── llm/
 │   │   ├── llm.go               #   ChatClient interface + Message type
 │   │   ├── ollama.go            #   Ollama /api/chat client
@@ -145,7 +154,9 @@ All configuration is environment-driven, matching the original `.env` pattern.
 | Gateway | `BACKEND_PORT`, `DATA_DIR` | 8000, `/app/data` |
 | Frontend | `FRONTEND_PORT` | 80 (Docker Compose only) |
 | LLM | `LLM_PROVIDER`, `OLLAMA_URL`, `OLLAMA_MODEL`, `OLLAMA_TIMEOUT`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_CHAT_MODEL`, `OPENAI_TIMEOUT`, `OPENAI_API_MODE`, `OPENAI_REASONING_EFFORT` | ollama, `http://127.0.0.1:11434`, `llama3:latest`, 120s |
-| Agent | `AGENT_DB`, `AGENT_CONTEXT_TAIL`, `AGENT_MEMORY_HITS`, `AGENT_MAX_STEPS` | `{DATA_DIR}/agent_memory.sqlite3`, 30, 5, 25 |
+| Agent | `AGENT_DB`, `AGENT_CONTEXT_TAIL`, `AGENT_MEMORY_HITS`, `AGENT_MAX_STEPS`, `AGENT_PARALLEL_TOOLS`, `AGENT_MAX_PARALLEL` | `{DATA_DIR}/agent_memory.sqlite3`, 30, 5, 25, false, 4 |
+| Playground | `PLAYGROUND_DISABLED` | false (playground enabled) |
+| CLI | `OMEGA_REMOTE` | unset (local mode); set to gateway URL for remote mode |
 | Vector memory | `AGENT_VECTOR_DIR`, `AGENT_VECTOR_COLLECTION`, `AGENT_DEDUP_DISTANCE` | `{DATA_DIR}/chromem`, `memories`, 0.08 |
 | Embeddings | `OLLAMA_EMBED_MODEL`, `OPENAI_EMBED_MODEL` | `nomic-embed-text`, `text-embedding-3-small` |
 | Scheduler | `SCHEDULER_DB`, `SCHEDULER_TICK_SEC` | `{DATA_DIR}/scheduler.sqlite3`, 60 |
@@ -205,6 +216,28 @@ iteration the LLM must return one of two envelope types:
   "notes": "<optional>"
 }
 ```
+
+When `AGENT_PARALLEL_TOOLS=true`, a third envelope is allowed and a corresponding
+addendum is appended to the system prompt:
+
+```json
+// Parallel batch — execute multiple INDEPENDENT tools at once
+{
+  "type": "tool_calls",
+  "calls": [
+    {"tool": "weather", "args": {"city": "Berlin"}, "why": "..."},
+    {"tool": "weather", "args": {"city": "Paris"},  "why": "..."}
+  ]
+}
+```
+
+Calls in a batch run concurrently up to `AGENT_MAX_PARALLEL` (default 4) via a
+semaphore-bounded goroutine pool (`Service.executeBatch`).  Results are
+appended to the LLM context in the order the model emitted them — not in
+completion order — so the LLM's view stays deterministic.  A failure in one
+call does not cancel its siblings; each result is surfaced individually.
+Streaming mode emits all `tool_call` events upfront, then `tool_result` events
+as each completes (potentially out of order).
 
 #### Run flow
 
@@ -538,6 +571,7 @@ Built on [go-chi/chi v5](https://github.com/go-chi/chi).
 | `POST` | `/api/memory/add` | `handleMemoryAdd` | In-process vector store |
 | `POST` | `/api/memory/search` | `handleMemorySearch` | In-process vector store |
 | `GET` | `/api/skills` | `handleListSkills` | In-process skill registry |
+| `POST` | `/api/skills/{name}/invoke` | `handleSkillInvoke` | **Skill playground** — direct skill execution, no agent loop. Gated by `PLAYGROUND_DISABLED`. |
 | `GET` | `/api/tools` | `handleListTools` | Built-in tool schemas |
 | `POST` | `/api/scheduler/tasks` | `handleSchedulerCreate` | In-process scheduler store |
 | `GET` | `/api/scheduler/tasks` | `handleSchedulerList` | In-process scheduler store |
@@ -646,7 +680,7 @@ A single-page application built with **Vite + React 18 + TypeScript + Tailwind C
 |---|---|---|
 | `/ui/` | Chat | Streaming chat; SSE events rendered as tool-call cards; session sidebar; auto-scroll; abort button |
 | `/ui/memory` | Memory | Semantic search (configurable k); manual add with JSON metadata |
-| `/ui/skills` | Skills | Collapsible skill cards with full parameter schemas |
+| `/ui/skills` | Skills | Collapsible skill cards with full parameter schemas; **inline playground panel** with auto-generated form, three-tab result view (Pretty / Raw / Timing), and a "Copy as `tool_call` JSON" button for prompt debugging |
 | `/ui/scheduler` | Scheduler | Task list with enable/disable toggle; create-modal with skill picker |
 | `/ui/health` | Health | Provider/model status card; 30 s auto-refresh |
 
@@ -677,6 +711,70 @@ The gateway binary contains no UI assets and no static-file serving.  The
 React app is built and served exclusively by the nginx frontend container.
 For local UI development without Docker, run `make dev-web` (Vite dev
 server at `:5173/ui/`, proxying `/api` to the gateway on `:8000`).
+
+### 3.11 Bootstrap (`internal/bootstrap`)
+
+A single `bootstrap.New(cfg)` function constructs every runtime service
+(LLM chat, memory, skills, scheduler store, scheduler runner, native
+skills, agent service) and returns a `*Services` struct plus a cleanup
+closure.  Both `cmd/gateway` and `cmd/cli` (in local mode) call it, so
+service wiring lives in exactly one place.
+
+```go
+type Services struct {
+    Chat         llm.ChatClient
+    Memory       *memory.Client
+    Skills       *skills.Client
+    Sched        *scheduler.Store
+    Runner       *scheduler.Runner
+    Agent        *agent.Service
+    NativeSkills map[string]agent.Skill
+}
+
+func New(cfg config.Config) (*Services, func(), error)
+```
+
+This refactor reduced `cmd/gateway/main.go` from 168 to 52 lines and let the
+CLI reuse the gateway's exact construction without duplication.
+
+### 3.12 CLI (`cmd/cli` — `omega` binary)
+
+A single static Go binary that exposes the agent's full surface without
+requiring a running HTTP gateway.  Built with stdlib only (no cobra) using
+manual subcommand dispatch + `flag.FlagSet` per subcommand.
+
+```
+omega <ask|skills|memory|schedule|session> [flags] [args]
+```
+
+#### Operating modes
+
+The CLI checks the `OMEGA_REMOTE` env var to choose between two modes:
+
+| Mode | When | How |
+|---|---|---|
+| **local** (default) | `OMEGA_REMOTE` unset | `bootstrap.New(cfg)` constructs all services in-process — same wiring as the gateway. The `Skills`, `Memory`, `Sched`, and `Agent` services are then called directly. |
+| **remote** | `OMEGA_REMOTE=http://host:port` set | Each subcommand makes JSON HTTP calls to the gateway's REST endpoints. SSE streaming is parsed by `bufio.Scanner`. |
+
+Subcommands depend only on the typed wrappers in `cmd/cli/client.go`
+(`listSkills()`, `invokeSkill()`, `searchMemory()`, etc.); the wrappers
+internally branch on `isRemote()` to pick the right path.
+
+#### Subcommands
+
+| Command | Purpose |
+|---|---|
+| `omega ask "..." [--stream] [--session N]` | Run an agent query.  With `--stream` and a TTY stdout, renders thinking / tool_call / tool_result events with ANSI color; falls back to plain text when stdout is piped. |
+| `omega skills list` | List all registered skills with signatures. |
+| `omega skills describe NAME` | Show one skill's full schema. |
+| `omega skills run NAME --arg k=v` | Invoke a skill directly (uses the same execution path as the playground endpoint). |
+| `omega memory search "Q" -k N` | Semantic search over vector memory. |
+| `omega memory add "TEXT" --meta k=v` | Manually add a memory. |
+| `omega schedule list / create / delete` | CRUD for scheduled cron tasks. |
+| `omega session list` | List sessions with message counts. |
+| `omega session export ID` | Dump a session's full message history as JSON (for piping to `jq`). |
+
+`--json` is supported across most subcommands for machine-readable output.
 
 ---
 
@@ -924,9 +1022,26 @@ POST /api/memory/search {"query": "...", "k": 5}
 #### Skills
 
 ```
-GET /api/skills → {"skills": [{name, description, parameters, body}]}
-GET /api/tools  → {"tools": [{name, description, parameters}]}
+GET  /api/skills                     → {"skills": [{name, description, parameters, body}]}
+GET  /api/tools                      → {"tools": [{name, description, parameters}]}
+
+POST /api/skills/{name}/invoke       — skill playground; bypasses the agent loop
+{"args": {"city": "Berlin"}}
+→ {
+    "name":      "weather",
+    "args":      {"city": "Berlin"},
+    "result":    {...}        // raw tool result (or null on error)
+    "elapsed_s": 0.412,
+    "error":     null,        // string when execution fails
+    "attachments": [...]      // images extracted via ExtractAttachments (or null)
+  }
 ```
+
+The invoke endpoint is gated by `PLAYGROUND_DISABLED` (default off — playground
+enabled).  It runs the same `skills.Execute()` path as the agent loop and
+applies the same `agent.ExtractAttachments()` post-processing so binary
+artifacts like QR-code images come back as base64 attachments instead of
+inflating the response payload.
 
 #### Scheduler
 
@@ -1058,15 +1173,24 @@ Or write the `.md` file manually and restart the gateway (it loads all files in
 ### Adding a new LLM backend
 
 1. Create `internal/llm/my_backend.go` implementing `ChatClient`.
-2. Add a case in `cmd/gateway/main.go` to construct it when
-   `LLM_PROVIDER=my_backend`.
+2. Add a case in `bootstrap.BuildChat()` to construct it when
+   `LLM_PROVIDER=my_backend`.  Both `cmd/gateway` and `cmd/cli` (local mode)
+   pick it up automatically.
 3. If the backend needs a different embeddings client, add it in
    `internal/memory/embeddings.go` and wire it in `memory.New()`.
 
 ### Adding a new native Go skill
 
 1. Create a file under `internal/` implementing `agent.Skill`.
-2. Register it in `cmd/gateway/main.go` in the `nativeSkills` map.
+2. Register it in `bootstrap.New()` in the `native` map (used by both gateway
+   and CLI local mode).
+
+### Adding a new CLI subcommand
+
+1. Add a switch-case in `cmd/cli/main.go` dispatching to a new `runX(args)` function.
+2. Create `cmd/cli/x.go` with the new function, using `flag.FlagSet` for argument parsing.
+3. Add typed wrappers to `cmd/cli/client.go` if the command needs a new
+   service or HTTP call — branch on `isRemote()` to pick local vs. remote.
 
 ### Adding a new Telegram command
 

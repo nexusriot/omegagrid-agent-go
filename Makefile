@@ -3,7 +3,7 @@
 export UID := $(shell id -u)
 export GID := $(shell id -g)
 
-.PHONY: web build build-all dev-web migrate-vector vector-export vector-import vector-migrate vet init
+.PHONY: web build build-all cli dev-web migrate-vector vector-export vector-import vector-migrate vet init
 
 ## Create ./data with correct ownership (run once before first docker compose up)
 init:
@@ -17,11 +17,16 @@ web:
 build: web
 	go build -o bin/gateway ./cmd/gateway
 
-## Build both binaries
+## Build all binaries (gateway + telegram-bot + migrate-vector + omega CLI)
 build-all: web
-	go build -o bin/gateway      ./cmd/gateway
-	go build -o bin/telegram-bot ./cmd/telegram-bot
+	go build -o bin/gateway        ./cmd/gateway
+	go build -o bin/telegram-bot   ./cmd/telegram-bot
 	go build -o bin/migrate-vector ./cmd/migrate-vector
+	go build -o bin/omega          ./cmd/cli
+
+## Build the omega CLI binary only
+cli:
+	go build -o bin/omega ./cmd/cli
 
 ## Run go vet on all packages
 vet:

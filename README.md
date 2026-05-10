@@ -18,9 +18,9 @@ repository.
     ▼
 ┌─────────────────────┐   HTTP    ┌──────────────────────────────────────────┐
 │  frontend (nginx)   │ ────────► │   Go gateway                     :8000   │
-│  React UI  :80      │           │                                           │
-│  proxies /api/*     │           │  agent loop · scheduler · skills          │
-└─────────────────────┘           │  vector memory · history                  │
+│  React UI  :80      │           │                                          │
+│  proxies /api/*     │           │  agent loop · scheduler · skills         │
+└─────────────────────┘           │  vector memory · history                 │
          ▲                        └─────────────────┬────────────────────────┘
          │ Telegram Bot API                          │ HTTP
          │                                           ▼

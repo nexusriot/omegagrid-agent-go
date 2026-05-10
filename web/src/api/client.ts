@@ -64,3 +64,9 @@ export const enableTask = (id: number) =>
 
 export const disableTask = (id: number) =>
   json<{ ok: boolean }>(`/api/scheduler/tasks/${id}/disable`, { method: 'POST' })
+
+export const invokeSkill = (name: string, args: Record<string, unknown>) =>
+  json<import('./types').SkillInvokeResult>(`/api/skills/${encodeURIComponent(name)}/invoke`, {
+    method: 'POST',
+    body: JSON.stringify({ args }),
+  })

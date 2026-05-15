@@ -18,9 +18,9 @@ repository.
     ▼
 ┌─────────────────────┐   HTTP    ┌──────────────────────────────────────────┐
 │  frontend (nginx)   │ ────────► │   Go gateway                     :8000   │
-│  React UI  :80      │           │                                           │
-│  proxies /api/*     │           │  agent loop · scheduler · skills          │
-└─────────────────────┘           │  vector memory · history                  │
+│  React UI  :80      │           │                                          │
+│  proxies /api/*     │           │  agent loop · scheduler · skills         │
+└─────────────────────┘           │  vector memory · history                 │
          ▲                        └─────────────────┬────────────────────────┘
          │ Telegram Bot API                          │ HTTP
          │                                           ▼
@@ -32,12 +32,14 @@ repository.
 ```
 cmd/
   gateway/              Go gateway entry point (HTTP API on :8000)
+  cli/                  `omega` CLI — local or remote agent / skills / memory / scheduler
   telegram-bot/         Standalone Telegram bot binary
   migrate-vector/       One-shot ChromaDB → chromem-go migration tool
     main.go             Go importer (reads JSONL → writes chromem-go)
     export.py           Python exporter (reads ChromaDB → writes JSONL)
 internal/
-  agent/                Tool-calling loop (Run / RunStream)
+  agent/                Tool-calling loop (Run / RunStream); supports tool_calls batches
+  bootstrap/            Single New() that wires every service (used by gateway + cli)
   config/               Env-driven configuration loader
   httpapi/              chi router + all REST handlers
   llm/                  Ollama + OpenAI chat clients (chat_completions & responses)
@@ -119,11 +121,47 @@ TELEGRAM_BOT_TOKEN=... GATEWAY_URL=http://127.0.0.1:8000 \
 ```bash
 make web          # cd web && npm run build  (populates web/dist/)
 make build        # web + go build -o bin/gateway
-make build-all    # web + build gateway + telegram-bot + migrate-vector
+make build-all    # web + build gateway + telegram-bot + migrate-vector + omega CLI
+make cli          # go build -o bin/omega ./cmd/cli
 make dev-web      # cd web && npm run dev  (Vite dev server, hot-reload)
 make vet          # go vet ./...
 make vector-migrate   # ChromaDB → chromem-go migration (see below)
 ```
+
+## CLI (`omega`)
+
+A single static Go binary that exposes the full agent surface — agent queries,
+skills, vector memory, scheduler, and session history — without requiring the
+HTTP gateway to be running.
+
+```bash
+go build -o bin/omega ./cmd/cli
+```
+
+By default the CLI wires services in-process (same construction as the
+gateway), reading the same `LLM_PROVIDER`, `DATA_DIR`, etc. env vars.  Set
+`OMEGA_REMOTE=http://localhost:8000` to hit a running gateway over HTTP
+instead.
+
+```bash
+# Local mode (in-process services)
+omega ask "what's the weather in Berlin?" --stream
+omega skills list
+omega skills run weather --arg city=Berlin
+omega memory search "kubernetes notes" -k 10
+omega memory add "vlad prefers tabs" --meta tag=preference
+omega schedule list
+omega schedule create --name daily-news --cron "0 9 * * *" --skill web_search --arg query=hackernews
+omega schedule delete 7
+omega session list
+omega session export 42 > session-42.json
+
+# Remote mode (talks to a running gateway)
+OMEGA_REMOTE=http://localhost:8000 omega ask "..."
+```
+
+`omega ask --stream` renders SSE events with ANSI color when stdout is a TTY
+and falls back to plain text when piped (so `omega ask … | jq` works).
 
 ## Web UI pages
 
@@ -131,7 +169,7 @@ make vector-migrate   # ChromaDB → chromem-go migration (see below)
 |---|---|---|
 | Chat | `/ui/` | Streaming agent chat with live tool-call cards, session sidebar, markdown rendering |
 | Memory | `/ui/memory` | Semantic search + manual add to the vector store |
-| Skills | `/ui/skills` | Browse all registered skills with parameter schemas |
+| Skills | `/ui/skills` | Browse all registered skills with parameter schemas; **skill playground** (▶ button) invokes any skill directly with auto-generated forms and shows pretty / raw / timing tabs |
 | Scheduler | `/ui/scheduler` | CRUD for cron tasks: create, enable/disable, delete, view last result |
 | Health | `/ui/health` | Live gateway + provider status, auto-refreshes every 30 s |
 
@@ -141,10 +179,12 @@ Everything is compiled into the gateway binary (pure Go, no CGO, distroless runt
 
 **Core platform:**
 - HTTP gateway, REST API, SSE streaming
-- Agent tool-calling loop with JSON recovery
+- Agent tool-calling loop with JSON recovery and **optional parallel tool calls** (`tool_calls` batch envelope, gated by `AGENT_PARALLEL_TOOLS`)
 - Ollama + OpenAI (chat_completions & responses) LLM clients
 - Cron scheduler (SQLite store, matcher, runner)
 - Telegram bot with SQLite auth allowlist
+- `omega` CLI binary with local + remote modes (`cmd/cli`)
+- **Skill playground** endpoint (`POST /api/skills/{name}/invoke`) for invoking any skill directly without going through the agent loop
 
 **Memory & history:**
 - `HistoryStore` — SQLite sessions + messages (`modernc.org/sqlite`, CGO-free)
@@ -259,6 +299,10 @@ rm data/vector_db.jsonl
 | `AGENT_CONTEXT_TAIL` | `30` | Messages loaded from history per run |
 | `AGENT_MEMORY_HITS` | `5` | Vector memory results injected into context |
 | `AGENT_MAX_STEPS` | `25` | Maximum tool-call steps per agent run |
+| `AGENT_PARALLEL_TOOLS` | `false` | Allow the LLM to emit `tool_calls` batches that execute concurrently |
+| `AGENT_MAX_PARALLEL` | `4` | Max concurrent tool executions per batch when `AGENT_PARALLEL_TOOLS=true` |
+| `PLAYGROUND_DISABLED` | `false` | Disable `POST /api/skills/{name}/invoke` (skill playground) |
+| `OMEGA_REMOTE` | — | Base URL of a running gateway; switches the `omega` CLI from local to remote mode |
 | `SKILLS_DIR` | `{DATA_DIR}/skills` | Directory for dynamic markdown skills |
 | `SKILL_HTTP_TIMEOUT` | `30` | Timeout for HTTP-based skills (seconds) |
 | `SKILL_SHELL_ENABLED` | `false` | Enable `shell_command` skill |

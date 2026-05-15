@@ -44,9 +44,14 @@ type Config struct {
 	SkillSSHIdentFile  string
 
 	// Agent loop
-	ContextTail   int
-	MemoryHits    int
-	AgentMaxSteps int
+	ContextTail        int
+	MemoryHits         int
+	AgentMaxSteps      int
+	AgentParallelTools bool
+	AgentMaxParallel   int
+
+	// Skill playground
+	PlaygroundEnabled bool
 
 	// Scheduler
 	SchedulerDB      string
@@ -82,6 +87,9 @@ func Load() Config {
 		ContextTail:         atoiOr(os.Getenv("AGENT_CONTEXT_TAIL"), 30),
 		MemoryHits:          atoiOr(os.Getenv("AGENT_MEMORY_HITS"), 5),
 		AgentMaxSteps:       atoiOr(os.Getenv("AGENT_MAX_STEPS"), 25),
+		AgentParallelTools:  isTruthy(os.Getenv("AGENT_PARALLEL_TOOLS")),
+		AgentMaxParallel:    atoiOr(os.Getenv("AGENT_MAX_PARALLEL"), 4),
+		PlaygroundEnabled:   !isTruthy(os.Getenv("PLAYGROUND_DISABLED")),
 		SchedulerTickSec:    atoiOr(os.Getenv("SCHEDULER_TICK_SEC"), 60),
 		TelegramBotToken:    os.Getenv("TELEGRAM_BOT_TOKEN"),
 	}

@@ -32,6 +32,22 @@ func newHistoryStore(path string) (*historyStore, error) {
 			content_json TEXT  NOT NULL
 		);
 		CREATE INDEX IF NOT EXISTS idx_msg_sess_ts ON messages(session_id, ts);
+		CREATE TABLE IF NOT EXISTS skill_invocations (
+			id            INTEGER PRIMARY KEY AUTOINCREMENT,
+			session_id    INTEGER REFERENCES sessions(id),
+			step          INTEGER NOT NULL,
+			ts            REAL    NOT NULL,
+			skill         TEXT    NOT NULL,
+			kind          TEXT    NOT NULL,
+			args_json     TEXT    NOT NULL,
+			result_json   TEXT,
+			error_msg     TEXT,
+			duration_ms   INTEGER NOT NULL,
+			why           TEXT,
+			replayed_from INTEGER
+		);
+		CREATE INDEX IF NOT EXISTS idx_inv_session_ts ON skill_invocations(session_id, ts);
+		CREATE INDEX IF NOT EXISTS idx_inv_skill_ts   ON skill_invocations(skill, ts);
 	`); err != nil {
 		_ = db.Close()
 		return nil, err

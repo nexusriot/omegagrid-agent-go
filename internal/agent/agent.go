@@ -178,44 +178,7 @@ func (s *Service) Run(req RunRequest) (*RunResult, error) {
 		}
 		why, _ := data["why"].(string)
 
-		isSkill := state.skillNames[toolName]
-		kind := "tool"
-		if isSkill {
-			kind = "skill"
-		}
-		state.debug = append(state.debug,
-			fmt.Sprintf("[%s] >>> CALL %s(%s) reason=%s", kind, toolName, truncateJSON(args, 200), nonempty(why, "-")),
-		)
-
-		var result any
-		var elapsed float64
-		if entry, ok := state.tools[toolName]; ok {
-			t0 := time.Now()
-			r, err := entry.Execute(args)
-			elapsed = time.Since(t0).Seconds()
-			if err != nil {
-				result = map[string]any{"error": err.Error(), "tool": toolName, "args": args}
-				state.debug = append(state.debug, fmt.Sprintf("[%s] EXCEPTION: %v", kind, err))
-			} else {
-				result = r
-			}
-			key := "tool_s_total"
-			if isSkill {
-				key = "skill_s_total"
-			}
-			state.timings[key] += elapsed
-			state.debug = append(state.debug, fmt.Sprintf("[%s] <<< RESULT (%.3fs): %s", kind, elapsed, truncate(fmt.Sprint(result), 300)))
-		} else {
-			available := keys(state.tools)
-			result = map[string]any{"error": "Unknown tool/skill: " + toolName, "available": available}
-			state.debug = append(state.debug, fmt.Sprintf("[%s] ERROR unknown name '%s'", kind, toolName))
-		}
-
-		// Extract binary attachments (images etc.) before feeding result to LLM.
-		if atts, cleaned := extractAttachments(toolName, result); len(atts) > 0 {
-			state.attachments = append(state.attachments, atts...)
-			result = cleaned
-		}
+		result, _ := s.callTool(state, step, toolName, why, args)
 
 		// Persist tool result and feed back into the LLM context
 		_ = s.Memory.AddMessage(state.sid, "tool", result)
@@ -306,31 +269,7 @@ func (s *Service) RunStream(req RunRequest, out chan<- Event) {
 		why, _ := data["why"].(string)
 		out <- Event{Event: "tool_call", Step: step, Tool: toolName, Args: args, Why: why}
 
-		var result any
-		var elapsed float64
-		if entry, ok := state.tools[toolName]; ok {
-			t0 := time.Now()
-			r, err := entry.Execute(args)
-			elapsed = time.Since(t0).Seconds()
-			if err != nil {
-				result = map[string]any{"error": err.Error(), "tool": toolName, "args": args}
-			} else {
-				result = r
-			}
-			key := "tool_s_total"
-			if state.skillNames[toolName] {
-				key = "skill_s_total"
-			}
-			state.timings[key] += elapsed
-		} else {
-			result = map[string]any{"error": "Unknown tool/skill: " + toolName, "available": keys(state.tools)}
-		}
-
-		// Extract binary attachments before feeding result to LLM.
-		if atts, cleaned := extractAttachments(toolName, result); len(atts) > 0 {
-			state.attachments = append(state.attachments, atts...)
-			result = cleaned
-		}
+		result, elapsed := s.callTool(state, step, toolName, why, args)
 
 		out <- Event{Event: "tool_result", Step: step, Tool: toolName, Result: truncate(fmt.Sprint(result), 300), ElapsedS: round3(elapsed)}
 
@@ -531,6 +470,81 @@ func (s *Service) buildMeta(st *runState, step int, fallback bool) map[string]an
 		out["fallback"] = true
 	}
 	return out
+}
+
+// sensitiveSkills have their args and result redacted in the audit log.
+var sensitiveSkills = map[string]bool{
+	"password_gen":  true,
+	"shell_command": true,
+	"ssh_command":   true,
+}
+
+// callTool executes one tool/skill, updates state (timings, debug, attachments),
+// writes an audit record (best-effort), and returns the cleaned result and
+// elapsed seconds.
+func (s *Service) callTool(state *runState, step int, name, why string, args map[string]any) (any, float64) {
+	kind := "unknown"
+	if _, ok := state.tools[name]; ok {
+		if state.skillNames[name] {
+			kind = "skill"
+		} else {
+			kind = "tool"
+		}
+	}
+	state.debug = append(state.debug,
+		fmt.Sprintf("[%s] >>> CALL %s(%s) reason=%s", kind, name, truncateJSON(args, 200), nonempty(why, "-")),
+	)
+
+	var result any
+	var execErr error
+	t0 := time.Now()
+	if entry, ok := state.tools[name]; ok {
+		result, execErr = entry.Execute(args)
+		if execErr != nil {
+			result = map[string]any{"error": execErr.Error(), "tool": name, "args": args}
+			state.debug = append(state.debug, fmt.Sprintf("[%s] EXCEPTION: %v", kind, execErr))
+		}
+	} else {
+		result = map[string]any{"error": "Unknown tool/skill: " + name, "available": keys(state.tools)}
+		state.debug = append(state.debug, fmt.Sprintf("[%s] ERROR unknown name '%s'", kind, name))
+	}
+	elapsed := time.Since(t0)
+
+	key := "tool_s_total"
+	if state.skillNames[name] {
+		key = "skill_s_total"
+	}
+	state.timings[key] += elapsed.Seconds()
+	state.debug = append(state.debug, fmt.Sprintf("[%s] <<< RESULT (%.3fs): %s", kind, elapsed.Seconds(), truncate(fmt.Sprint(result), 300)))
+
+	if atts, cleaned := extractAttachments(name, result); len(atts) > 0 {
+		state.attachments = append(state.attachments, atts...)
+		result = cleaned
+	}
+
+	auditArgs := any(args)
+	auditResult := result
+	if sensitiveSkills[name] {
+		auditArgs = map[string]any{"redacted": true}
+		auditResult = map[string]any{"redacted": true}
+	}
+	errMsg := ""
+	if execErr != nil {
+		errMsg = execErr.Error()
+	}
+	_ = s.Memory.AddInvocation(memory.AuditRecord{
+		SessionID:  state.sid,
+		Step:       step,
+		Skill:      name,
+		Kind:       kind,
+		Args:       auditArgs,
+		Result:     auditResult,
+		ErrorMsg:   errMsg,
+		DurationMS: elapsed.Milliseconds(),
+		Why:        why,
+	})
+
+	return result, elapsed.Seconds()
 }
 
 func buildSystemPrompt(tools map[string]Skill, skillNames map[string]bool) string {

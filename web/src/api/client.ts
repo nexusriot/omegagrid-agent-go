@@ -82,3 +82,9 @@ export const fetchInvocation = (id: number) =>
 
 export const replayInvocation = (id: number) =>
   json<ReplayResult>(`/api/invocations/${id}/replay`, { method: 'POST' })
+
+export const invokeSkill = (name: string, args: Record<string, unknown>) =>
+  json<import('./types').SkillInvokeResult>(`/api/skills/${encodeURIComponent(name)}/invoke`, {
+    method: 'POST',
+    body: JSON.stringify({ args }),
+  })

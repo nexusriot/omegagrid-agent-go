@@ -50,6 +50,7 @@ func NewRouter(d Deps) http.Handler {
 		r.Post("/memory/search", d.handleMemorySearch)
 
 		r.Get("/skills", d.handleListSkills)
+		r.Post("/skills/{name}/invoke", d.handleSkillInvoke)
 		r.Get("/tools", d.handleListTools)
 
 		r.Get("/invocations", d.handleListInvocations)

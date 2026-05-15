@@ -130,6 +130,22 @@ export interface ReplayResult {
   error: string
 }
 
+export interface SkillAttachment {
+  type: string
+  filename: string
+  mime_type: string
+  base64: string
+}
+
+export interface SkillInvokeResult {
+  name: string
+  args: Record<string, unknown>
+  result: unknown
+  elapsed_s: number
+  error: string | null
+  attachments: SkillAttachment[] | null
+}
+
 // SSE event payloads
 export interface ThinkingEvent  { step: number }
 export interface ToolCallEvent  { step: number; tool: string; args: Record<string, unknown>; why: string }

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nexusriot/omegagrid-agent-go/internal/llm"
@@ -68,6 +69,22 @@ CRITICAL RULES:
   "instructions" field directly and immediately return type="final" with your
   generated answer. Do NOT call the same skill again.`
 
+// parallelAddendum is appended to the system prompt when parallel tool calls
+// are enabled. It teaches the model the batch envelope format.
+const parallelAddendum = `
+PARALLEL TOOL CALLS: When you need multiple INDEPENDENT tools whose results do
+not depend on each other, you may return all of them in one batch:
+{
+  "type": "tool_calls",
+  "calls": [
+    {"tool": "<name>", "args": {...}, "why": "<reason>"},
+    {"tool": "<name>", "args": {...}, "why": "<reason>"}
+  ]
+}
+Use this ONLY when the calls are genuinely independent (e.g. weather for two
+cities, ping two hosts). For sequential dependencies call tools one at a time.
+Maximum %d calls per batch.`
+
 // Attachment is a binary artifact produced by a tool (e.g. a QR code image).
 // It is carried through the streaming pipeline and handed to the final consumer
 // (Telegram bot, HTTP client, etc.) without going through the LLM.
@@ -88,12 +105,14 @@ type Skill struct {
 // Service is the agent.  It has no per-request state — all dependencies are
 // injected and reused across run() and run_stream() calls.
 type Service struct {
-	Memory       *memory.Client
-	Skills       *skills.Client
-	Chat         llm.ChatClient
-	NativeSkills map[string]Skill // schedule_task lives here
-	ContextTail  int
-	MemoryHits   int
+	Memory          *memory.Client
+	Skills          *skills.Client
+	Chat            llm.ChatClient
+	NativeSkills    map[string]Skill // schedule_task lives here
+	ContextTail     int
+	MemoryHits      int
+	ParallelEnabled bool
+	MaxParallel     int
 }
 
 // RunRequest is the input contract for both Run and RunStream.
@@ -163,6 +182,39 @@ func (s *Service) Run(req RunRequest) (*RunResult, error) {
 			_ = s.Memory.AddMessage(state.sid, "assistant", answer)
 			return s.fallbackResult(state, answer, step, false), nil
 		}
+
+		// Parallel batch: execute all calls concurrently, then feed combined result.
+		if respType == "tool_calls" {
+			calls, ok := parseBatchCalls(data)
+			if !ok {
+				answer := bestAnswer(data)
+				_ = s.Memory.AddMessage(state.sid, "assistant", answer)
+				return s.fallbackResult(state, answer, step, true), nil
+			}
+			for i := range calls {
+				calls[i].Step = step
+			}
+			results := s.executeBatch(state, calls)
+			for _, r := range results {
+				state.attachments = append(state.attachments, r.Atts...)
+				_ = s.Memory.AddMessage(state.sid, "tool", r.Result)
+				state.timings["skill_s_total"] += r.Elapsed
+				state.debug = append(state.debug, fmt.Sprintf("[batch] %s (%.3fs): %s", r.Call.Name, r.Elapsed, truncate(fmt.Sprint(r.Result), 200)))
+			}
+			batchJSON, _ := json.Marshal(data)
+			var allResults []any
+			for _, r := range results {
+				allResults = append(allResults, r.Result)
+			}
+			allJSON, _ := json.Marshal(allResults)
+			state.messages = append(state.messages,
+				llm.Message{Role: "assistant", Content: string(batchJSON)},
+				llm.Message{Role: "tool", Content: string(allJSON)},
+				llm.Message{Role: "user", Content: batchFollowup(results)},
+			)
+			continue
+		}
+
 		if respType != "tool_call" {
 			state.debug = append(state.debug, fmt.Sprintf("[fallback] LLM returned unexpected type=%v", data["type"]))
 			answer := bestAnswer(data)
@@ -170,7 +222,7 @@ func (s *Service) Run(req RunRequest) (*RunResult, error) {
 			return s.fallbackResult(state, answer, step, true), nil
 		}
 
-		// Execute tool call
+		// Single tool call (original path).
 		toolName, _ := data["tool"].(string)
 		args, _ := data["args"].(map[string]any)
 		if args == nil {
@@ -178,9 +230,27 @@ func (s *Service) Run(req RunRequest) (*RunResult, error) {
 		}
 		why, _ := data["why"].(string)
 
-		result, _ := s.callTool(state, step, toolName, why, args)
+		isSkill := state.skillNames[toolName]
+		kind := "tool"
+		if isSkill {
+			kind = "skill"
+		}
+		state.debug = append(state.debug,
+			fmt.Sprintf("[%s] >>> CALL %s(%s) reason=%s", kind, toolName, truncateJSON(args, 200), nonempty(why, "-")),
+		)
 
-		// Persist tool result and feed back into the LLM context
+		br := s.runOne(state, batchCall{Name: toolName, Args: args, Why: why, Step: step})
+		result := br.Result
+		elapsed := br.Elapsed
+		state.attachments = append(state.attachments, br.Atts...)
+
+		key := "tool_s_total"
+		if isSkill {
+			key = "skill_s_total"
+		}
+		state.timings[key] += elapsed
+		state.debug = append(state.debug, fmt.Sprintf("[%s] <<< RESULT (%.3fs): %s", kind, elapsed, truncate(fmt.Sprint(result), 300)))
+
 		_ = s.Memory.AddMessage(state.sid, "tool", result)
 		var assistantJSON, toolJSON []byte
 		if assistantJSON, err = json.Marshal(data); err != nil {
@@ -246,6 +316,45 @@ func (s *Service) RunStream(req RunRequest, out chan<- Event) {
 			}
 			return
 		}
+		// Parallel batch.
+		if respType == "tool_calls" {
+			calls, ok := parseBatchCalls(data)
+			if !ok {
+				answer := bestAnswer(data)
+				_ = s.Memory.AddMessage(state.sid, "assistant", answer)
+				meta := s.buildMeta(state, step, false)
+				meta["fallback"] = true
+				out <- Event{Event: "final", SessionID: state.sid, Answer: answer, Meta: meta, Attachments: state.attachments}
+				return
+			}
+			// Emit tool_call events upfront so the UI shows them immediately.
+			for i := range calls {
+				calls[i].Step = step
+			}
+			for _, c := range calls {
+				out <- Event{Event: "tool_call", Step: step, Tool: c.Name, Args: c.Args, Why: c.Why}
+			}
+			results := s.executeBatch(state, calls)
+			for _, r := range results {
+				state.attachments = append(state.attachments, r.Atts...)
+				_ = s.Memory.AddMessage(state.sid, "tool", r.Result)
+				state.timings["skill_s_total"] += r.Elapsed
+				out <- Event{Event: "tool_result", Step: step, Tool: r.Call.Name, Result: truncate(fmt.Sprint(r.Result), 300), ElapsedS: round3(r.Elapsed)}
+			}
+			batchJSON, _ := json.Marshal(data)
+			var allResults []any
+			for _, r := range results {
+				allResults = append(allResults, r.Result)
+			}
+			allJSON, _ := json.Marshal(allResults)
+			state.messages = append(state.messages,
+				llm.Message{Role: "assistant", Content: string(batchJSON)},
+				llm.Message{Role: "tool", Content: string(allJSON)},
+				llm.Message{Role: "user", Content: batchFollowup(results)},
+			)
+			continue
+		}
+
 		if respType != "tool_call" {
 			answer := bestAnswer(data)
 			_ = s.Memory.AddMessage(state.sid, "assistant", answer)
@@ -261,6 +370,7 @@ func (s *Service) RunStream(req RunRequest, out chan<- Event) {
 			return
 		}
 
+		// Single tool call.
 		toolName, _ := data["tool"].(string)
 		args, _ := data["args"].(map[string]any)
 		if args == nil {
@@ -269,7 +379,16 @@ func (s *Service) RunStream(req RunRequest, out chan<- Event) {
 		why, _ := data["why"].(string)
 		out <- Event{Event: "tool_call", Step: step, Tool: toolName, Args: args, Why: why}
 
-		result, elapsed := s.callTool(state, step, toolName, why, args)
+		br := s.runOne(state, batchCall{Name: toolName, Args: args, Why: why, Step: step})
+		result := br.Result
+		elapsed := br.Elapsed
+		state.attachments = append(state.attachments, br.Atts...)
+
+		key := "tool_s_total"
+		if state.skillNames[toolName] {
+			key = "skill_s_total"
+		}
+		state.timings[key] += elapsed
 
 		out <- Event{Event: "tool_result", Step: step, Tool: toolName, Result: truncate(fmt.Sprint(result), 300), ElapsedS: round3(elapsed)}
 
@@ -429,7 +548,7 @@ func (s *Service) startSession(req RunRequest) (*runState, error) {
 	st.debug = append(st.debug, fmt.Sprintf("[init] skills_count=%d", len(st.skillNames)))
 
 	// Assemble the message list
-	systemPrompt := buildSystemPrompt(st.tools, st.skillNames)
+	systemPrompt := s.buildSystemPrompt(st.tools, st.skillNames)
 	contextParts := []string{formatMemoryHits(st.memories)}
 	if req.TelegramChatID != nil {
 		contextParts = append(contextParts, fmt.Sprintf("Current Telegram chat_id: %d (use this for notify_telegram_chat_id when user asks for Telegram notifications)", *req.TelegramChatID))
@@ -479,88 +598,28 @@ var sensitiveSkills = map[string]bool{
 	"ssh_command":   true,
 }
 
-// callTool executes one tool/skill, updates state (timings, debug, attachments),
-// writes an audit record (best-effort), and returns the cleaned result and
-// elapsed seconds.
-func (s *Service) callTool(state *runState, step int, name, why string, args map[string]any) (any, float64) {
-	kind := "unknown"
-	if _, ok := state.tools[name]; ok {
-		if state.skillNames[name] {
-			kind = "skill"
-		} else {
-			kind = "tool"
+func (s *Service) buildSystemPrompt(tools map[string]Skill, skillNames map[string]bool) string {
+	var skillSection string
+	if len(skillNames) > 0 {
+		var lines []string
+		lines = append(lines, "", "You also have skills (call them like tools):")
+		for name := range tools {
+			if !skillNames[name] {
+				continue
+			}
+			lines = append(lines, formatSkillLine(tools[name].Schema))
 		}
+		skillSection = strings.Join(lines, "\n")
 	}
-	state.debug = append(state.debug,
-		fmt.Sprintf("[%s] >>> CALL %s(%s) reason=%s", kind, name, truncateJSON(args, 200), nonempty(why, "-")),
-	)
-
-	var result any
-	var execErr error
-	t0 := time.Now()
-	if entry, ok := state.tools[name]; ok {
-		result, execErr = entry.Execute(args)
-		if execErr != nil {
-			result = map[string]any{"error": execErr.Error(), "tool": name, "args": args}
-			state.debug = append(state.debug, fmt.Sprintf("[%s] EXCEPTION: %v", kind, execErr))
+	base := fmt.Sprintf(systemPromptTemplate, skillSection)
+	if s.ParallelEnabled {
+		maxP := s.MaxParallel
+		if maxP <= 0 {
+			maxP = 4
 		}
-	} else {
-		result = map[string]any{"error": "Unknown tool/skill: " + name, "available": keys(state.tools)}
-		state.debug = append(state.debug, fmt.Sprintf("[%s] ERROR unknown name '%s'", kind, name))
+		base += fmt.Sprintf(parallelAddendum, maxP)
 	}
-	elapsed := time.Since(t0)
-
-	key := "tool_s_total"
-	if state.skillNames[name] {
-		key = "skill_s_total"
-	}
-	state.timings[key] += elapsed.Seconds()
-	state.debug = append(state.debug, fmt.Sprintf("[%s] <<< RESULT (%.3fs): %s", kind, elapsed.Seconds(), truncate(fmt.Sprint(result), 300)))
-
-	if atts, cleaned := extractAttachments(name, result); len(atts) > 0 {
-		state.attachments = append(state.attachments, atts...)
-		result = cleaned
-	}
-
-	auditArgs := any(args)
-	auditResult := result
-	if sensitiveSkills[name] {
-		auditArgs = map[string]any{"redacted": true}
-		auditResult = map[string]any{"redacted": true}
-	}
-	errMsg := ""
-	if execErr != nil {
-		errMsg = execErr.Error()
-	}
-	_ = s.Memory.AddInvocation(memory.AuditRecord{
-		SessionID:  state.sid,
-		Step:       step,
-		Skill:      name,
-		Kind:       kind,
-		Args:       auditArgs,
-		Result:     auditResult,
-		ErrorMsg:   errMsg,
-		DurationMS: elapsed.Milliseconds(),
-		Why:        why,
-	})
-
-	return result, elapsed.Seconds()
-}
-
-func buildSystemPrompt(tools map[string]Skill, skillNames map[string]bool) string {
-	if len(skillNames) == 0 {
-		return fmt.Sprintf(systemPromptTemplate, "")
-	}
-	var lines []string
-	lines = append(lines, "", "You also have skills (call them like tools):")
-	for name := range tools {
-		if !skillNames[name] {
-			continue
-		}
-		entry := tools[name]
-		lines = append(lines, formatSkillLine(entry.Schema))
-	}
-	return fmt.Sprintf(systemPromptTemplate, strings.Join(lines, "\n"))
+	return base
 }
 
 func formatSkillLine(s skills.Skill) string {
@@ -760,11 +819,161 @@ func toolFollowup(toolName string, result any) string {
 	return `Tool result received. If you now have all the information needed, return type="final". Otherwise call another tool.`
 }
 
-// extractAttachments inspects a tool result for binary artifacts (images) and
+// batchCall is one entry in a tool_calls batch.
+type batchCall struct {
+	Name string
+	Args map[string]any
+	Why  string
+	Step int
+}
+
+// batchResult is the outcome of executing one batchCall.
+type batchResult struct {
+	Call    batchCall
+	Result  any
+	Elapsed float64
+	Atts    []Attachment
+}
+
+// executeBatch runs multiple tool calls. When s.ParallelEnabled is true and
+// there is more than one call, they execute concurrently up to s.MaxParallel.
+func (s *Service) executeBatch(state *runState, calls []batchCall) []batchResult {
+	out := make([]batchResult, len(calls))
+	if !s.ParallelEnabled || len(calls) == 1 {
+		for i, c := range calls {
+			out[i] = s.runOne(state, c)
+		}
+		return out
+	}
+
+	maxP := s.MaxParallel
+	if maxP <= 0 {
+		maxP = 4
+	}
+	sem := make(chan struct{}, maxP)
+	var wg sync.WaitGroup
+	for i, c := range calls {
+		wg.Add(1)
+		go func(i int, c batchCall) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			out[i] = s.runOne(state, c)
+		}(i, c)
+	}
+	wg.Wait()
+	return out
+}
+
+// runOne executes a single tool/skill call, writes a best-effort audit
+// record (covering single, batch and parallel calls), and returns its result.
+func (s *Service) runOne(state *runState, c batchCall) batchResult {
+	kind := "unknown"
+	if _, ok := state.tools[c.Name]; ok {
+		if state.skillNames[c.Name] {
+			kind = "skill"
+		} else {
+			kind = "tool"
+		}
+	}
+
+	entry, ok := state.tools[c.Name]
+	var result any
+	var execErr error
+	var dur time.Duration
+	if ok {
+		t0 := time.Now()
+		r, err := entry.Execute(c.Args)
+		dur = time.Since(t0)
+		if err != nil {
+			execErr = err
+			result = map[string]any{"error": err.Error(), "tool": c.Name, "args": c.Args}
+		} else {
+			result = r
+		}
+	} else {
+		result = map[string]any{"error": "Unknown tool/skill: " + c.Name, "available": keys(state.tools)}
+	}
+	elapsed := dur.Seconds()
+	atts, cleaned := ExtractAttachments(c.Name, result)
+
+	auditArgs := any(c.Args)
+	auditResult := any(cleaned)
+	if sensitiveSkills[c.Name] {
+		auditArgs = map[string]any{"redacted": true}
+		auditResult = map[string]any{"redacted": true}
+	}
+	errMsg := ""
+	if execErr != nil {
+		errMsg = execErr.Error()
+	}
+	_ = s.Memory.AddInvocation(memory.AuditRecord{
+		SessionID:  state.sid,
+		Step:       c.Step,
+		Skill:      c.Name,
+		Kind:       kind,
+		Args:       auditArgs,
+		Result:     auditResult,
+		ErrorMsg:   errMsg,
+		DurationMS: dur.Milliseconds(),
+		Why:        c.Why,
+	})
+
+	return batchResult{Call: c, Result: cleaned, Elapsed: elapsed, Atts: atts}
+}
+
+// parseBatchCalls extracts the calls array from a tool_calls envelope.
+func parseBatchCalls(data map[string]any) ([]batchCall, bool) {
+	raw, ok := data["calls"]
+	if !ok {
+		return nil, false
+	}
+	arr, ok := raw.([]any)
+	if !ok {
+		return nil, false
+	}
+	out := make([]batchCall, 0, len(arr))
+	for _, item := range arr {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		name, _ := m["tool"].(string)
+		if name == "" {
+			continue
+		}
+		args, _ := m["args"].(map[string]any)
+		if args == nil {
+			args = map[string]any{}
+		}
+		why, _ := m["why"].(string)
+		out = append(out, batchCall{Name: name, Args: args, Why: why})
+	}
+	return out, len(out) > 0
+}
+
+// batchFollowup builds the user follow-up message after a parallel batch.
+func batchFollowup(results []batchResult) string {
+	var names []string
+	for _, r := range results {
+		names = append(names, r.Call.Name)
+	}
+	var sb strings.Builder
+	sb.WriteString("Tool results received for: ")
+	sb.WriteString(strings.Join(names, ", "))
+	sb.WriteString(".\n")
+	for _, r := range results {
+		sb.WriteString(fmt.Sprintf("- %s: %s\n", r.Call.Name, truncate(fmt.Sprint(r.Result), 200)))
+	}
+	sb.WriteString(`If you now have all the information needed, return type="final". Otherwise call another tool.`)
+	return sb.String()
+}
+
+// ExtractAttachments inspects a tool result for binary artifacts (images) and
 // returns them as Attachment values.  The original result map is modified
 // in-place: the heavy base64 payload is replaced with a short human-readable
 // summary so the LLM context doesn't blow up.
-func extractAttachments(toolName string, result any) ([]Attachment, any) {
+func ExtractAttachments(toolName string, result any) ([]Attachment, any) {
 	m, ok := result.(map[string]any)
 	if !ok {
 		return nil, result

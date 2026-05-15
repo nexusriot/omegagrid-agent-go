@@ -18,12 +18,12 @@ repository.
     ▼
 ┌─────────────────────┐   HTTP    ┌──────────────────────────────────────────┐
 │  frontend (nginx)   │ ────────► │   Go gateway                     :8000   │
-│  React UI  :80      │           │                                           │
-│  proxies /api/*     │           │  agent loop · scheduler · skills          │
-└─────────────────────┘           │  vector memory · history                  │
+│  React UI  :80      │           │                                          │
+│  proxies /api/*     │           │  agent loop · scheduler · skills         │
+└─────────────────────┘           │  vector memory · history                 │
          ▲                        └─────────────────┬────────────────────────┘
-         │ Telegram Bot API                          │ HTTP
-         │                                           ▼
+         │ Telegram Bot API                         │ HTTP
+         │                                          ▼
          └──────────── telegram-bot (Go) ──► Ollama / OpenAI / OpenAI Codex
 ```
 
@@ -37,13 +37,15 @@ cmd/
     main.go             Go importer (reads JSONL → writes chromem-go)
     export.py           Python exporter (reads ChromaDB → writes JSONL)
 internal/
-  agent/                Tool-calling loop (Run / RunStream)
+  agent/                Tool-calling loop (Run / RunStream / callTool)
   config/               Env-driven configuration loader
   httpapi/              chi router + all REST handlers
+    audit.go            GET /api/invocations, GET /api/invocations/{id}, POST …/replay
   llm/                  Ollama + OpenAI chat clients (chat_completions & responses)
   memory/               In-process history (SQLite) + vector store (chromem-go)
     client.go           Public API — CreateSession / AddMemory / SearchMemory / …
     history.go          SQLite sessions + messages (modernc.org/sqlite, no CGO)
+    audit.go            SQLite skill_invocations table — record / get / list
     vector.go           chromem-go vector store + SHA256 + cosine dedup pipeline
     embeddings.go       Ollama (3-endpoint fallback) + OpenAI embeddings clients
   observability/        Mark-based timer (surfaces in RunResult.Meta)
@@ -65,7 +67,7 @@ web/                    React frontend — built by frontend container, served b
   src/
     api/                TypeScript REST client, SSE stream helper, API types
     components/         Layout, SessionList, ChatBubble, ToolCard
-    pages/              Chat, Memory, Skills, Scheduler, Health
+    pages/              Chat, Memory, Skills, Scheduler, Activity, Health
     store/              Zustand chat + stream state
   package.json          Vite + React 18 + TypeScript + Tailwind project
 docker/
@@ -133,6 +135,7 @@ make vector-migrate   # ChromaDB → chromem-go migration (see below)
 | Memory | `/ui/memory` | Semantic search + manual add to the vector store |
 | Skills | `/ui/skills` | Browse all registered skills with parameter schemas |
 | Scheduler | `/ui/scheduler` | CRUD for cron tasks: create, enable/disable, delete, view last result |
+| Activity | `/ui/activity` | Skill/tool invocation audit log: filter by skill or session, errors-only toggle, JSON drawer, replay button. Auto-refreshes every 10 s |
 | Health | `/ui/health` | Live gateway + provider status, auto-refreshes every 30 s |
 
 ## What's in Go
@@ -272,6 +275,7 @@ rm data/vector_db.jsonl
 | `BOT_AUTH_ENABLED` | `false` | Enable Telegram user allowlist |
 | `BOT_ADMIN_ID` | `0` | Telegram user ID of the admin |
 | `GATEWAY_URL` | `http://127.0.0.1:8000` | Telegram bot → gateway base URL |
+| `AUDIT_MAX_BLOB_BYTES` | `65536` | Max bytes stored per args/result blob in the audit log. Set to `0` to disable audit logging entirely |
 
 ## Frontend / gateway separation
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -52,7 +53,7 @@ func runAskLocal(query string, sessionID, maxSteps int, stream, jsonOut bool) {
 
 	if stream {
 		ch := make(chan agent.Event, 32)
-		go svc.Agent.RunStream(req, ch)
+		go svc.Agent.RunStream(context.Background(), req, ch)
 		printStreamEvents(ch, jsonOut)
 		return
 	}

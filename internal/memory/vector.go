@@ -17,7 +17,13 @@ type vectorStore struct {
 	col         *chromem.Collection
 	embedClient embeddingsClient
 	dedupDist   float32
-	hashes      sync.Map // sha256hex → memoryID; rebuilt at runtime, not persisted
+
+	// mu serialises addText so the dedup pipeline (hash check → embed →
+	// semantic NN check → upsert → hash store) is atomic. Without it two
+	// concurrent identical vector_add calls (e.g. a parallel tool batch)
+	// both pass the hash check and both get inserted, defeating dedup.
+	mu     sync.Mutex
+	hashes map[string]string // sha256hex → memoryID; rebuilt at runtime, not persisted
 }
 
 func newVectorStore(dir, collection string, embed embeddingsClient, dedupDist float64) (*vectorStore, error) {
@@ -33,7 +39,12 @@ func newVectorStore(dir, collection string, embed embeddingsClient, dedupDist fl
 	if err != nil {
 		return nil, fmt.Errorf("get/create collection %q: %w", collection, err)
 	}
-	return &vectorStore{col: col, embedClient: embed, dedupDist: float32(dedupDist)}, nil
+	return &vectorStore{
+		col:         col,
+		embedClient: embed,
+		dedupDist:   float32(dedupDist),
+		hashes:      map[string]string{},
+	}, nil
 }
 
 // addText mirrors Python VectorStore.add_text: SHA256 dedup → embed → cosine NN dedup → upsert.
@@ -42,11 +53,16 @@ func (v *vectorStore) addText(text string, meta map[string]any, memoryID string)
 		return nil, errors.New("text is empty")
 	}
 
+	// Serialise the whole dedup pipeline: the hash check below and the
+	// hash store at the end must be atomic relative to other adds.
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
 	h := sha256Text(text)
 
 	// exact hash dedup (in-memory, rebuilt at runtime)
-	if existing, ok := v.hashes.Load(h); ok {
-		return &AddResult{MemoryID: existing.(string), Skipped: true, Reason: "exact_hash_duplicate"}, nil
+	if existing, ok := v.hashes[h]; ok {
+		return &AddResult{MemoryID: existing, Skipped: true, Reason: "exact_hash_duplicate"}, nil
 	}
 
 	emb, err := v.embedClient.embed(text)
@@ -86,7 +102,7 @@ func (v *vectorStore) addText(text string, meta map[string]any, memoryID string)
 	if err != nil {
 		return nil, fmt.Errorf("chromem add: %w", err)
 	}
-	v.hashes.Store(h, memoryID)
+	v.hashes[h] = memoryID
 	return &AddResult{MemoryID: memoryID, Skipped: false}, nil
 }
 

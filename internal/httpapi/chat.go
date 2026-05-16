@@ -88,10 +88,10 @@ func (d *Deps) handleQueryStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 
-	events := make(chan agent.Event, 16)
-	go d.Agent.RunStream(req.toAgentReq(d.Cfg.AgentMaxSteps), events)
-
 	ctx := r.Context()
+	events := make(chan agent.Event, 16)
+	go d.Agent.RunStream(ctx, req.toAgentReq(d.Cfg.AgentMaxSteps), events)
+
 	for {
 		select {
 		case <-ctx.Done():

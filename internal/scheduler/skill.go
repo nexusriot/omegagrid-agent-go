@@ -20,9 +20,10 @@ func (s *ScheduleTaskSkill) SkillSchema() map[string]any {
 		"name": "schedule_task",
 		"description": "Manage scheduled tasks. Actions: 'create' a new recurring task " +
 			"(runs a skill on cron schedule, optionally notifies Telegram), 'list' all scheduled tasks, " +
-			"'delete' a task by id, 'enable'/'disable' a task by id.",
+			"'delete' a task by id, 'delete_all' to remove every scheduled task (no task_id needed), " +
+			"'enable'/'disable' a task by id.",
 		"parameters": map[string]any{
-			"action":                  map[string]any{"type": "string", "description": "Action: create, list, delete, enable, disable", "required": true},
+			"action":                  map[string]any{"type": "string", "description": "Action: create, list, delete, delete_all, enable, disable", "required": true},
 			"name":                    map[string]any{"type": "string", "description": "Task name (for create)", "required": false},
 			"cron_expr":               map[string]any{"type": "string", "description": "Cron expression, e.g. '*/5 * * * *' (for create)", "required": false},
 			"skill":                   map[string]any{"type": "string", "description": "Skill to run, e.g. 'ping_check', 'weather' (for create)", "required": false},
@@ -44,12 +45,14 @@ func (s *ScheduleTaskSkill) Execute(args map[string]any) any {
 		return s.list()
 	case "delete":
 		return s.delete(args)
+	case "delete_all", "deleteall", "delete-all":
+		return s.deleteAll()
 	case "enable":
 		return s.setEnabled(args, true)
 	case "disable":
 		return s.setEnabled(args, false)
 	default:
-		return map[string]any{"error": fmt.Sprintf("Unknown action: %s. Use: create, list, delete, enable, disable", action)}
+		return map[string]any{"error": fmt.Sprintf("Unknown action: %s. Use: create, list, delete, delete_all, enable, disable", action)}
 	}
 }
 
@@ -107,6 +110,14 @@ func (s *ScheduleTaskSkill) delete(args map[string]any) any {
 		return map[string]any{"error": fmt.Sprintf("Task %d not found", id)}
 	}
 	return map[string]any{"deleted": true, "task_id": id}
+}
+
+func (s *ScheduleTaskSkill) deleteAll() any {
+	n, err := s.Store.DeleteAll()
+	if err != nil {
+		return map[string]any{"error": err.Error()}
+	}
+	return map[string]any{"deleted_all": true, "deleted_count": n}
 }
 
 func (s *ScheduleTaskSkill) setEnabled(args map[string]any, enabled bool) any {

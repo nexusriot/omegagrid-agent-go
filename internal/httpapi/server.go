@@ -53,6 +53,10 @@ func NewRouter(d Deps) http.Handler {
 		r.Post("/skills/{name}/invoke", d.handleSkillInvoke)
 		r.Get("/tools", d.handleListTools)
 
+		r.Get("/invocations", d.handleListInvocations)
+		r.Get("/invocations/{id}", d.handleGetInvocation)
+		r.Post("/invocations/{id}/replay", d.handleReplayInvocation)
+
 		r.Post("/scheduler/tasks", d.handleSchedulerCreate)
 		r.Get("/scheduler/tasks", d.handleSchedulerList)
 		r.Get("/scheduler/tasks/{id}", d.handleSchedulerGet)

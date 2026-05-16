@@ -5,6 +5,7 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -191,11 +192,18 @@ func (s *Service) Run(req RunRequest) (*RunResult, error) {
 				_ = s.Memory.AddMessage(state.sid, "assistant", answer)
 				return s.fallbackResult(state, answer, step, true), nil
 			}
+			for i := range calls {
+				calls[i].Step = step
+			}
 			results := s.executeBatch(state, calls)
 			for _, r := range results {
 				state.attachments = append(state.attachments, r.Atts...)
 				_ = s.Memory.AddMessage(state.sid, "tool", r.Result)
-				state.timings["skill_s_total"] += r.Elapsed
+				if state.skillNames[r.Call.Name] {
+					state.timings["skill_s_total"] += r.Elapsed
+				} else {
+					state.timings["tool_s_total"] += r.Elapsed
+				}
 				state.debug = append(state.debug, fmt.Sprintf("[batch] %s (%.3fs): %s", r.Call.Name, r.Elapsed, truncate(fmt.Sprint(r.Result), 200)))
 			}
 			batchJSON, _ := json.Marshal(data)
@@ -236,7 +244,7 @@ func (s *Service) Run(req RunRequest) (*RunResult, error) {
 			fmt.Sprintf("[%s] >>> CALL %s(%s) reason=%s", kind, toolName, truncateJSON(args, 200), nonempty(why, "-")),
 		)
 
-		br := s.runOne(state, batchCall{Name: toolName, Args: args, Why: why})
+		br := s.runOne(state, batchCall{Name: toolName, Args: args, Why: why, Step: step})
 		result := br.Result
 		elapsed := br.Elapsed
 		state.attachments = append(state.attachments, br.Atts...)
@@ -274,28 +282,51 @@ func (s *Service) Run(req RunRequest) (*RunResult, error) {
 
 // RunStream is the streaming counterpart of Run.  Events are pushed onto out
 // in real time so the gateway can forward them as SSE.
-func (s *Service) RunStream(req RunRequest, out chan<- Event) {
+func (s *Service) RunStream(ctx context.Context, req RunRequest, out chan<- Event) {
 	defer close(out)
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	// send delivers one event, but bails out the moment the consumer's context
+	// is cancelled (e.g. the SSE client disconnected). Without this the loop
+	// would block forever on a full channel with no reader, leaking this
+	// goroutine and the agent run it holds.
+	send := func(ev Event) bool {
+		select {
+		case out <- ev:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
 
 	state, err := s.startSession(req)
 	if err != nil {
-		out <- Event{Event: "error", Error: err.Error()}
+		send(Event{Event: "error", Error: err.Error()})
 		return
 	}
 
 	for step := 1; step <= req.MaxSteps; step++ {
-		out <- Event{Event: "thinking", Step: step}
+		// Stop doing expensive LLM/tool work once the client is gone.
+		if ctx.Err() != nil {
+			return
+		}
+		if !send(Event{Event: "thinking", Step: step}) {
+			return
+		}
 
 		raw, llmS, err := s.Chat.CompleteJSON(state.messages)
 		if err != nil {
-			out <- Event{Event: "error", Error: err.Error()}
+			send(Event{Event: "error", Error: err.Error()})
 			return
 		}
 		state.timings["llm_chat_s_total"] += llmS
 
 		data, err := parseJSONSafely(raw)
 		if err != nil {
-			out <- Event{Event: "error", Error: err.Error()}
+			send(Event{Event: "error", Error: err.Error()})
 			return
 		}
 		data = normalizeToolCall(data, state.toolNames)
@@ -304,13 +335,13 @@ func (s *Service) RunStream(req RunRequest, out chan<- Event) {
 		if respType == "final" {
 			answer := finalAnswer(data)
 			_ = s.Memory.AddMessage(state.sid, "assistant", answer)
-			out <- Event{
+			send(Event{
 				Event:       "final",
 				SessionID:   state.sid,
 				Answer:      answer,
 				Meta:        s.buildMeta(state, step, false),
 				Attachments: state.attachments,
-			}
+			})
 			return
 		}
 		// Parallel batch.
@@ -321,19 +352,30 @@ func (s *Service) RunStream(req RunRequest, out chan<- Event) {
 				_ = s.Memory.AddMessage(state.sid, "assistant", answer)
 				meta := s.buildMeta(state, step, false)
 				meta["fallback"] = true
-				out <- Event{Event: "final", SessionID: state.sid, Answer: answer, Meta: meta, Attachments: state.attachments}
+				send(Event{Event: "final", SessionID: state.sid, Answer: answer, Meta: meta, Attachments: state.attachments})
 				return
 			}
 			// Emit tool_call events upfront so the UI shows them immediately.
+			for i := range calls {
+				calls[i].Step = step
+			}
 			for _, c := range calls {
-				out <- Event{Event: "tool_call", Step: step, Tool: c.Name, Args: c.Args, Why: c.Why}
+				if !send(Event{Event: "tool_call", Step: step, Tool: c.Name, Args: c.Args, Why: c.Why}) {
+					return
+				}
 			}
 			results := s.executeBatch(state, calls)
 			for _, r := range results {
 				state.attachments = append(state.attachments, r.Atts...)
 				_ = s.Memory.AddMessage(state.sid, "tool", r.Result)
-				state.timings["skill_s_total"] += r.Elapsed
-				out <- Event{Event: "tool_result", Step: step, Tool: r.Call.Name, Result: truncate(fmt.Sprint(r.Result), 300), ElapsedS: round3(r.Elapsed)}
+				if state.skillNames[r.Call.Name] {
+					state.timings["skill_s_total"] += r.Elapsed
+				} else {
+					state.timings["tool_s_total"] += r.Elapsed
+				}
+				if !send(Event{Event: "tool_result", Step: step, Tool: r.Call.Name, Result: truncate(fmt.Sprint(r.Result), 300), ElapsedS: round3(r.Elapsed)}) {
+					return
+				}
 			}
 			batchJSON, _ := json.Marshal(data)
 			var allResults []any
@@ -354,13 +396,13 @@ func (s *Service) RunStream(req RunRequest, out chan<- Event) {
 			_ = s.Memory.AddMessage(state.sid, "assistant", answer)
 			meta := s.buildMeta(state, step, false)
 			meta["fallback"] = true
-			out <- Event{
+			send(Event{
 				Event:       "final",
 				SessionID:   state.sid,
 				Answer:      answer,
 				Meta:        meta,
 				Attachments: state.attachments,
-			}
+			})
 			return
 		}
 
@@ -371,9 +413,11 @@ func (s *Service) RunStream(req RunRequest, out chan<- Event) {
 			args = map[string]any{}
 		}
 		why, _ := data["why"].(string)
-		out <- Event{Event: "tool_call", Step: step, Tool: toolName, Args: args, Why: why}
+		if !send(Event{Event: "tool_call", Step: step, Tool: toolName, Args: args, Why: why}) {
+			return
+		}
 
-		br := s.runOne(state, batchCall{Name: toolName, Args: args, Why: why})
+		br := s.runOne(state, batchCall{Name: toolName, Args: args, Why: why, Step: step})
 		result := br.Result
 		elapsed := br.Elapsed
 		state.attachments = append(state.attachments, br.Atts...)
@@ -384,7 +428,9 @@ func (s *Service) RunStream(req RunRequest, out chan<- Event) {
 		}
 		state.timings[key] += elapsed
 
-		out <- Event{Event: "tool_result", Step: step, Tool: toolName, Result: truncate(fmt.Sprint(result), 300), ElapsedS: round3(elapsed)}
+		if !send(Event{Event: "tool_result", Step: step, Tool: toolName, Result: truncate(fmt.Sprint(result), 300), ElapsedS: round3(elapsed)}) {
+			return
+		}
 
 		_ = s.Memory.AddMessage(state.sid, "tool", result)
 		var assistantJSON, toolJSON []byte
@@ -405,7 +451,7 @@ func (s *Service) RunStream(req RunRequest, out chan<- Event) {
 	_ = s.Memory.AddMessage(state.sid, "assistant", answer)
 	meta := s.buildMeta(state, req.MaxSteps, false)
 	meta["max_steps_hit"] = true
-	out <- Event{Event: "final", SessionID: state.sid, Answer: answer, Meta: meta, Attachments: state.attachments}
+	send(Event{Event: "final", SessionID: state.sid, Answer: answer, Meta: meta, Attachments: state.attachments})
 }
 
 type runState struct {
@@ -583,6 +629,13 @@ func (s *Service) buildMeta(st *runState, step int, fallback bool) map[string]an
 		out["fallback"] = true
 	}
 	return out
+}
+
+// sensitiveSkills have their args and result redacted in the audit log.
+var sensitiveSkills = map[string]bool{
+	"password_gen":  true,
+	"shell_command": true,
+	"ssh_command":   true,
 }
 
 func (s *Service) buildSystemPrompt(tools map[string]Skill, skillNames map[string]bool) string {
@@ -811,6 +864,7 @@ type batchCall struct {
 	Name string
 	Args map[string]any
 	Why  string
+	Step int
 }
 
 // batchResult is the outcome of executing one batchCall.
@@ -851,16 +905,28 @@ func (s *Service) executeBatch(state *runState, calls []batchCall) []batchResult
 	return out
 }
 
-// runOne executes a single tool call and returns its result.
+// runOne executes a single tool/skill call, writes a best-effort audit
+// record (covering single, batch and parallel calls), and returns its result.
 func (s *Service) runOne(state *runState, c batchCall) batchResult {
+	kind := "unknown"
+	if _, ok := state.tools[c.Name]; ok {
+		if state.skillNames[c.Name] {
+			kind = "skill"
+		} else {
+			kind = "tool"
+		}
+	}
+
 	entry, ok := state.tools[c.Name]
 	var result any
-	var elapsed float64
+	var execErr error
+	var dur time.Duration
 	if ok {
 		t0 := time.Now()
 		r, err := entry.Execute(c.Args)
-		elapsed = time.Since(t0).Seconds()
+		dur = time.Since(t0)
 		if err != nil {
+			execErr = err
 			result = map[string]any{"error": err.Error(), "tool": c.Name, "args": c.Args}
 		} else {
 			result = r
@@ -868,7 +934,31 @@ func (s *Service) runOne(state *runState, c batchCall) batchResult {
 	} else {
 		result = map[string]any{"error": "Unknown tool/skill: " + c.Name, "available": keys(state.tools)}
 	}
+	elapsed := dur.Seconds()
 	atts, cleaned := ExtractAttachments(c.Name, result)
+
+	auditArgs := any(c.Args)
+	auditResult := any(cleaned)
+	if sensitiveSkills[c.Name] {
+		auditArgs = map[string]any{"redacted": true}
+		auditResult = map[string]any{"redacted": true}
+	}
+	errMsg := ""
+	if execErr != nil {
+		errMsg = execErr.Error()
+	}
+	_ = s.Memory.AddInvocation(memory.AuditRecord{
+		SessionID:  state.sid,
+		Step:       c.Step,
+		Skill:      c.Name,
+		Kind:       kind,
+		Args:       auditArgs,
+		Result:     auditResult,
+		ErrorMsg:   errMsg,
+		DurationMS: dur.Milliseconds(),
+		Why:        c.Why,
+	})
+
 	return batchResult{Call: c, Result: cleaned, Elapsed: elapsed, Atts: atts}
 }
 

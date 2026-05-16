@@ -1,6 +1,6 @@
 import { NavLink } from 'react-router-dom'
 import {
-  MessageSquare, Database, Wrench, Clock, Activity, Omega,
+  MessageSquare, Database, Wrench, Clock, Activity, Omega, History,
 } from 'lucide-react'
 import type { ReactNode } from 'react'
 
@@ -9,6 +9,7 @@ const NAV = [
   { to: '/memory',    icon: Database,      label: 'Memory'    },
   { to: '/skills',    icon: Wrench,        label: 'Skills'    },
   { to: '/scheduler', icon: Clock,         label: 'Scheduler' },
+  { to: '/activity',  icon: History,       label: 'Activity'  },
   { to: '/health',    icon: Activity,      label: 'Health'    },
 ]
 

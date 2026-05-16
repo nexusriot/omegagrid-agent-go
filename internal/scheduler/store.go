@@ -145,6 +145,16 @@ func (s *Store) Delete(id int64) (bool, error) {
 	return n > 0, nil
 }
 
+// DeleteAll removes every scheduled task and returns the number deleted.
+func (s *Store) DeleteAll() (int64, error) {
+	res, err := s.db.Exec(`DELETE FROM scheduled_tasks`)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
 // scanRow lets scanTask consume either *sql.Row or *sql.Rows.
 type scanRow interface {
 	Scan(dest ...any) error

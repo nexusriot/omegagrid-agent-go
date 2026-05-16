@@ -57,6 +57,9 @@ type Config struct {
 	SchedulerDB      string
 	SchedulerTickSec int
 	TelegramBotToken string
+
+	// Audit log
+	AuditMaxBlobBytes int // 0 = audit disabled
 }
 
 func Load() Config {
@@ -92,6 +95,7 @@ func Load() Config {
 		PlaygroundEnabled:   !isTruthy(os.Getenv("PLAYGROUND_DISABLED")),
 		SchedulerTickSec:    atoiOr(os.Getenv("SCHEDULER_TICK_SEC"), 60),
 		TelegramBotToken:    os.Getenv("TELEGRAM_BOT_TOKEN"),
+		AuditMaxBlobBytes:   atoiOr(os.Getenv("AUDIT_MAX_BLOB_BYTES"), 65536),
 	}
 	c.AgentDB = getOr(os.Getenv("AGENT_DB"), dataDir+"/agent_memory.sqlite3")
 	c.VectorDir = getOr(os.Getenv("AGENT_VECTOR_DIR"), dataDir+"/chromem")

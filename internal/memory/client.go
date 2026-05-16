@@ -12,8 +12,9 @@ import (
 
 // Client wraps the in-process history and vector stores.
 type Client struct {
-	hist *historyStore
-	vec  *vectorStore
+	hist         *historyStore
+	vec          *vectorStore
+	auditMaxBlob int
 }
 
 // New initialises SQLite history and chromem-go vector stores.
@@ -35,7 +36,7 @@ func New(cfg config.Config) (*Client, error) {
 		return nil, fmt.Errorf("vector store: %w", err)
 	}
 
-	return &Client{hist: hist, vec: vec}, nil
+	return &Client{hist: hist, vec: vec, auditMaxBlob: cfg.AuditMaxBlobBytes}, nil
 }
 
 func buildEmbeddings(cfg config.Config) (embeddingsClient, error) {
@@ -105,6 +106,25 @@ type AddResult struct {
 type SearchResult struct {
 	Hits    []MemoryHit        `json:"hits"`
 	Timings map[string]float64 `json:"timings,omitempty"`
+}
+
+// AddInvocation persists one skill/tool call to the audit log.
+// It is a no-op when AUDIT_MAX_BLOB_BYTES=0.
+func (c *Client) AddInvocation(r AuditRecord) error {
+	if c.auditMaxBlob == 0 {
+		return nil
+	}
+	return c.hist.recordInvocation(r, c.auditMaxBlob)
+}
+
+// GetInvocation returns one audit record by ID, or nil if not found.
+func (c *Client) GetInvocation(id int64) (*AuditRecord, error) {
+	return c.hist.getInvocation(id)
+}
+
+// ListInvocations returns a filtered page of audit records and the total count.
+func (c *Client) ListInvocations(f AuditFilter) ([]AuditRecord, int, error) {
+	return c.hist.listInvocations(f)
 }
 
 func (c *Client) AddMemory(text string, meta map[string]any) (*AddResult, error) {

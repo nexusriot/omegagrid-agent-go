@@ -2,6 +2,7 @@ import type {
   Session, Message, Skill, SchedulerTask,
   CreateTaskRequest, MemoryHit, MemoryAddResult,
   HealthStatus, QueryResult, QueryRequest,
+  Invocation, InvocationListResult, InvocationFilter, ReplayResult,
 } from './types'
 
 const BASE = import.meta.env.VITE_API_BASE ?? ''
@@ -64,6 +65,23 @@ export const enableTask = (id: number) =>
 
 export const disableTask = (id: number) =>
   json<{ ok: boolean }>(`/api/scheduler/tasks/${id}/disable`, { method: 'POST' })
+
+export const fetchInvocations = (f: InvocationFilter = {}) => {
+  const p = new URLSearchParams()
+  if (f.skill)         p.set('skill', f.skill)
+  if (f.session_id)    p.set('session_id', String(f.session_id))
+  if (f.only_errors)   p.set('only_errors', 'true')
+  if (f.limit)         p.set('limit', String(f.limit))
+  if (f.offset)        p.set('offset', String(f.offset))
+  const qs = p.toString()
+  return json<InvocationListResult>(`/api/invocations${qs ? '?' + qs : ''}`)
+}
+
+export const fetchInvocation = (id: number) =>
+  json<Invocation>(`/api/invocations/${id}`)
+
+export const replayInvocation = (id: number) =>
+  json<ReplayResult>(`/api/invocations/${id}/replay`, { method: 'POST' })
 
 export const invokeSkill = (name: string, args: Record<string, unknown>) =>
   json<import('./types').SkillInvokeResult>(`/api/skills/${encodeURIComponent(name)}/invoke`, {

@@ -92,6 +92,44 @@ export interface QueryResult {
   debug_log?: string
 }
 
+export interface Invocation {
+  id: number
+  session_id: number
+  step: number
+  ts: number
+  skill: string
+  kind: 'skill' | 'tool' | 'unknown' | 'replay'
+  args: Record<string, unknown> | null
+  result?: unknown
+  error?: string
+  duration_ms: number
+  why?: string
+  replayed_from?: number
+}
+
+export interface InvocationListResult {
+  invocations: Invocation[]
+  total: number
+  limit: number
+  offset: number
+}
+
+export interface InvocationFilter {
+  skill?: string
+  session_id?: number
+  only_errors?: boolean
+  limit?: number
+  offset?: number
+}
+
+export interface ReplayResult {
+  replayed_from: number
+  skill: string
+  result: unknown
+  duration_ms: number
+  error: string
+}
+
 export interface SkillAttachment {
   type: string
   filename: string

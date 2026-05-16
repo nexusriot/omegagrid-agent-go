@@ -58,7 +58,7 @@ omegagrid-agent-go/
 │       ├── main.go              #   Go importer (reads JSONL → writes chromem-go)
 │       └── export.py            #   Python exporter (reads ChromaDB → writes JSONL)
 ├── internal/
-│   ├── agent/agent.go           # Tool-calling loop (Run / RunStream); tool_calls batches
+│   ├── agent/agent.go           # Tool-calling loop (Run / RunStream); tool_calls batches + audit
 │   ├── bootstrap/bootstrap.go   # Single New(cfg) wires every service (gateway + cli)
 │   ├── config/config.go         # Env-driven configuration
 │   ├── httpapi/                 # chi router + REST handlers
@@ -68,14 +68,16 @@ omegagrid-agent-go/
 │   │   ├── history.go           #   sessions CRUD
 │   │   ├── memory.go            #   POST /api/memory/{add,search}
 │   │   ├── scheduler.go         #   scheduler task CRUD
-│   │   └── skills.go            #   GET /api/skills, /api/tools, POST /api/skills/{name}/invoke
+│   │   ├── skills.go            #   GET /api/skills, /api/tools, POST /api/skills/{name}/invoke
+│   │   └── audit.go             #   GET /api/invocations, /invocations/{id}, /invocations/{id}/replay
 │   ├── llm/
 │   │   ├── llm.go               #   ChatClient interface + Message type
 │   │   ├── ollama.go            #   Ollama /api/chat client
 │   │   └── openai.go            #   OpenAI chat_completions + responses client
 │   ├── memory/
-│   │   ├── client.go            #   Public API — CreateSession / AddMemory / SearchMemory / …
+│   │   ├── client.go            #   Public API — CreateSession / AddMemory / SearchMemory / AddInvocation / …
 │   │   ├── history.go           #   SQLite sessions + messages (modernc.org/sqlite, no CGO)
+│   │   ├── audit.go             #   SQLite skill_invocations — AuditRecord / AuditFilter / record / list
 │   │   ├── vector.go            #   chromem-go vector store + SHA256 + cosine dedup pipeline
 │   │   └── embeddings.go        #   Ollama (3-endpoint fallback) + OpenAI embeddings clients
 │   ├── observability/timing.go  # Mark-based timer (surfaces in RunResult.Meta)
@@ -126,6 +128,7 @@ omegagrid-agent-go/
 │           ├── Memory.tsx       #   Vector search + manual add
 │           ├── Skills.tsx       #   Skill catalog with param schemas
 │           ├── Scheduler.tsx    #   Cron task CRUD
+│           ├── Activity.tsx     #   Skill invocation audit log + replay
 │           └── Health.tsx       #   Gateway status, auto-refresh
 ├── docker/
 │   ├── frontend.Dockerfile      # node:20-alpine build → nginx:1.27-alpine
@@ -162,6 +165,7 @@ All configuration is environment-driven, matching the original `.env` pattern.
 | Scheduler | `SCHEDULER_DB`, `SCHEDULER_TICK_SEC` | `{DATA_DIR}/scheduler.sqlite3`, 60 |
 | Telegram | `TELEGRAM_BOT_TOKEN`, `BOT_AUTH_ENABLED`, `BOT_ADMIN_ID` | — |
 | Skills | `SKILLS_DIR`, `SKILL_HTTP_TIMEOUT`, `SKILL_SHELL_ENABLED`, `SKILL_SSH_ENABLED`, `SKILL_SSH_IDENTITY_FILE`, `SKILL_SSH_DEFAULT_USER`, `SKILL_SSH_PRIVATE_KEY` | `{DATA_DIR}/skills`, 30, false, false |
+| Audit log | `AUDIT_MAX_BLOB_BYTES` | `65536` (0 = disabled) |
 
 `LLM_PROVIDER` determines both the chat client and the embeddings backend.
 When set to `openai-codex` or when the model name contains `codex`, the
@@ -256,8 +260,17 @@ for step = 1..MaxSteps:
   ├─ if type == "final":
   │     persist answer, return RunResult
   │
+  ├─ if type == "tool_calls":
+  │     executeBatch(state, calls) — runOne() per call (parallel up to MaxParallel)
+  │     append combined results to messages, continue
+  │
   └─ if type == "tool_call":
-        dispatch to skill registry or native skill
+        runOne(state, batchCall{name, args, why, step})
+          ├─ execute skill or built-in tool
+          ├─ extract binary attachments (QR images, etc.)
+          ├─ write AuditRecord to skill_invocations (best-effort)
+          └─ return batchResult{result, elapsed, attachments}
+        update timings + debug log
         append tool result to messages
         continue
 
@@ -271,7 +284,7 @@ if MaxSteps exceeded:
 |---|---|---|
 | `vector_add` | Store a durable fact or preference | `memory.Client.AddMemory()` → in-process vector store |
 | `vector_search` | Semantic search over stored memories | `memory.Client.SearchMemory()` → in-process vector store |
-| `schedule_task` | Create/list/delete/enable/disable cron tasks | Native Go via `scheduler.ScheduleTaskSkill` |
+| `schedule_task` | Create/list/delete/delete_all/enable/disable cron tasks | Native Go via `scheduler.ScheduleTaskSkill` |
 | `web_search` | DuckDuckGo HTML search (no API key); returns title/url/snippet | Native Go via `search.WebSearchSkill` |
 
 All registered skills (weather, dns_lookup, shell_command, etc.) are listed
@@ -348,6 +361,46 @@ Public methods:
 | `ListMessages(sid, limit, offset)` | Paginated message list |
 | `LoadTail(sid, limit)` | Last N messages for LLM context (skips `raw_model_json`) |
 | `AddMessage(sid, role, content)` | Persist one message |
+
+#### Audit log (`audit.go`)
+
+Skill and tool invocations are recorded in `skill_invocations`, which lives in
+the same `agent_memory.sqlite3` database:
+
+```sql
+skill_invocations (
+    id            INTEGER PK,
+    session_id    INTEGER FK → sessions(id),
+    step          INTEGER,       -- agent loop step number
+    ts            REAL,          -- unix seconds
+    skill         TEXT,          -- skill/tool name
+    kind          TEXT,          -- 'skill' | 'tool' | 'unknown' | 'replay'
+    args_json     TEXT,          -- caller args (truncated to AUDIT_MAX_BLOB_BYTES)
+    result_json   TEXT,          -- skill result (nullable; truncated)
+    error_msg     TEXT,          -- nullable; non-null on failure
+    duration_ms   INTEGER,
+    why           TEXT,          -- LLM's stated reason for the call
+    replayed_from INTEGER        -- FK to id of the original invocation
+)
+INDEX ON skill_invocations(session_id, ts)
+INDEX ON skill_invocations(skill, ts)
+```
+
+**Sensitive skills** (`password_gen`, `shell_command`, `ssh_command`) always
+store `{"redacted": true}` for both args and result — raw values are never
+written to the database.
+
+**Blob truncation** — args and result JSON blobs are truncated to
+`AUDIT_MAX_BLOB_BYTES` (default 64 KB) before storage.  Set to `0` to disable
+audit logging entirely (`AddInvocation` becomes a no-op).
+
+Public methods on `memory.Client`:
+
+| Method | Purpose |
+|---|---|
+| `AddInvocation(r AuditRecord)` | Write one invocation record (no-op when disabled) |
+| `GetInvocation(id)` | Fetch one record by ID, nil if not found |
+| `ListInvocations(f AuditFilter)` | Filtered, paginated list + total count |
 
 #### Vector store (`vector.go`)
 
@@ -494,8 +547,9 @@ CREATE TABLE IF NOT EXISTS scheduled_tasks (
 ```
 
 Operations: `Create`, `Get`, `ListAll`, `ListEnabled`, `UpdateLastRun`,
-`SetEnabled`, `Delete`.  The directory for the database file is created
-automatically via `os.MkdirAll`.
+`SetEnabled`, `Delete`, `DeleteAll`.  `DeleteAll` truncates the table in a
+single statement and returns the number of rows removed.  The directory for
+the database file is created automatically via `os.MkdirAll`.
 
 #### Cron matcher (`cron.go`)
 
@@ -534,15 +588,20 @@ avoid double-firing if the tick period is shorter than a minute.
 
 #### Native skill (`skill.go`)
 
-`ScheduleTaskSkill` exposes five actions:
+`ScheduleTaskSkill` exposes six actions:
 
 | Action | Parameters | Returns |
 |---|---|---|
 | `create` | `cron_expr`, `skill`, `name`, `args`, `notify_telegram_chat_id` | `{created: true, task: {...}}` |
 | `list` | — | `{count: N, tasks: [...]}` |
-| `delete` | `task_id` | `{deleted: true}` |
+| `delete` | `task_id` | `{deleted: true, task_id: N}` |
+| `delete_all` | — | `{deleted_all: true, deleted_count: N}` |
 | `enable` | `task_id` | `{enabled: true}` |
 | `disable` | `task_id` | `{disabled: true}` |
+
+`delete_all` (aliases `deleteall`, `delete-all`) requires no `task_id` and
+removes every scheduled task — this is what the agent calls for requests like
+"remove all scheduled tasks".
 
 Registered as a **native** Go skill in `cmd/gateway/main.go`, operating
 directly on the `Store` struct — no HTTP round-trip required.
@@ -573,6 +632,9 @@ Built on [go-chi/chi v5](https://github.com/go-chi/chi).
 | `GET` | `/api/skills` | `handleListSkills` | In-process skill registry |
 | `POST` | `/api/skills/{name}/invoke` | `handleSkillInvoke` | **Skill playground** — direct skill execution, no agent loop. Gated by `PLAYGROUND_DISABLED`. |
 | `GET` | `/api/tools` | `handleListTools` | Built-in tool schemas |
+| `GET` | `/api/invocations` | `handleListInvocations` | Audit log — filter by skill, session, errors; paginated |
+| `GET` | `/api/invocations/{id}` | `handleGetInvocation` | Single audit record |
+| `POST` | `/api/invocations/{id}/replay` | `handleReplayInvocation` | Re-run skill with same args; writes a new `replay` row |
 | `POST` | `/api/scheduler/tasks` | `handleSchedulerCreate` | In-process scheduler store |
 | `GET` | `/api/scheduler/tasks` | `handleSchedulerList` | In-process scheduler store |
 | `GET` | `/api/scheduler/tasks/{id}` | `handleSchedulerGet` | In-process scheduler store |
@@ -657,7 +719,62 @@ func (t *Timer) AsMap() map[string]float64  // {name: seconds, total_s: total}
 
 Timings surface in `RunResult.Meta` and in the streaming `final` event.
 
-### 3.10 Web UI (`web/`)
+### 3.10 Skill invocation audit log (`internal/memory/audit.go`, `internal/httpapi/audit.go`)
+
+Every skill and tool execution during an agent run is recorded in
+`skill_invocations` (co-located in `agent_memory.sqlite3`).  The audit system
+has three layers:
+
+#### Storage layer (`memory/audit.go`)
+
+`AuditRecord` carries the full context of one invocation:
+
+```go
+type AuditRecord struct {
+    ID, SessionID, Step int
+    TS                  float64        // unix seconds
+    Skill, Kind, Why    string
+    Args, Result        any            // JSON-deserialised blobs
+    ErrorMsg            string
+    DurationMS          int64
+    ReplayedFrom        *int64         // non-nil for replay rows
+}
+```
+
+`AuditFilter` drives filtered queries: `SessionID`, `Skill`, `Since`, `Until`,
+`OnlyErrors`, `Limit`, `Offset`.
+
+#### Agent integration (`agent/agent.go`)
+
+The audit write lives in `runOne`, the single execution path shared by the
+single `tool_call`, the `tool_calls` batch, and parallel execution — so every
+invocation is recorded exactly once regardless of how it was dispatched:
+
+```
+runOne(state, batchCall{name, args, why, step})
+  1. classify kind: skill / tool / unknown
+  2. execute entry.Execute(args) — or build an error result for unknown tools
+  3. measure elapsed time (the caller updates state.timings + state.debug)
+  4. extract binary attachments (qr_generate images, etc.)
+  5. redact args + result for sensitive skills (password_gen, shell_command, ssh_command)
+  6. _ = s.Memory.AddInvocation(rec)   // best-effort — never aborts the agent loop
+  7. return batchResult{result, elapsed, attachments}
+```
+
+#### HTTP layer (`httpapi/audit.go`)
+
+| Endpoint | Behaviour |
+|---|---|
+| `GET /api/invocations` | Paginated list with `skill`, `session_id`, `only_errors`, `since`, `until`, `limit`, `offset` query params |
+| `GET /api/invocations/{id}` | Full record including untruncated blobs (up to `AUDIT_MAX_BLOB_BYTES`) |
+| `POST /api/invocations/{id}/replay` | Re-executes the skill via `skills.Client.Execute()` with the original args; writes a new `kind="replay"` row with `replayed_from` set; returns `{replayed_from, skill, result, duration_ms, error}` |
+
+Replay is gated by the same env flags as the underlying skill — `shell_command`
+and `ssh_command` remain disabled unless `SKILL_SHELL_ENABLED` / `SKILL_SSH_ENABLED`
+are set.  Replay is not available for built-in agent tools (`vector_add`,
+`vector_search`) since they are not in the `skills.Client` registry.
+
+### 3.11 Web UI (`web/`)
 
 A single-page application built with **Vite + React 18 + TypeScript + Tailwind CSS**.
 
@@ -682,6 +799,7 @@ A single-page application built with **Vite + React 18 + TypeScript + Tailwind C
 | `/ui/memory` | Memory | Semantic search (configurable k); manual add with JSON metadata |
 | `/ui/skills` | Skills | Collapsible skill cards with full parameter schemas; **inline playground panel** with auto-generated form, three-tab result view (Pretty / Raw / Timing), and a "Copy as `tool_call` JSON" button for prompt debugging |
 | `/ui/scheduler` | Scheduler | Task list with enable/disable toggle; create-modal with skill picker |
+| `/ui/activity` | Activity | Skill invocation audit log; filter by skill/session/errors; JSON drawer; Replay button; 10 s auto-refresh |
 | `/ui/health` | Health | Provider/model status card; 30 s auto-refresh |
 
 #### SSE stream protocol
@@ -871,7 +989,7 @@ Three stages — only the relevant one runs per `docker compose run`:
 
 ```
 {DATA_DIR}/
-├── agent_memory.sqlite3       # HistoryStore: sessions + messages
+├── agent_memory.sqlite3       # HistoryStore: sessions + messages + skill_invocations (audit)
 ├── scheduler.sqlite3          # Scheduler task definitions + run state
 ├── telegram_auth.sqlite3      # Telegram bot allowlist (if auth enabled)
 ├── skills/                    # Dynamic markdown skill files (SKILLS_DIR)
@@ -1052,6 +1170,29 @@ GET    /api/scheduler/tasks/{id}     get one
 POST   /api/scheduler/tasks/{id}/enable
 POST   /api/scheduler/tasks/{id}/disable
 DELETE /api/scheduler/tasks/{id}     remove
+```
+
+#### Invocations (audit log)
+
+```
+GET /api/invocations
+    ?skill=weather&session_id=3&only_errors=true&limit=50&offset=0
+  → {
+      "invocations": [
+        {
+          "id": 42, "session_id": 3, "step": 2, "ts": 1747390000.1,
+          "skill": "weather", "kind": "skill",
+          "args": {"city": "Berlin"},
+          "result": {"temperature": 18, ...},
+          "duration_ms": 312,
+          "why": "User asked for current weather in Berlin"
+        }
+      ],
+      "total": 87, "limit": 50, "offset": 0
+    }
+
+GET  /api/invocations/{id}          → full AuditRecord
+POST /api/invocations/{id}/replay   → {"replayed_from":42,"skill":"weather","result":{...},"duration_ms":298,"error":""}
 ```
 
 #### Health

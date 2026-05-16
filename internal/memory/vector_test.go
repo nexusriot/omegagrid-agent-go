@@ -7,8 +7,6 @@ import (
 	"testing"
 )
 
-// ── mockEmbeddings implements embeddingsClient ───────────────────────────────
-
 const embDim = 8 // small fixed dimension for tests
 
 // mockEmbeddings returns a deterministic pseudo-random vector derived from
@@ -56,8 +54,6 @@ func openTestVectorStore(t *testing.T) *vectorStore {
 	}
 	return vs
 }
-
-// ── addText ──────────────────────────────────────────────────────────────────
 
 func TestAddText_BasicAdd(t *testing.T) {
 	vs := openTestVectorStore(t)
@@ -175,8 +171,6 @@ func TestAddText_ConcurrentDedupNoRace(t *testing.T) {
 	}
 }
 
-// ── searchText ───────────────────────────────────────────────────────────────
-
 func TestSearchText_EmptyQuery(t *testing.T) {
 	vs := openTestVectorStore(t)
 	res, err := vs.searchText("", 5)
@@ -229,8 +223,6 @@ func TestSearchText_KClampedToCollectionSize(t *testing.T) {
 		t.Errorf("expected at most 2 hits, got %d", len(res.Hits))
 	}
 }
-
-// ── coerceMeta ───────────────────────────────────────────────────────────────
 
 func TestCoerceMeta_ConvertsTypes(t *testing.T) {
 	in := map[string]any{

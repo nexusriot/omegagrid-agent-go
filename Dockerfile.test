@@ -7,7 +7,6 @@
 # Or use the helper script:
 #   ./run_tests.sh --docker
 
-# ── builder stage ─────────────────────────────────────────────────────────────
 FROM golang:1.25-alpine AS builder
 
 # CGO is not required: modernc.org/sqlite is a pure-Go SQLite implementation.
@@ -27,7 +26,6 @@ RUN go mod download
 # Copy the entire source tree.
 COPY . .
 
-# ── test stage ────────────────────────────────────────────────────────────────
 FROM builder AS test
 
 # -race requires CGO on most platforms; we run without it inside Alpine to

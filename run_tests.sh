@@ -32,7 +32,6 @@ for arg in "$@"; do
   esac
 done
 
-# ── Docker mode ───────────────────────────────────────────────────────────────
 if $DOCKER; then
   echo "==> Building Docker test image: $IMAGE_NAME"
   docker build \
@@ -47,7 +46,6 @@ if $DOCKER; then
   exit $?
 fi
 
-# ── Local mode ────────────────────────────────────────────────────────────────
 echo "==> Running tests locally (race=${RACE_FLAG:-off}, timeout=120s)"
 # shellcheck disable=SC2086
 go test \

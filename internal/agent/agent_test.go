@@ -14,8 +14,6 @@ import (
 	"github.com/nexusriot/omegagrid-agent-go/internal/skills"
 )
 
-// ── helpers ──────────────────────────────────────────────────────────────────
-
 // mockLLM is a deterministic stub that cycles through canned JSON responses.
 type mockLLM struct {
 	mu        sync.Mutex
@@ -96,8 +94,6 @@ func collectEvents(out <-chan Event) []Event {
 	return evs
 }
 
-// ── parseJSONSafely ──────────────────────────────────────────────────────────
-
 func TestParseJSONSafely_CleanJSON(t *testing.T) {
 	data, err := parseJSONSafely(`{"type":"final","answer":"hello"}`)
 	if err != nil {
@@ -138,8 +134,6 @@ func TestParseJSONSafely_UnwrapsRawModelJSON(t *testing.T) {
 	}
 }
 
-// ── normalizeToolCall ────────────────────────────────────────────────────────
-
 func TestNormalizeToolCall_AlreadyNormalized(t *testing.T) {
 	in := map[string]any{"type": "tool_call", "tool": "weather", "args": map[string]any{}}
 	out := normalizeToolCall(in, map[string]bool{"weather": true})
@@ -173,8 +167,6 @@ func TestNormalizeToolCall_UnknownTypePassed(t *testing.T) {
 	}
 }
 
-// ── ExtractAttachments ───────────────────────────────────────────────────────
-
 func TestExtractAttachments_NoImage(t *testing.T) {
 	result := map[string]any{"key": "value"}
 	atts, cleaned := ExtractAttachments("tool", result)
@@ -188,9 +180,9 @@ func TestExtractAttachments_NoImage(t *testing.T) {
 
 func TestExtractAttachments_WithImage(t *testing.T) {
 	result := map[string]any{
-		"image_base64":  "abc123",
-		"image_format":  "png",
-		"size_bytes":    float64(100),
+		"image_base64":   "abc123",
+		"image_format":   "png",
+		"size_bytes":     float64(100),
 		"something_else": "kept",
 	}
 	atts, cleaned := ExtractAttachments("qr_generate", result)
@@ -222,8 +214,6 @@ func TestExtractAttachments_NonMapResult(t *testing.T) {
 		t.Errorf("cleaned should equal original for non-map: %v", cleaned)
 	}
 }
-
-// ── parseBatchCalls ──────────────────────────────────────────────────────────
 
 func TestParseBatchCalls_Valid(t *testing.T) {
 	data := map[string]any{
@@ -263,8 +253,6 @@ func TestParseBatchCalls_EmptyCalls(t *testing.T) {
 		t.Error("expected failure for empty calls array")
 	}
 }
-
-// ── finalAnswer / bestAnswer / toolFollowup ──────────────────────────────────
 
 func TestFinalAnswer_String(t *testing.T) {
 	data := map[string]any{"answer": "hello world"}
@@ -314,8 +302,6 @@ func TestToolFollowup_WithoutError(t *testing.T) {
 		t.Error("expected non-empty followup")
 	}
 }
-
-// ── runOne ────────────────────────────────────────────────────────────────────
 
 func TestRunOne_UnknownTool(t *testing.T) {
 	svc := newMinimalService(t, &mockLLM{})
@@ -407,8 +393,6 @@ func TestRunOne_SensitiveSkillRedacted(t *testing.T) {
 		t.Error("expected non-nil result")
 	}
 }
-
-// ── RunStream context cancellation ───────────────────────────────────────────
 
 // TestRunStream_CancelledContextExitsQuickly cancels the context before calling
 // RunStream.  The implementation checks ctx.Err() at the top of every loop
@@ -512,8 +496,6 @@ func TestRunStream_FinalAnswerClosesChannel(t *testing.T) {
 	}
 }
 
-// ── executeBatch ─────────────────────────────────────────────────────────────
-
 func TestExecuteBatch_Sequential(t *testing.T) {
 	svc := newMinimalService(t, &mockLLM{})
 	svc.ParallelEnabled = false
@@ -597,8 +579,6 @@ func TestExecuteBatch_Parallel(t *testing.T) {
 		}
 	}
 }
-
-// ── funcLLM ──────────────────────────────────────────────────────────────────
 
 // funcLLM wraps a function as a llm.ChatClient for fine-grained control.
 type funcLLM struct {

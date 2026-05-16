@@ -18,8 +18,6 @@ func openTestDB(t *testing.T) *historyStore {
 	return h
 }
 
-// ── createSession ───────────────────────────────────────────────────────────
-
 func TestCreateSession_ReturnsPositiveID(t *testing.T) {
 	h := openTestDB(t)
 	id, err := h.createSession()
@@ -45,8 +43,6 @@ func TestCreateSession_IDsAreMonotonicallyIncreasing(t *testing.T) {
 		t.Errorf("expected id2 (%d) > id1 (%d)", id2, id1)
 	}
 }
-
-// ── listSessions ────────────────────────────────────────────────────────────
 
 func TestListSessions_EmptyDB(t *testing.T) {
 	h := openTestDB(t)
@@ -90,8 +86,6 @@ func TestListSessions_LimitIsRespected(t *testing.T) {
 		t.Errorf("expected 2 sessions (limit), got %d", len(sessions))
 	}
 }
-
-// ── addMessage / loadTail ────────────────────────────────────────────────────
 
 func TestAddMessage_StringContent(t *testing.T) {
 	h := openTestDB(t)
@@ -178,8 +172,6 @@ func TestLoadTail_IsolatedBySessions(t *testing.T) {
 	}
 }
 
-// ── listMessages ─────────────────────────────────────────────────────────────
-
 func TestListMessages_PaginationOffset(t *testing.T) {
 	h := openTestDB(t)
 	sid, _ := h.createSession()
@@ -205,8 +197,6 @@ func TestListMessages_PaginationOffset(t *testing.T) {
 		t.Errorf("page2: expected 2, got %d", len(page2))
 	}
 }
-
-// ── audit / invocation ───────────────────────────────────────────────────────
 
 func TestRecordAndGetInvocation(t *testing.T) {
 	h := openTestDB(t)

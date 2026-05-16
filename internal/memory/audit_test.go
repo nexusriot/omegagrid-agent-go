@@ -7,8 +7,6 @@ import (
 	"unicode/utf8"
 )
 
-// ── marshalAuditBlob ────────────────────────────────────────────────────────
-
 func TestMarshalAuditBlob_SmallValue(t *testing.T) {
 	v := map[string]any{"key": "value"}
 	out := marshalAuditBlob(v, 0) // 0 = no limit
@@ -73,8 +71,6 @@ func TestMarshalAuditBlob_StringValue(t *testing.T) {
 	}
 }
 
-// ── safeTruncateUTF8 ────────────────────────────────────────────────────────
-
 func TestSafeTruncateUTF8_ShortString(t *testing.T) {
 	s := "hello"
 	got := safeTruncateUTF8(s, 100)
@@ -111,8 +107,6 @@ func TestSafeTruncateUTF8_EmptyString(t *testing.T) {
 	}
 }
 
-// ── unmarshalAuditBlob ──────────────────────────────────────────────────────
-
 func TestUnmarshalAuditBlob_ValidJSON(t *testing.T) {
 	s := `{"key":"value","num":42}`
 	v := unmarshalAuditBlob(s)
@@ -139,8 +133,6 @@ func TestUnmarshalAuditBlob_Null(t *testing.T) {
 		t.Errorf("expected nil for JSON null, got %v", v)
 	}
 }
-
-// ── round-trip ──────────────────────────────────────────────────────────────
 
 func TestMarshalUnmarshalRoundTrip(t *testing.T) {
 	original := map[string]any{

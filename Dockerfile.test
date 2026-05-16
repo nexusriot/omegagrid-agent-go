@@ -1,0 +1,37 @@
+# Dockerfile.test — runs the Go test suite inside a container.
+#
+# Build & run (from repo root):
+#   docker build -f Dockerfile.test -t omegagrid-test .
+#   docker run --rm omegagrid-test
+#
+# Or use the helper script:
+#   ./run_tests.sh --docker
+
+# ── builder stage ─────────────────────────────────────────────────────────────
+FROM golang:1.25-alpine AS builder
+
+# CGO is not required: modernc.org/sqlite is a pure-Go SQLite implementation.
+ENV CGO_ENABLED=0
+
+# Install git (needed by some go tool invocations) and gcc-related headers
+# are not required here since CGO is off.
+RUN apk add --no-cache git
+
+WORKDIR /src
+
+# Cache dependency downloads as a separate layer so code changes don't
+# re-download modules.
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy the entire source tree.
+COPY . .
+
+# ── test stage ────────────────────────────────────────────────────────────────
+FROM builder AS test
+
+# -race requires CGO on most platforms; we run without it inside Alpine to
+# keep the image simple.  Remove the -race flag if you need CGO-based race
+# detection in a glibc-based image (e.g. golang:1.25).
+# To enable the race detector locally use run_tests.sh without --docker.
+CMD ["go", "test", "-v", "-timeout", "120s", "./..."]

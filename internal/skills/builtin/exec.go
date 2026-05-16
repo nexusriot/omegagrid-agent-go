@@ -123,7 +123,6 @@ func SshCommand(cfg SSHConfig) Executor {
 			Timeout:         10 * time.Second,
 		}
 		addr := fmt.Sprintf("%s:%d", host, port)
-		deadline := time.Now().Add(time.Duration(timeout * float64(time.Second)))
 
 		conn, err := ssh.Dial("tcp", addr, clientCfg)
 		if err != nil {
@@ -140,15 +139,34 @@ func SshCommand(cfg SSHConfig) Executor {
 		var stdout, stderr bytes.Buffer
 		sess.Stdout = &stdout
 		sess.Stderr = &stderr
-		_ = deadline
+
+		// Enforce the caller-supplied timeout on command execution. Without
+		// this a hung remote command blocks this goroutine forever (only the
+		// dial had a timeout before).
+		runErr := make(chan error, 1)
+		go func() { runErr <- sess.Run(command) }()
 
 		exitCode := 0
-		if err := sess.Run(command); err != nil {
-			if ee, ok := err.(*ssh.ExitError); ok {
-				exitCode = ee.ExitStatus()
-			} else {
-				exitCode = -1
+		select {
+		case err := <-runErr:
+			if err != nil {
+				if ee, ok := err.(*ssh.ExitError); ok {
+					exitCode = ee.ExitStatus()
+				} else {
+					exitCode = -1
+				}
 			}
+		case <-time.After(time.Duration(timeout * float64(time.Second))):
+			// Don't read stdout/stderr here: the Run goroutine may still be
+			// writing to those buffers (bytes.Buffer is not concurrency-safe).
+			_ = sess.Signal(ssh.SIGKILL)
+			_ = sess.Close()
+			return map[string]any{
+				"host":      host,
+				"command":   command,
+				"exit_code": -1,
+				"error":     fmt.Sprintf("command timed out after %gs", timeout),
+			}, nil
 		}
 		return map[string]any{
 			"host":      host,

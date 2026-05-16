@@ -60,7 +60,10 @@ func (h *historyStore) createSession() (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	id, _ := res.LastInsertId()
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("session created but id unavailable: %w", err)
+	}
 	return int(id), nil
 }
 

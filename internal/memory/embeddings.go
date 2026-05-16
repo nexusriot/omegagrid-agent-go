@@ -40,6 +40,9 @@ func (o *ollamaEmbeddings) embed(text string) ([]float32, error) {
 		}
 		lastErr = err
 	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no ollama embedding endpoints configured")
+	}
 	return nil, lastErr
 }
 
@@ -96,8 +99,14 @@ func newOpenAIEmbeddings(baseURL, apiKey, model string, timeoutSec float64) *ope
 }
 
 func (o *openAIEmbeddings) embed(text string) ([]float32, error) {
-	body, _ := json.Marshal(map[string]any{"model": o.model, "input": text})
-	req, _ := http.NewRequest(http.MethodPost, o.baseURL+"/embeddings", bytes.NewReader(body))
+	body, err := json.Marshal(map[string]any{"model": o.model, "input": text})
+	if err != nil {
+		return nil, fmt.Errorf("marshal embeddings request: %w", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, o.baseURL+"/embeddings", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("build embeddings request: %w", err)
+	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+o.apiKey)
 	resp, err := o.http.Do(req)

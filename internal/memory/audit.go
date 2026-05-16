@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // AuditRecord is one persisted skill/tool invocation.
@@ -173,9 +174,34 @@ func marshalAuditBlob(v any, maxBytes int) string {
 		return `{"error":"marshal failed"}`
 	}
 	if maxBytes > 0 && len(b) > maxBytes {
-		return string(b[:maxBytes])
+		// Byte-slicing the marshaled JSON would cut it mid-token (and possibly
+		// mid-rune), producing invalid JSON that unmarshalAuditBlob can't parse
+		// back — corrupting the stored args/result. Emit a valid JSON wrapper
+		// carrying a UTF-8-safe preview and a truncation marker instead.
+		wrapped, werr := json.Marshal(map[string]any{
+			"_truncated":     true,
+			"_original_size": len(b),
+			"preview":        safeTruncateUTF8(string(b), maxBytes),
+		})
+		if werr != nil {
+			return `{"_truncated":true}`
+		}
+		return string(wrapped)
 	}
 	return string(b)
+}
+
+// safeTruncateUTF8 returns at most maxBytes bytes of s, trimming back so the
+// result never ends in the middle of a multi-byte rune.
+func safeTruncateUTF8(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	t := s[:maxBytes]
+	for len(t) > 0 && !utf8.ValidString(t) {
+		t = t[:len(t)-1]
+	}
+	return t
 }
 
 func unmarshalAuditBlob(s string) any {

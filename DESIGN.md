@@ -284,7 +284,7 @@ if MaxSteps exceeded:
 |---|---|---|
 | `vector_add` | Store a durable fact or preference | `memory.Client.AddMemory()` → in-process vector store |
 | `vector_search` | Semantic search over stored memories | `memory.Client.SearchMemory()` → in-process vector store |
-| `schedule_task` | Create/list/delete/enable/disable cron tasks | Native Go via `scheduler.ScheduleTaskSkill` |
+| `schedule_task` | Create/list/delete/delete_all/enable/disable cron tasks | Native Go via `scheduler.ScheduleTaskSkill` |
 | `web_search` | DuckDuckGo HTML search (no API key); returns title/url/snippet | Native Go via `search.WebSearchSkill` |
 
 All registered skills (weather, dns_lookup, shell_command, etc.) are listed
@@ -547,8 +547,9 @@ CREATE TABLE IF NOT EXISTS scheduled_tasks (
 ```
 
 Operations: `Create`, `Get`, `ListAll`, `ListEnabled`, `UpdateLastRun`,
-`SetEnabled`, `Delete`.  The directory for the database file is created
-automatically via `os.MkdirAll`.
+`SetEnabled`, `Delete`, `DeleteAll`.  `DeleteAll` truncates the table in a
+single statement and returns the number of rows removed.  The directory for
+the database file is created automatically via `os.MkdirAll`.
 
 #### Cron matcher (`cron.go`)
 
@@ -587,15 +588,20 @@ avoid double-firing if the tick period is shorter than a minute.
 
 #### Native skill (`skill.go`)
 
-`ScheduleTaskSkill` exposes five actions:
+`ScheduleTaskSkill` exposes six actions:
 
 | Action | Parameters | Returns |
 |---|---|---|
 | `create` | `cron_expr`, `skill`, `name`, `args`, `notify_telegram_chat_id` | `{created: true, task: {...}}` |
 | `list` | — | `{count: N, tasks: [...]}` |
-| `delete` | `task_id` | `{deleted: true}` |
+| `delete` | `task_id` | `{deleted: true, task_id: N}` |
+| `delete_all` | — | `{deleted_all: true, deleted_count: N}` |
 | `enable` | `task_id` | `{enabled: true}` |
 | `disable` | `task_id` | `{disabled: true}` |
+
+`delete_all` (aliases `deleteall`, `delete-all`) requires no `task_id` and
+removes every scheduled task — this is what the agent calls for requests like
+"remove all scheduled tasks".
 
 Registered as a **native** Go skill in `cmd/gateway/main.go`, operating
 directly on the `Store` struct — no HTTP round-trip required.

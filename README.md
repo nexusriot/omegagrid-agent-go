@@ -88,8 +88,16 @@ Makefile               web / build / build-all / dev-web / vector-migrate target
 ```bash
 cp .env.example .env
 # edit .env  (LLM_PROVIDER, API keys, TELEGRAM_BOT_TOKEN, …)
+mkdir -p data                       # REQUIRED — see note below
 docker compose up --build
 ```
+
+> **`mkdir -p data` is required before the first `up`.** Docker will
+> otherwise create the bind-mount source as `root:root` and the containers
+> (which run as `${UID:-1000}:${GID:-1000}`) will fail with
+> `mkdir /app/data/chromem: permission denied` and
+> `auth: unable to open database file (14)`. See the
+> [Quick Start guide](QUICK_START.md) for the full from-scratch walkthrough.
 
 | URL | What |
 |---|---|
@@ -99,6 +107,37 @@ docker compose up --build
 
 Set `FRONTEND_PORT` (default `80`) or `BACKEND_PORT` (default `8000`) in `.env`
 to use different host ports.
+
+### `./data` permissions (UID/GID)
+
+Both the gateway and telegram-bot containers run as `${UID:-1000}:${GID:-1000}`
+and bind-mount `./data:/app/data`. If the host `./data/` directory is owned by
+a different user (commonly `root`, if an earlier run created it before the
+`user:` directive was added, or if you ran compose with `sudo`), the container
+processes can't write to it and you will see cryptic errors such as:
+
+```
+auth: unable to open database file (14)
+```
+
+(SQLite error 14 = `SQLITE_CANTOPEN` — almost always a permissions/path problem.)
+
+Fix it on the host:
+
+```bash
+# Make sure your real UID/GID are passed into compose
+echo "UID=$(id -u)"  >> .env
+echo "GID=$(id -g)" >> .env
+
+# Re-own any pre-existing data directory
+sudo chown -R "$(id -u):$(id -g)" data/
+
+docker compose up -d --force-recreate
+```
+
+Some shells (notably bash) treat `UID` as read-only and won't export it into
+`docker compose`'s environment — writing it into `.env` as shown above is the
+reliable way.
 
 ## Running locally (no Docker)
 

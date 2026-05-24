@@ -102,6 +102,12 @@ to use different host ports.
 
 ## Running locally (no Docker)
 
+The gateway auto-creates `DATA_DIR` and its subdirectories (`chromem/`, `skills/`,
+and the parent dirs of `AGENT_DB` / `SCHEDULER_DB`) on first start, so no
+`mkdir -p data/skills` step is required. If you prefer to pre-create them (e.g.
+to set custom permissions, or to bind-mount the dir into Docker), `make build`
+still runs `mkdir -p data/skills` for you.
+
 ```bash
 # 1. Go gateway  (serves /api/* and /health on :8000 — no UI)
 LLM_PROVIDER=ollama OLLAMA_URL=http://127.0.0.1:11434 \

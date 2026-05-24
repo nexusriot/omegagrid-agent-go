@@ -126,6 +126,16 @@ func BuildChat(cfg config.Config) (llm.ChatClient, error) {
 			cfg.OpenAIAPIKey, cfg.OpenAIBaseURL, cfg.OpenAIChatModel,
 			cfg.OpenAIAPIMode, cfg.OpenAIReasoning, cfg.OpenAITimeoutSec,
 		), nil
+	case "digitalocean", "do":
+		if cfg.DigitalOceanAPIKey == "" {
+			return nil, errors.New("DIGITALOCEAN_API_KEY is required for digitalocean provider")
+		}
+		// DigitalOcean Serverless Inference is OpenAI-compatible (POST /v1/chat/completions,
+		// bearer auth) so we reuse the OpenAI chat client.
+		return llm.NewOpenAIChat(
+			cfg.DigitalOceanAPIKey, cfg.DigitalOceanBaseURL, cfg.DigitalOceanChatModel,
+			"chat_completions", "", cfg.DigitalOceanTimeoutSec,
+		), nil
 	default:
 		return llm.NewOllamaChat(cfg.OllamaURL, cfg.OllamaModel, cfg.OllamaTimeoutSec), nil
 	}

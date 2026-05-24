@@ -283,7 +283,7 @@ rm data/vector_db.jsonl
 | `BACKEND_PORT` | `8000` | Gateway listen port |
 | `FRONTEND_PORT` | `80` | nginx listen port (Docker Compose only) |
 | `DATA_DIR` | `/app/data` | Root directory for all persistent data |
-| `LLM_PROVIDER` | `ollama` | `ollama` \| `openai` \| `openai-codex` |
+| `LLM_PROVIDER` | `ollama` | `ollama` \| `openai` \| `openai-codex` \| `digitalocean` |
 | `OLLAMA_URL` | `http://127.0.0.1:11434` | Ollama server URL |
 | `OLLAMA_MODEL` | `llama3:latest` | Ollama chat model |
 | `OLLAMA_EMBED_MODEL` | `nomic-embed-text` | Ollama embeddings model (for vector memory) |
@@ -295,6 +295,11 @@ rm data/vector_db.jsonl
 | `OPENAI_API_MODE` | auto | `chat_completions` \| `responses` (auto-selected for codex models) |
 | `OPENAI_REASONING_EFFORT` | `medium` | Reasoning effort for the `responses` API |
 | `OPENAI_TIMEOUT` | `120` | OpenAI request timeout (seconds) |
+| `DIGITALOCEAN_API_KEY` | — | Required for `digitalocean` provider (model access key or DO personal access token) |
+| `DIGITALOCEAN_BASE_URL` | `https://inference.do-ai.run/v1` | DigitalOcean Serverless Inference base URL |
+| `DIGITALOCEAN_CHAT_MODEL` | `meta-llama/Llama-3.3-70B-Instruct` | DigitalOcean chat model |
+| `DIGITALOCEAN_EMBED_MODEL` | `qwen3-embedding-0.6b` | DigitalOcean embeddings model (for vector memory) |
+| `DIGITALOCEAN_TIMEOUT` | `120` | DigitalOcean request timeout (seconds) |
 | `AGENT_DB` | `{DATA_DIR}/agent_memory.sqlite3` | Conversation history database |
 | `AGENT_VECTOR_DIR` | `{DATA_DIR}/chromem` | chromem-go vector database directory |
 | `AGENT_VECTOR_COLLECTION` | `memories` | Collection name inside the vector database |

@@ -46,6 +46,11 @@ func buildEmbeddings(cfg config.Config) (embeddingsClient, error) {
 			return nil, fmt.Errorf("OPENAI_API_KEY required for openai embeddings")
 		}
 		return newOpenAIEmbeddings(cfg.OpenAIBaseURL, cfg.OpenAIAPIKey, cfg.OpenAIEmbedModel, cfg.OpenAITimeoutSec), nil
+	case "digitalocean", "do":
+		if cfg.DigitalOceanAPIKey == "" {
+			return nil, fmt.Errorf("DIGITALOCEAN_API_KEY required for digitalocean embeddings")
+		}
+		return newOpenAIEmbeddings(cfg.DigitalOceanBaseURL, cfg.DigitalOceanAPIKey, cfg.DigitalOceanEmbedModel, cfg.DigitalOceanTimeoutSec), nil
 	default:
 		return newOllamaEmbeddings(cfg.OllamaURL, cfg.OllamaEmbedModel, cfg.OllamaTimeoutSec), nil
 	}

@@ -5,6 +5,9 @@ package bootstrap
 
 import (
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/nexusriot/omegagrid-agent-go/internal/agent"
@@ -15,6 +18,30 @@ import (
 	"github.com/nexusriot/omegagrid-agent-go/internal/search"
 	"github.com/nexusriot/omegagrid-agent-go/internal/skills"
 )
+
+// ensureDataDirs creates every on-disk directory the runtime writes to.
+// SQLite drivers don't create parent directories, so a fresh clone with no
+// existing DATA_DIR would otherwise fail on first start with "unable to open
+// database file". Running this at bootstrap removes the need for users to
+// `mkdir -p data/...` before launching the gateway.
+func ensureDataDirs(cfg config.Config) error {
+	dirs := []string{
+		cfg.DataDir,
+		filepath.Dir(cfg.AgentDB),
+		cfg.VectorDir,
+		cfg.SkillsDir,
+		filepath.Dir(cfg.SchedulerDB),
+	}
+	for _, d := range dirs {
+		if d == "" || d == "." {
+			continue
+		}
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			return fmt.Errorf("create %s: %w", d, err)
+		}
+	}
+	return nil
+}
 
 // Services holds every initialised service.
 type Services struct {
@@ -32,6 +59,9 @@ type Services struct {
 // New builds all services from cfg. The returned cleanup func must be called
 // (e.g. via defer) to close database handles and stop background goroutines.
 func New(cfg config.Config) (*Services, func(), error) {
+	if err := ensureDataDirs(cfg); err != nil {
+		return nil, nil, err
+	}
 	chat, err := BuildChat(cfg)
 	if err != nil {
 		return nil, nil, err
@@ -125,6 +155,16 @@ func BuildChat(cfg config.Config) (llm.ChatClient, error) {
 		return llm.NewOpenAIChat(
 			cfg.OpenAIAPIKey, cfg.OpenAIBaseURL, cfg.OpenAIChatModel,
 			cfg.OpenAIAPIMode, cfg.OpenAIReasoning, cfg.OpenAITimeoutSec,
+		), nil
+	case "digitalocean", "do":
+		if cfg.DigitalOceanAPIKey == "" {
+			return nil, errors.New("DIGITALOCEAN_API_KEY is required for digitalocean provider")
+		}
+		// DigitalOcean Serverless Inference is OpenAI-compatible (POST /v1/chat/completions,
+		// bearer auth) so we reuse the OpenAI chat client.
+		return llm.NewOpenAIChat(
+			cfg.DigitalOceanAPIKey, cfg.DigitalOceanBaseURL, cfg.DigitalOceanChatModel,
+			"chat_completions", "", cfg.DigitalOceanTimeoutSec,
 		), nil
 	default:
 		return llm.NewOllamaChat(cfg.OllamaURL, cfg.OllamaModel, cfg.OllamaTimeoutSec), nil

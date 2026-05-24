@@ -88,8 +88,16 @@ Makefile               web / build / build-all / dev-web / vector-migrate target
 ```bash
 cp .env.example .env
 # edit .env  (LLM_PROVIDER, API keys, TELEGRAM_BOT_TOKEN, …)
+mkdir -p data                       # REQUIRED — see note below
 docker compose up --build
 ```
+
+> **`mkdir -p data` is required before the first `up`.** Docker will
+> otherwise create the bind-mount source as `root:root` and the containers
+> (which run as `${UID:-1000}:${GID:-1000}`) will fail with
+> `mkdir /app/data/chromem: permission denied` and
+> `auth: unable to open database file (14)`. See the
+> [Quick Start guide](QUICK_START.md) for the full from-scratch walkthrough.
 
 | URL | What |
 |---|---|
@@ -100,7 +108,44 @@ docker compose up --build
 Set `FRONTEND_PORT` (default `80`) or `BACKEND_PORT` (default `8000`) in `.env`
 to use different host ports.
 
+### `./data` permissions (UID/GID)
+
+Both the gateway and telegram-bot containers run as `${UID:-1000}:${GID:-1000}`
+and bind-mount `./data:/app/data`. If the host `./data/` directory is owned by
+a different user (commonly `root`, if an earlier run created it before the
+`user:` directive was added, or if you ran compose with `sudo`), the container
+processes can't write to it and you will see cryptic errors such as:
+
+```
+auth: unable to open database file (14)
+```
+
+(SQLite error 14 = `SQLITE_CANTOPEN` — almost always a permissions/path problem.)
+
+Fix it on the host:
+
+```bash
+# Make sure your real UID/GID are passed into compose
+echo "UID=$(id -u)"  >> .env
+echo "GID=$(id -g)" >> .env
+
+# Re-own any pre-existing data directory
+sudo chown -R "$(id -u):$(id -g)" data/
+
+docker compose up -d --force-recreate
+```
+
+Some shells (notably bash) treat `UID` as read-only and won't export it into
+`docker compose`'s environment — writing it into `.env` as shown above is the
+reliable way.
+
 ## Running locally (no Docker)
+
+The gateway auto-creates `DATA_DIR` and its subdirectories (`chromem/`, `skills/`,
+and the parent dirs of `AGENT_DB` / `SCHEDULER_DB`) on first start, so no
+`mkdir -p data/skills` step is required. If you prefer to pre-create them (e.g.
+to set custom permissions, or to bind-mount the dir into Docker), `make build`
+still runs `mkdir -p data/skills` for you.
 
 ```bash
 # 1. Go gateway  (serves /api/* and /health on :8000 — no UI)
@@ -283,7 +328,7 @@ rm data/vector_db.jsonl
 | `BACKEND_PORT` | `8000` | Gateway listen port |
 | `FRONTEND_PORT` | `80` | nginx listen port (Docker Compose only) |
 | `DATA_DIR` | `/app/data` | Root directory for all persistent data |
-| `LLM_PROVIDER` | `ollama` | `ollama` \| `openai` \| `openai-codex` |
+| `LLM_PROVIDER` | `ollama` | `ollama` \| `openai` \| `openai-codex` \| `digitalocean` |
 | `OLLAMA_URL` | `http://127.0.0.1:11434` | Ollama server URL |
 | `OLLAMA_MODEL` | `llama3:latest` | Ollama chat model |
 | `OLLAMA_EMBED_MODEL` | `nomic-embed-text` | Ollama embeddings model (for vector memory) |
@@ -295,6 +340,11 @@ rm data/vector_db.jsonl
 | `OPENAI_API_MODE` | auto | `chat_completions` \| `responses` (auto-selected for codex models) |
 | `OPENAI_REASONING_EFFORT` | `medium` | Reasoning effort for the `responses` API |
 | `OPENAI_TIMEOUT` | `120` | OpenAI request timeout (seconds) |
+| `DIGITALOCEAN_API_KEY` | — | Required for `digitalocean` provider (model access key or DO personal access token) |
+| `DIGITALOCEAN_BASE_URL` | `https://inference.do-ai.run/v1` | DigitalOcean Serverless Inference base URL |
+| `DIGITALOCEAN_CHAT_MODEL` | `meta-llama/Llama-3.3-70B-Instruct` | DigitalOcean chat model |
+| `DIGITALOCEAN_EMBED_MODEL` | `qwen3-embedding-0.6b` | DigitalOcean embeddings model (for vector memory) |
+| `DIGITALOCEAN_TIMEOUT` | `120` | DigitalOcean request timeout (seconds) |
 | `AGENT_DB` | `{DATA_DIR}/agent_memory.sqlite3` | Conversation history database |
 | `AGENT_VECTOR_DIR` | `{DATA_DIR}/chromem` | chromem-go vector database directory |
 | `AGENT_VECTOR_COLLECTION` | `memories` | Collection name inside the vector database |

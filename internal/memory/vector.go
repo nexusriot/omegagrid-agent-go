@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -143,6 +144,106 @@ func (v *vectorStore) searchText(query string, k int) (*SearchResult, error) {
 		})
 	}
 	return &SearchResult{Hits: hits}, nil
+}
+
+// listAll enumerates every stored memory. chromem-go v0.7.0 exposes no
+// "list documents" API, so we embed a constant probe and ask for the whole
+// collection (nResults = Count) — QueryEmbedding returns every document when
+// k equals the collection size. Results are sorted newest-first by the
+// created_at metadata, then paginated in memory. limit<=0 means "no limit".
+func (v *vectorStore) listAll(limit, offset int) ([]MemoryHit, int, error) {
+	count := v.col.Count()
+	if count == 0 {
+		return []MemoryHit{}, 0, nil
+	}
+
+	emb, err := v.embedClient.embed("probe")
+	if err != nil {
+		return nil, 0, fmt.Errorf("embed probe: %w", err)
+	}
+	docs, err := v.col.QueryEmbedding(context.Background(), emb, count, nil, nil)
+	if err != nil {
+		return nil, 0, fmt.Errorf("chromem enumerate: %w", err)
+	}
+
+	all := make([]MemoryHit, 0, len(docs))
+	for _, d := range docs {
+		m := make(map[string]any, len(d.Metadata))
+		for k, val := range d.Metadata {
+			m[k] = val
+		}
+		all = append(all, MemoryHit{ID: d.ID, Text: d.Content, Metadata: m})
+	}
+
+	sort.SliceStable(all, func(i, j int) bool {
+		return createdAt(all[i].Metadata) > createdAt(all[j].Metadata)
+	})
+
+	total := len(all)
+	if offset < 0 {
+		offset = 0
+	}
+	if offset >= total {
+		return []MemoryHit{}, total, nil
+	}
+	all = all[offset:]
+	if limit > 0 && limit < len(all) {
+		all = all[:limit]
+	}
+	return all, total, nil
+}
+
+// getByID returns a single stored memory, or nil when it does not exist.
+func (v *vectorStore) getByID(id string) (*MemoryHit, error) {
+	doc, err := v.col.GetByID(context.Background(), id)
+	if err != nil {
+		return nil, nil // chromem returns an error for unknown IDs; treat as not-found
+	}
+	m := make(map[string]any, len(doc.Metadata))
+	for k, val := range doc.Metadata {
+		m[k] = val
+	}
+	return &MemoryHit{ID: doc.ID, Text: doc.Content, Metadata: m}, nil
+}
+
+// deleteByID removes a memory from the collection and evicts its hash from the
+// in-memory dedup index so an identical text can be re-added afterwards.
+func (v *vectorStore) deleteByID(id string) (bool, error) {
+	doc, err := v.col.GetByID(context.Background(), id)
+	if err != nil {
+		return false, nil // not found
+	}
+	if err := v.col.Delete(context.Background(), nil, nil, id); err != nil {
+		return false, fmt.Errorf("chromem delete: %w", err)
+	}
+	v.mu.Lock()
+	if h, ok := doc.Metadata["hash"]; ok {
+		delete(v.hashes, h)
+	} else {
+		// Fall back to a reverse scan if the doc carried no hash metadata.
+		for hk, mid := range v.hashes {
+			if mid == id {
+				delete(v.hashes, hk)
+				break
+			}
+		}
+	}
+	v.mu.Unlock()
+	return true, nil
+}
+
+// createdAt parses the created_at metadata (unix seconds, may be fractional)
+// into a float for sorting. Missing/invalid values sort last (0).
+func createdAt(m map[string]any) float64 {
+	s, ok := m["created_at"].(string)
+	if !ok {
+		return 0
+	}
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0
+	}
+	return f
 }
 
 func coerceMeta(m map[string]any) map[string]string {

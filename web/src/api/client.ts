@@ -45,6 +45,16 @@ export const addMemory = (text: string, meta: Record<string, unknown> = {}) =>
     body: JSON.stringify({ text, meta }),
   })
 
+export const listMemories = (limit = 100, offset = 0) =>
+  json<{ hits: MemoryHit[] | null; total: number }>(
+    `/api/memory?limit=${limit}&offset=${offset}`,
+  ).then(r => ({ hits: r.hits ?? [], total: r.total }))
+
+export const deleteMemory = (id: string) =>
+  json<{ ok: boolean; deleted: string }>(`/api/memory/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+  })
+
 export const fetchSkills = () =>
   json<{ skills: Skill[] }>('/api/skills').then(r => r.skills)
 

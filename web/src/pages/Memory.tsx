@@ -1,8 +1,8 @@
 import { useState } from 'react'
-import { useMutation } from '@tanstack/react-query'
-import { Search, Plus, Database, Loader2, X } from 'lucide-react'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { Search, Plus, Database, Loader2, X, List, Trash2 } from 'lucide-react'
 import { toast } from 'sonner'
-import { searchMemory, addMemory } from '../api/client'
+import { searchMemory, addMemory, listMemories, deleteMemory } from '../api/client'
 import type { MemoryHit } from '../api/types'
 
 function DistanceBadge({ d }: { d: number }) {
@@ -15,6 +15,37 @@ function DistanceBadge({ d }: { d: number }) {
   )
 }
 
+function MemoryCard({ h, onDelete, deleting }: {
+  h: MemoryHit
+  onDelete: (id: string) => void
+  deleting: boolean
+}) {
+  return (
+    <div className="rounded-2xl border border-surface-border bg-surface-overlay p-4 animate-fade-in">
+      <div className="flex items-start justify-between gap-3 mb-2">
+        <p className="text-sm text-gray-200 leading-relaxed">{h.text}</p>
+        <div className="flex items-center gap-2 shrink-0">
+          {typeof h.distance === 'number' && <DistanceBadge d={h.distance} />}
+          <button
+            onClick={() => onDelete(h.id)}
+            disabled={deleting}
+            title="Delete memory"
+            className="text-gray-600 hover:text-red-400 transition-colors disabled:opacity-40"
+          >
+            {deleting ? <Loader2 size={13} className="animate-spin" /> : <Trash2 size={13} />}
+          </button>
+        </div>
+      </div>
+      {Object.keys(h.metadata).length > 0 && (
+        <pre className="mt-2 rounded-lg bg-surface p-2 font-mono text-[11px] text-gray-500 overflow-x-auto">
+          {JSON.stringify(h.metadata, null, 2)}
+        </pre>
+      )}
+      <p className="mt-1 font-mono text-[10px] text-gray-700 truncate">{h.id}</p>
+    </div>
+  )
+}
+
 export default function Memory() {
   const [query, setQuery]   = useState('')
   const [k, setK]           = useState(10)
@@ -22,6 +53,15 @@ export default function Memory() {
   const [addText, setAddText] = useState('')
   const [addMeta, setAddMeta] = useState('')
   const [showAdd, setShowAdd] = useState(false)
+  const [browse, setBrowse]   = useState(false)
+
+  const qc = useQueryClient()
+
+  const browseQuery = useQuery({
+    queryKey: ['memories'],
+    queryFn: () => listMemories(200, 0),
+    enabled: browse,
+  })
 
   const searchMut = useMutation({
     mutationFn: () => searchMemory(query, k),
@@ -40,10 +80,21 @@ export default function Memory() {
         toast.info(`Skipped: ${res.reason ?? 'duplicate'}`)
       } else {
         toast.success('Memory stored')
+        qc.invalidateQueries({ queryKey: ['memories'] })
       }
       setAddText('')
       setAddMeta('')
       setShowAdd(false)
+    },
+    onError: (e: Error) => toast.error(e.message),
+  })
+
+  const delMut = useMutation({
+    mutationFn: (id: string) => deleteMemory(id),
+    onSuccess: (res) => {
+      toast.success('Memory deleted')
+      setHits((prev) => prev.filter((h) => h.id !== res.deleted))
+      qc.invalidateQueries({ queryKey: ['memories'] })
     },
     onError: (e: Error) => toast.error(e.message),
   })
@@ -55,6 +106,15 @@ export default function Memory() {
         <Database size={16} className="text-accent" />
         <span className="text-sm font-semibold text-gray-300">Vector Memory</span>
         <div className="flex-1" />
+        <button
+          onClick={() => setBrowse((b) => !b)}
+          className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${
+            browse ? 'bg-accent/30 text-accent' : 'bg-surface-overlay text-gray-400 hover:text-gray-200'
+          }`}
+        >
+          <List size={12} />
+          {browse ? 'Hide all' : 'Browse all'}
+        </button>
         <button
           onClick={() => setShowAdd((s) => !s)}
           className="flex items-center gap-1.5 rounded-lg bg-accent/20 px-3 py-1.5 text-xs font-medium text-accent hover:bg-accent/30 transition-colors"
@@ -94,68 +154,92 @@ export default function Memory() {
           </div>
         )}
 
-        {/* Search bar */}
-        <div className="flex gap-2">
-          <div className="relative flex-1">
-            <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-600" />
-            <input
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              onKeyDown={(e) => e.key === 'Enter' && searchMut.mutate()}
-              placeholder="Semantic search…"
-              className="w-full rounded-xl border border-surface-border bg-surface-overlay py-2 pl-9 pr-3 text-sm text-gray-200 placeholder-gray-600 outline-none focus:border-accent/50"
-            />
+        {/* Browse-all list */}
+        {browse && (
+          <div className="space-y-2">
+            {browseQuery.isLoading && (
+              <div className="flex items-center gap-2 text-sm text-gray-500 py-6 justify-center">
+                <Loader2 size={14} className="animate-spin" /> Loading memories…
+              </div>
+            )}
+            {browseQuery.data && (
+              <>
+                <p className="text-xs text-gray-600">
+                  {browseQuery.data.total} stored memor{browseQuery.data.total !== 1 ? 'ies' : 'y'}
+                  {browseQuery.data.hits.length < browseQuery.data.total &&
+                    ` (showing ${browseQuery.data.hits.length})`}
+                </p>
+                {browseQuery.data.hits.map((h) => (
+                  <MemoryCard
+                    key={h.id}
+                    h={h}
+                    onDelete={(id) => delMut.mutate(id)}
+                    deleting={delMut.isPending && delMut.variables === h.id}
+                  />
+                ))}
+                {browseQuery.data.total === 0 && (
+                  <p className="text-center text-sm text-gray-600 py-8">No memories stored yet</p>
+                )}
+              </>
+            )}
           </div>
-          <div className="flex items-center gap-1.5 rounded-xl border border-surface-border bg-surface-overlay px-3 text-xs text-gray-500">
-            <span>k =</span>
-            <input
-              type="number"
-              min={1}
-              max={50}
-              value={k}
-              onChange={(e) => setK(Number(e.target.value))}
-              className="w-10 bg-transparent text-gray-300 outline-none text-center"
-            />
-          </div>
-          <button
-            onClick={() => searchMut.mutate()}
-            disabled={!query.trim() || searchMut.isPending}
-            className="flex items-center gap-2 rounded-xl bg-accent px-4 py-2 text-xs font-semibold text-white hover:bg-accent-hover disabled:opacity-40 transition-colors"
-          >
-            {searchMut.isPending ? <Loader2 size={12} className="animate-spin" /> : <Search size={12} />}
-            Search
-          </button>
-        </div>
+        )}
 
-        {/* Results */}
-        {hits.length > 0 && (
+        {/* Search bar */}
+        {!browse && (
+          <div className="flex gap-2">
+            <div className="relative flex-1">
+              <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-600" />
+              <input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && searchMut.mutate()}
+                placeholder="Semantic search…"
+                className="w-full rounded-xl border border-surface-border bg-surface-overlay py-2 pl-9 pr-3 text-sm text-gray-200 placeholder-gray-600 outline-none focus:border-accent/50"
+              />
+            </div>
+            <div className="flex items-center gap-1.5 rounded-xl border border-surface-border bg-surface-overlay px-3 text-xs text-gray-500">
+              <span>k =</span>
+              <input
+                type="number"
+                min={1}
+                max={50}
+                value={k}
+                onChange={(e) => setK(Number(e.target.value))}
+                className="w-10 bg-transparent text-gray-300 outline-none text-center"
+              />
+            </div>
+            <button
+              onClick={() => searchMut.mutate()}
+              disabled={!query.trim() || searchMut.isPending}
+              className="flex items-center gap-2 rounded-xl bg-accent px-4 py-2 text-xs font-semibold text-white hover:bg-accent-hover disabled:opacity-40 transition-colors"
+            >
+              {searchMut.isPending ? <Loader2 size={12} className="animate-spin" /> : <Search size={12} />}
+              Search
+            </button>
+          </div>
+        )}
+
+        {/* Search results */}
+        {!browse && hits.length > 0 && (
           <div className="space-y-2">
             <p className="text-xs text-gray-600">{hits.length} result{hits.length !== 1 ? 's' : ''}</p>
             {hits.map((h) => (
-              <div
+              <MemoryCard
                 key={h.id}
-                className="rounded-2xl border border-surface-border bg-surface-overlay p-4 animate-fade-in"
-              >
-                <div className="flex items-start justify-between gap-3 mb-2">
-                  <p className="text-sm text-gray-200 leading-relaxed">{h.text}</p>
-                  <DistanceBadge d={h.distance} />
-                </div>
-                {Object.keys(h.metadata).length > 0 && (
-                  <pre className="mt-2 rounded-lg bg-surface p-2 font-mono text-[11px] text-gray-500 overflow-x-auto">
-                    {JSON.stringify(h.metadata, null, 2)}
-                  </pre>
-                )}
-                <p className="mt-1 font-mono text-[10px] text-gray-700 truncate">{h.id}</p>
-              </div>
+                h={h}
+                onDelete={(id) => delMut.mutate(id)}
+                deleting={delMut.isPending && delMut.variables === h.id}
+              />
             ))}
           </div>
         )}
 
-        {hits.length === 0 && !searchMut.isPending && query && searchMut.isSuccess && (
+        {!browse && hits.length === 0 && !searchMut.isPending && query && searchMut.isSuccess && (
           <p className="text-center text-sm text-gray-600 py-8">No memories found for "{query}"</p>
         )}
 
-        {!query && hits.length === 0 && !showAdd && (
+        {!browse && !query && hits.length === 0 && !showAdd && (
           <div className="flex flex-col items-center justify-center py-20 gap-3 text-center">
             <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-accent/10 text-accent">
               <Database size={22} />

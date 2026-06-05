@@ -171,6 +171,32 @@ func addMemory(text string, meta map[string]any) error {
 	return err
 }
 
+func listMemories(limit, offset int) ([]memory.MemoryHit, int, error) {
+	if isRemote() {
+		var out struct {
+			Hits  []memory.MemoryHit `json:"hits"`
+			Total int                `json:"total"`
+		}
+		path := fmt.Sprintf("/api/memory?limit=%d&offset=%d", limit, offset)
+		return out.Hits, out.Total, httpJSON("GET", path, nil, &out)
+	}
+	return getLocal().Memory.ListMemories(limit, offset)
+}
+
+func deleteMemory(id string) error {
+	if isRemote() {
+		return httpJSON("DELETE", "/api/memory/"+id, nil, nil)
+	}
+	existed, err := getLocal().Memory.DeleteMemory(id)
+	if err != nil {
+		return err
+	}
+	if !existed {
+		return fmt.Errorf("memory not found: %s", id)
+	}
+	return nil
+}
+
 func listSchedule() ([]*scheduler.Task, error) {
 	if isRemote() {
 		var out []*scheduler.Task

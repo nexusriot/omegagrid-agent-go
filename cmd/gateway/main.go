@@ -27,12 +27,13 @@ func main() {
 	defer cleanup()
 
 	deps := httpapi.Deps{
-		Cfg:       cfg,
-		Agent:     svc.Agent,
-		Memory:    svc.Memory,
-		Skills:    svc.Skills,
-		Chat:      svc.Chat,
-		Scheduler: svc.Sched,
+		Cfg:          cfg,
+		Agent:        svc.Agent,
+		Memory:       svc.Memory,
+		Skills:       svc.Skills,
+		Chat:         svc.Chat,
+		Scheduler:    svc.Sched,
+		ToolProvider: svc.ToolProvider,
 	}
 
 	addr := fmt.Sprintf(":%d", cfg.BackendPort)

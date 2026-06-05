@@ -197,6 +197,8 @@ omega skills list
 omega skills run weather --arg city=Berlin
 omega memory search "kubernetes notes" -k 10
 omega memory add "vlad prefers tabs" --meta tag=preference
+omega memory list --limit 50
+omega memory delete <memory-id>
 omega schedule list
 omega schedule create --name daily-news --cron "0 9 * * *" --skill web_search --arg query=hackernews
 omega schedule delete 7
@@ -215,7 +217,7 @@ and falls back to plain text when piped (so `omega ask … | jq` works).
 | Page | Path | Description |
 |---|---|---|
 | Chat | `/ui/` | Streaming agent chat with live tool-call cards, session sidebar, markdown rendering |
-| Memory | `/ui/memory` | Semantic search + manual add to the vector store |
+| Memory | `/ui/memory` | Semantic search, manual add, **browse-all list**, and per-memory delete |
 | Skills | `/ui/skills` | Browse all registered skills with parameter schemas; **skill playground** (▶ button) invokes any skill directly with auto-generated forms and shows pretty / raw / timing tabs |
 | Scheduler | `/ui/scheduler` | CRUD for cron tasks: create, enable/disable, delete, view last result |
 | Activity | `/ui/activity` | Skill/tool invocation audit log: filter by skill or session, errors-only toggle, JSON drawer, replay button. Auto-refreshes every 10 s |
@@ -233,6 +235,7 @@ Everything is compiled into the gateway binary (pure Go, no CGO, distroless runt
 - Telegram bot with SQLite auth allowlist
 - `omega` CLI binary with local + remote modes (`cmd/cli`)
 - **Skill playground** endpoint (`POST /api/skills/{name}/invoke`) for invoking any skill directly without going through the agent loop
+- **MCP server + client** (`POST /mcp`): expose skills as MCP tools and consume tools from remote MCP servers — hand-rolled JSON-RPC 2.0, no SDK dependency
 
 **Memory & history:**
 - `HistoryStore` — SQLite sessions + messages (`modernc.org/sqlite`, CGO-free)
@@ -268,6 +271,59 @@ Everything is compiled into the gateway binary (pure Go, no CGO, distroless runt
 **Markdown / pipeline skills:**
 Dynamic skills defined as `*.md` files in `SKILLS_DIR` (default `DATA_DIR/skills`).
 `skill_creator` writes new `.md` files and hot-registers them without a restart.
+
+## MCP (Model Context Protocol)
+
+The gateway speaks MCP in both directions over a hand-rolled JSON-RPC 2.0
+transport (no SDK dependency).
+
+**As an MCP server** — every registered skill (built-in, dynamic, native, and
+any consumed remote tools) is exposed as an MCP tool at `POST /mcp`. Point any
+MCP client (Claude Desktop, Cursor, …) at `http://<gateway>/mcp`:
+
+```bash
+# initialize
+curl -s localhost:8000/mcp -d '{"jsonrpc":"2.0","id":1,"method":"initialize",
+  "params":{"protocolVersion":"2025-06-18"}}'
+# list tools
+curl -s localhost:8000/mcp -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+# call a tool
+curl -s localhost:8000/mcp -d '{"jsonrpc":"2.0","id":3,"method":"tools/call",
+  "params":{"name":"weather","arguments":{"city":"Berlin"}}}'
+```
+
+Implemented methods: `initialize`, `tools/list`, `tools/call`, `ping`, and the
+`notifications/initialized` notification. Disable the endpoint with
+`MCP_SERVER_DISABLED=true`.
+
+**As an MCP client** — set `MCP_SERVERS` to consume tools from remote MCP
+servers (streamable-HTTP transport). Each server's tools are registered into
+the skill registry namespaced as `<name>_<tool>`, so the agent, the scheduler,
+the skill playground, and the gateway's own MCP server can all use them:
+
+```bash
+MCP_SERVERS='weather=https://example.com/mcp,docs=https://docs.host/mcp|Authorization: Bearer TOKEN'
+```
+
+A remote server that is unreachable at startup is logged and skipped — it never
+blocks the gateway from coming up.
+
+## Memory management API
+
+Beyond add/search, the vector store supports listing and deletion:
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/memory?limit=100&offset=0` | List stored memories newest-first (`limit=0` → all) |
+| `GET` | `/api/memory/{id}` | Fetch one memory by ID |
+| `DELETE` | `/api/memory/{id}` | Delete a memory by ID |
+
+From the CLI:
+
+```bash
+omega memory list --limit 50
+omega memory delete <memory-id>
+```
 
 ## Migrating from a previous installation (Python sidecar → pure Go)
 
@@ -370,6 +426,8 @@ rm data/vector_db.jsonl
 | `BOT_ADMIN_ID` | `0` | Telegram user ID of the admin |
 | `GATEWAY_URL` | `http://127.0.0.1:8000` | Telegram bot → gateway base URL |
 | `AUDIT_MAX_BLOB_BYTES` | `65536` | Max bytes stored per args/result blob in the audit log. Set to `0` to disable audit logging entirely |
+| `MCP_SERVER_DISABLED` | `false` | Disable the MCP server endpoint (`POST /mcp`) that exposes skills as MCP tools |
+| `MCP_SERVERS` | — | Remote MCP servers to consume, comma-separated `name=url` entries (append `\|Header: Value` for one auth header). Their tools are registered locally as `<name>_<tool>` |
 
 ## Frontend / gateway separation
 

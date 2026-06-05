@@ -68,6 +68,10 @@ type Config struct {
 
 	// Audit log
 	AuditMaxBlobBytes int // 0 = audit disabled
+
+	// MCP (Model Context Protocol)
+	MCPServerEnabled bool     // expose skills as MCP tools at /mcp
+	MCPServers       []string // remote MCP servers to consume: "name=url" entries
 }
 
 func Load() Config {
@@ -109,6 +113,8 @@ func Load() Config {
 		SchedulerTickSec:       atoiOr(os.Getenv("SCHEDULER_TICK_SEC"), 60),
 		TelegramBotToken:       os.Getenv("TELEGRAM_BOT_TOKEN"),
 		AuditMaxBlobBytes:      atoiOr(os.Getenv("AUDIT_MAX_BLOB_BYTES"), 65536),
+		MCPServerEnabled:       !isTruthy(os.Getenv("MCP_SERVER_DISABLED")),
+		MCPServers:             splitCSV(os.Getenv("MCP_SERVERS")),
 	}
 	c.AgentDB = getOr(os.Getenv("AGENT_DB"), dataDir+"/agent_memory.sqlite3")
 	c.VectorDir = getOr(os.Getenv("AGENT_VECTOR_DIR"), dataDir+"/chromem")
@@ -134,6 +140,21 @@ func Load() Config {
 		}
 	}
 	return c
+}
+
+// splitCSV splits a comma-separated env value into trimmed, non-empty entries.
+func splitCSV(v string) []string {
+	if strings.TrimSpace(v) == "" {
+		return nil
+	}
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 func isTruthy(v string) bool {

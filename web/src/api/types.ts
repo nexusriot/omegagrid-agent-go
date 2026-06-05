@@ -51,7 +51,7 @@ export interface MemoryHit {
   id: string
   text: string
   metadata: Record<string, unknown>
-  distance: number
+  distance?: number
 }
 
 export interface MemoryAddResult {

@@ -13,6 +13,7 @@ import (
 	"github.com/nexusriot/omegagrid-agent-go/internal/agent"
 	"github.com/nexusriot/omegagrid-agent-go/internal/config"
 	"github.com/nexusriot/omegagrid-agent-go/internal/llm"
+	"github.com/nexusriot/omegagrid-agent-go/internal/mcp"
 	"github.com/nexusriot/omegagrid-agent-go/internal/memory"
 	"github.com/nexusriot/omegagrid-agent-go/internal/scheduler"
 	"github.com/nexusriot/omegagrid-agent-go/internal/skills"
@@ -27,7 +28,14 @@ type Deps struct {
 	Skills    *skills.Client
 	Chat      llm.ChatClient
 	Scheduler *scheduler.Store
+
+	// ToolProvider backs the MCP server endpoint. When nil or disabled by
+	// config, the /mcp route is not mounted.
+	ToolProvider mcp.ToolProvider
 }
+
+// mcpServerVersion is reported in the MCP initialize serverInfo block.
+const mcpServerVersion = "1.0.0"
 
 func NewRouter(d Deps) http.Handler {
 	r := chi.NewRouter()
@@ -37,6 +45,11 @@ func NewRouter(d Deps) http.Handler {
 	r.Use(corsMiddleware) // permissive CORS, matches the FastAPI default
 
 	r.Get("/health", d.handleHealth)
+
+	if d.Cfg.MCPServerEnabled && d.ToolProvider != nil {
+		srv := mcp.NewServer(d.ToolProvider, "omegagrid-agent-go", mcpServerVersion)
+		r.Handle("/mcp", srv.Handler())
+	}
 
 	r.Route("/api", func(r chi.Router) {
 		r.Post("/query", d.handleQuery)
@@ -48,6 +61,9 @@ func NewRouter(d Deps) http.Handler {
 
 		r.Post("/memory/add", d.handleMemoryAdd)
 		r.Post("/memory/search", d.handleMemorySearch)
+		r.Get("/memory", d.handleMemoryList)
+		r.Get("/memory/{id}", d.handleMemoryGet)
+		r.Delete("/memory/{id}", d.handleMemoryDelete)
 
 		r.Get("/skills", d.handleListSkills)
 		r.Post("/skills/{name}/invoke", d.handleSkillInvoke)

@@ -66,16 +66,20 @@ omegagrid-agent-go/
 │   │   ├── chat.go              #   POST /api/query, /api/query/stream
 │   │   ├── health.go            #   GET /health
 │   │   ├── history.go           #   sessions CRUD
-│   │   ├── memory.go            #   POST /api/memory/{add,search}
+│   │   ├── memory.go            #   POST /api/memory/{add,search}; GET /api/memory[/{id}]; DELETE /api/memory/{id}
 │   │   ├── scheduler.go         #   scheduler task CRUD
 │   │   ├── skills.go            #   GET /api/skills, /api/tools, POST /api/skills/{name}/invoke
 │   │   └── audit.go             #   GET /api/invocations, /invocations/{id}, /invocations/{id}/replay
+│   ├── mcp/                     # Model Context Protocol (hand-rolled JSON-RPC 2.0, no SDK)
+│   │   ├── mcp.go               #   Shared envelope, Tool/Param types, ToolProvider interface
+│   │   ├── server.go            #   MCP server at POST /mcp — exposes skills as MCP tools
+│   │   └── client.go            #   MCP client — consumes remote servers, proxies tools/call
 │   ├── llm/
 │   │   ├── llm.go               #   ChatClient interface + Message type
 │   │   ├── ollama.go            #   Ollama /api/chat client
 │   │   └── openai.go            #   OpenAI chat_completions + responses client
 │   ├── memory/
-│   │   ├── client.go            #   Public API — CreateSession / AddMemory / SearchMemory / AddInvocation / …
+│   │   ├── client.go            #   Public API — CreateSession / AddMemory / SearchMemory / ListMemories / GetMemory / DeleteMemory / AddInvocation / …
 │   │   ├── history.go           #   SQLite sessions + messages (modernc.org/sqlite, no CGO)
 │   │   ├── audit.go             #   SQLite skill_invocations — AuditRecord / AuditFilter / record / list
 │   │   ├── vector.go            #   chromem-go vector store + SHA256 + cosine dedup pipeline
@@ -88,7 +92,7 @@ omegagrid-agent-go/
 │   │   └── store.go             #   SQLite task CRUD
 │   ├── search/skill.go          # Native web_search skill (DuckDuckGo HTML scrape)
 │   ├── skills/
-│   │   ├── client.go            #   Public API — List() / Execute(); wires registry
+│   │   ├── client.go            #   Public API — List() / Execute() / Register(); wires registry
 │   │   ├── registry.go          #   Thread-safe sync.RWMutex skill map
 │   │   ├── builtin/             #   Go implementations of all 21 built-in skills
 │   │   │   ├── helpers.go       #     Local types (Skill/Param/Executor) + arg helpers
@@ -166,6 +170,7 @@ All configuration is environment-driven, matching the original `.env` pattern.
 | Telegram | `TELEGRAM_BOT_TOKEN`, `BOT_AUTH_ENABLED`, `BOT_ADMIN_ID` | — |
 | Skills | `SKILLS_DIR`, `SKILL_HTTP_TIMEOUT`, `SKILL_SHELL_ENABLED`, `SKILL_SSH_ENABLED`, `SKILL_SSH_IDENTITY_FILE`, `SKILL_SSH_DEFAULT_USER`, `SKILL_SSH_PRIVATE_KEY` | `{DATA_DIR}/skills`, 30, false, false |
 | Audit log | `AUDIT_MAX_BLOB_BYTES` | `65536` (0 = disabled) |
+| MCP | `MCP_SERVER_DISABLED`, `MCP_SERVERS` | false (server enabled); — (no remote servers) |
 
 `LLM_PROVIDER` determines both the chat client and the embeddings backend.
 When set to `openai-codex` or when the model name contains `codex`, the
@@ -613,8 +618,8 @@ Built on [go-chi/chi v5](https://github.com/go-chi/chi).
 #### Middleware stack
 
 1. `middleware.Recoverer` — panic recovery
-2. `middleware.RealIP` — trust `X-Forwarded-For`
-3. `middleware.RequestID` — inject unique request ID
+2. `middleware.RequestID` — inject unique request ID
+3. `middleware.RealIP` — trust `X-Forwarded-For`
 4. Custom CORS — `Access-Control-Allow-Origin: *`, all methods, common headers
 
 #### Route table
@@ -629,6 +634,10 @@ Built on [go-chi/chi v5](https://github.com/go-chi/chi).
 | `GET` | `/api/sessions/{sid}/messages` | `handleSessionMessages` | In-process history store |
 | `POST` | `/api/memory/add` | `handleMemoryAdd` | In-process vector store |
 | `POST` | `/api/memory/search` | `handleMemorySearch` | In-process vector store |
+| `GET` | `/api/memory` | `handleMemoryList` | List stored memories newest-first; `limit` (default 100, 0=all), `offset` |
+| `GET` | `/api/memory/{id}` | `handleMemoryGet` | Single memory by ID (404 if absent) |
+| `DELETE` | `/api/memory/{id}` | `handleMemoryDelete` | Delete a memory by ID (404 if absent) |
+| `POST` | `/mcp` | `mcp.Server.Handler` | MCP server (JSON-RPC 2.0) exposing skills as tools. Gated by `MCP_SERVER_DISABLED`. |
 | `GET` | `/api/skills` | `handleListSkills` | In-process skill registry |
 | `POST` | `/api/skills/{name}/invoke` | `handleSkillInvoke` | **Skill playground** — direct skill execution, no agent loop. Gated by `PLAYGROUND_DISABLED`. |
 | `GET` | `/api/tools` | `handleListTools` | Built-in tool schemas |
@@ -642,10 +651,10 @@ Built on [go-chi/chi v5](https://github.com/go-chi/chi).
 | `POST` | `/api/scheduler/tasks/{id}/disable` | `handleSchedulerDisable` | In-process scheduler store |
 | `DELETE` | `/api/scheduler/tasks/{id}` | `handleSchedulerDelete` | In-process scheduler store |
 
-The gateway router serves only `/health` and `/api/*`.  The gateway binary
-contains no static-file serving and no UI assets; all browser UI traffic is
-served by the separate nginx **frontend** service, which proxies `/api/*`
-and `/health` back to the gateway.
+The gateway router serves `/health`, `/api/*`, and (unless disabled) `/mcp`.
+The gateway binary contains no static-file serving and no UI assets; all
+browser UI traffic is served by the separate nginx **frontend** service, which
+proxies `/api/*` and `/health` back to the gateway.
 
 #### SSE streaming
 
@@ -1135,7 +1144,18 @@ POST /api/memory/add    {"text": "...", "meta": {}}
 
 POST /api/memory/search {"query": "...", "k": 5}
                       → {"ok": true, "hits": [{id, text, metadata, distance}]}
+
+GET  /api/memory?limit=100&offset=0
+                      → {"ok": true, "hits": [{id, text, metadata}], "total": 12, "limit": 100, "offset": 0}
+GET  /api/memory/{id} → {"ok": true, "hit": {id, text, metadata}}   (404 if absent)
+DELETE /api/memory/{id} → {"ok": true, "deleted": "id"}              (404 if absent)
 ```
+
+`GET /api/memory` enumerates the collection newest-first by `created_at`
+metadata. chromem-go exposes no list-all primitive, so the store embeds a
+constant probe and issues `QueryEmbedding(nResults = Count)` to retrieve every
+document, then sorts and paginates in memory. `DELETE` also evicts the in-memory
+SHA256 dedup entry so identical text can be re-added afterwards.
 
 #### Skills
 
@@ -1201,6 +1221,39 @@ POST /api/invocations/{id}/replay   → {"replayed_from":42,"skill":"weather","r
 GET /health → {"ok": true, "provider": "ollama", "chat_model": "llama3:latest",
                "skills_dir": "/app/data/skills", "scheduler_db": "..."}
 ```
+
+#### MCP (Model Context Protocol)
+
+The gateway is both an MCP **server** and an MCP **client**, implemented as a
+hand-rolled JSON-RPC 2.0 layer (`internal/mcp`) with no SDK dependency.
+
+Server — single endpoint, "streamable HTTP" style (one JSON request → one JSON
+response; notifications get `202 No Content`):
+
+```
+POST /mcp
+  initialize                  → {protocolVersion, capabilities:{tools:{listChanged:false}}, serverInfo}
+  tools/list                  → {tools:[{name, description, inputSchema}]}
+  tools/call {name,arguments} → {content:[{type:"text",text}], isError}
+  ping                        → {}
+  notifications/initialized   → (202, no body)
+```
+
+Every registered skill (built-in, dynamic markdown, native `schedule_task` /
+`web_search`, and any tools consumed from remote MCP servers) is advertised as
+an MCP tool; its parameter map is rendered as a JSON-Schema `inputSchema`. Skill
+execution errors are returned in-band as `isError:true` results (not JSON-RPC
+errors) so a calling model can read and react to them. The endpoint is gated by
+`MCP_SERVER_DISABLED`.
+
+Client — `MCP_SERVERS` is a comma-separated list of `name=url` entries (append
+`|Header: Value` for a single auth header). At startup the gateway dials each
+server (`initialize` + `tools/list`), then registers every remote tool into the
+local skill registry namespaced as `<name>_<tool>`. Responses are accepted as
+either `application/json` or a single-event `text/event-stream`. A server that
+is unreachable at startup is logged and skipped — it never blocks boot. Once
+registered, remote tools are reachable from the agent loop, the scheduler, the
+skill playground, and the gateway's own MCP server.
 
 ---
 

@@ -89,6 +89,13 @@ func (c *Client) Execute(name string, args map[string]any) (any, error) {
 	return c.reg.execute(name, args)
 }
 
+// Register adds (or replaces) a skill in the registry at runtime. Used to
+// register tools discovered from remote MCP servers so they become callable
+// like any built-in skill.
+func (c *Client) Register(name, description string, params map[string]Param, exec func(map[string]any) (any, error)) {
+	c.reg.register(Skill{Name: name, Description: description, Parameters: params}, exec)
+}
+
 // toSkill converts a builtin.Skill to the public skills.Skill type.
 func toSkill(b builtin.Skill) Skill {
 	params := make(map[string]Param, len(b.Parameters))

@@ -99,7 +99,7 @@ type MemoryHit struct {
 	ID       string         `json:"id"`
 	Text     string         `json:"text"`
 	Metadata map[string]any `json:"metadata"`
-	Distance float64        `json:"distance"`
+	Distance float64        `json:"distance,omitempty"`
 }
 
 type AddResult struct {
@@ -138,6 +138,22 @@ func (c *Client) AddMemory(text string, meta map[string]any) (*AddResult, error)
 
 func (c *Client) SearchMemory(query string, k int) (*SearchResult, error) {
 	return c.vec.searchText(query, k)
+}
+
+// ListMemories returns a newest-first page of stored memories and the total
+// count. limit<=0 returns all memories from the given offset.
+func (c *Client) ListMemories(limit, offset int) ([]MemoryHit, int, error) {
+	return c.vec.listAll(limit, offset)
+}
+
+// GetMemory returns one stored memory by ID, or nil when it does not exist.
+func (c *Client) GetMemory(id string) (*MemoryHit, error) {
+	return c.vec.getByID(id)
+}
+
+// DeleteMemory removes a memory by ID. The bool reports whether it existed.
+func (c *Client) DeleteMemory(id string) (bool, error) {
+	return c.vec.deleteByID(id)
 }
 
 func truncate(s string, n int) string {

@@ -61,6 +61,11 @@ func (s *ScheduleTaskSkill) create(args map[string]any) any {
 	if cron == "" {
 		return map[string]any{"error": "cron_expr is required (e.g. '*/5 * * * *')"}
 	}
+	// Validate up front: Matches() returns false for malformed expressions, so
+	// an unvalidated bad cron_expr would create a task that silently never fires.
+	if err := ValidateCron(cron); err != nil {
+		return map[string]any{"error": "invalid cron_expr: " + err.Error()}
+	}
 	skill := asString(args["skill"])
 	if skill == "" {
 		return map[string]any{"error": "skill is required (e.g. 'ping_check', 'weather')"}

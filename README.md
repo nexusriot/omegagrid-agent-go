@@ -251,7 +251,7 @@ Everything is compiled into the gateway binary (pure Go, no CGO, distroless runt
 | `http_request` | Arbitrary HTTP GET / POST |
 | `web_scrape` | Fetch URL and extract readable text |
 | `http_health` | HTTP endpoint health check with timing |
-| `ip_info` | Geolocation for an IP via ip-api.com |
+| `ip_info` | Geolocation for an IP via ip-api.com (free tier — plain HTTP by design) |
 | `dns_lookup` | A / AAAA / MX / TXT / CNAME / NS lookup (`dig` + stdlib fallback) |
 | `ping_check` | TCP connect reachability check |
 | `port_scan` | Concurrent TCP port scanner (up to 1024 ports) |
@@ -268,9 +268,21 @@ Everything is compiled into the gateway binary (pure Go, no CGO, distroless runt
 | `qr_generate` | QR code as base64 PNG |
 | `skill_creator` | Hot-register new skills from YAML + Markdown at runtime |
 
+**Native agent skills (registered directly into the agent's tool table):**
+
+| Skill | Description |
+|---|---|
+| `schedule_task` | Create / list / delete / enable / disable cron tasks against the Go scheduler. `cron_expr` is validated at creation time — a malformed expression is rejected instead of creating a task that never fires |
+| `web_search` | DuckDuckGo HTML search (no API key); returns title / URL / snippet |
+
+Plus the two memory tools every run gets: `vector_add` and `vector_search`.
+
 **Markdown / pipeline skills:**
 Dynamic skills defined as `*.md` files in `SKILLS_DIR` (default `DATA_DIR/skills`).
 `skill_creator` writes new `.md` files and hot-registers them without a restart.
+The free-text instructions block of a markdown skill (everything after the YAML
+frontmatter) is surfaced in the agent's system prompt (first 5 lines) and drives
+prompt-only skill execution.
 
 ## MCP (Model Context Protocol)
 
@@ -394,7 +406,7 @@ rm data/vector_db.jsonl
 | `OPENAI_CHAT_MODEL` | `gpt-4o-mini` | OpenAI chat model |
 | `OPENAI_EMBED_MODEL` | `text-embedding-3-small` | OpenAI embeddings model (for vector memory) |
 | `OPENAI_API_MODE` | auto | `chat_completions` \| `responses` (auto-selected for codex models) |
-| `OPENAI_REASONING_EFFORT` | `medium` | Reasoning effort for the `responses` API |
+| `OPENAI_REASONING_EFFORT` | — | Reasoning effort for the `responses` API (omitted from requests when unset) |
 | `OPENAI_TIMEOUT` | `120` | OpenAI request timeout (seconds) |
 | `DIGITALOCEAN_API_KEY` | — | Required for `digitalocean` provider (model access key or DO personal access token) |
 | `DIGITALOCEAN_BASE_URL` | `https://inference.do-ai.run/v1` | DigitalOcean Serverless Inference base URL |
@@ -405,7 +417,7 @@ rm data/vector_db.jsonl
 | `AGENT_VECTOR_DIR` | `{DATA_DIR}/chromem` | chromem-go vector database directory |
 | `AGENT_VECTOR_COLLECTION` | `memories` | Collection name inside the vector database |
 | `AGENT_DEDUP_DISTANCE` | `0.08` | Cosine distance threshold for semantic deduplication |
-| `AGENT_CONTEXT_TAIL` | `30` | Messages loaded from history per run |
+| `AGENT_CONTEXT_TAIL` | `30` | Most recent messages loaded from session history per run |
 | `AGENT_MEMORY_HITS` | `5` | Vector memory results injected into context |
 | `AGENT_MAX_STEPS` | `25` | Maximum tool-call steps per agent run |
 | `AGENT_PARALLEL_TOOLS` | `false` | Allow the LLM to emit `tool_calls` batches that execute concurrently |

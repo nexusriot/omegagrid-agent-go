@@ -915,14 +915,14 @@ No local Python installation is required — both steps run inside Docker.
 
 ```
  ┌──────────────────────────────────────────────┐
- │  migrate-export (Python 3.11 + chromadb 0.5.5) │
- │  Reads data/vector_db/ → data/vector_db.jsonl  │
+ │  migrate-export (Python 3 + chromadb 0.5.5)  │
+ │  Reads data/vector_db/ → data/vector_db.jsonl│
  └──────────────────────────────────────────────┘
                          │ JSONL (one record per line)
                          ▼
  ┌──────────────────────────────────────────────┐
- │  migrate-import (static Go binary)            │
- │  Reads data/vector_db.jsonl → data/chromem/   │
+ │  migrate-import (static Go binary)           │
+ │  Reads data/vector_db.jsonl → data/chromem/  │
  └──────────────────────────────────────────────┘
 ```
 
@@ -1109,7 +1109,7 @@ POST /api/query
 {
   "query": "What's the weather in London?",
   "session_id": 0,          // 0 = create new session
-  "remember": true,
+  "remember": true,         // accepted for API compatibility; currently a no-op
   "max_steps": 10,
   "telegram_chat_id": null
 }

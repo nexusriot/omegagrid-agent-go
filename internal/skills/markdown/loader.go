@@ -338,8 +338,12 @@ func Load(path string) (*Skill, error) {
 	if timeout <= 0 {
 		timeout = 30
 	}
+	schema := fmToSkillSchema(fm)
+	// Surface the instructions block in the schema so the agent's system
+	// prompt can preview it (formatSkillLine shows the first lines of Body).
+	schema.Body = body
 	return &Skill{
-		Schema:   fmToSkillSchema(fm),
+		Schema:   schema,
 		body:     body,
 		endpoint: fm.Endpoint,
 		method:   method,

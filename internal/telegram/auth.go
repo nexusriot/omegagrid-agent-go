@@ -51,10 +51,11 @@ func AuthFromEnv() (*AuthStore, error) {
 	if dir := filepath.Dir(dbPath); dir != "" {
 		_ = os.MkdirAll(dir, 0o755)
 	}
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := sql.Open("sqlite", dbPath+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
 	if err != nil {
 		return nil, err
 	}
+	db.SetMaxOpenConns(1)
 	if _, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS users (
 			telegram_id   INTEGER PRIMARY KEY,

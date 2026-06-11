@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/nexusriot/omegagrid-agent-go/internal/llm"
 	"github.com/nexusriot/omegagrid-agent-go/internal/memory"
@@ -484,6 +485,15 @@ func (s *Service) startSession(req RunRequest) (*runState, error) {
 		debug:   []string{},
 	}
 
+	// Tail of prior conversation — loaded BEFORE the current query is stored,
+	// otherwise the tail would contain the query and it would be sent to the
+	// LLM twice (once in the tail, once as the final user message).
+	tail, err := s.Memory.LoadTail(sid, s.ContextTail)
+	if err != nil {
+		st.debug = append(st.debug, "[history] ERROR: load tail failed: "+err.Error())
+	}
+	timer.Mark("sqlite_load_tail_s")
+
 	if err := s.Memory.AddMessage(sid, "user", req.Query); err != nil {
 		return nil, fmt.Errorf("store user msg: %w", err)
 	}
@@ -498,13 +508,6 @@ func (s *Service) startSession(req RunRequest) (*runState, error) {
 	} else {
 		st.debug = append(st.debug, "[memory] ERROR: vector search failed: "+err.Error())
 	}
-
-	// Tail of prior conversation
-	tail, err := s.Memory.LoadTail(sid, s.ContextTail)
-	if err != nil {
-		st.debug = append(st.debug, "[history] ERROR: load tail failed: "+err.Error())
-	}
-	timer.Mark("sqlite_load_tail_s")
 
 	// Build the tool table from sidecar skills + native skills + vector_*.
 	skillList, err := s.Skills.List()
@@ -799,11 +802,18 @@ func bestAnswer(data map[string]any) string {
 	return "I had trouble processing that request. Please try rephrasing."
 }
 
+// truncate cuts s to at most n bytes without splitting a multi-byte rune.
+// Truncated results travel to consumers that reject invalid UTF-8 (Telegram,
+// JSON encoders), so a plain byte slice is not safe here.
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	return s[:n]
+	t := s[:n]
+	for len(t) > 0 && !utf8.ValidString(t) {
+		t = t[:len(t)-1]
+	}
+	return t
 }
 
 func truncateJSON(v any, n int) string {

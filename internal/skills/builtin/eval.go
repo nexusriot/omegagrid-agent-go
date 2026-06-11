@@ -9,8 +9,6 @@ import (
 	"unicode"
 )
 
-// ── DateTime ─────────────────────────────────────────────────────────────────
-
 func DateTimeSchema() Skill {
 	return Skill{Name: "datetime_skill", Description: "Return the current UTC date and time.",
 		Parameters: map[string]Param{}}
@@ -28,8 +26,6 @@ func DateTime() Executor {
 		}, nil
 	}
 }
-
-// ── Math Eval (safe recursive-descent parser) ─────────────────────────────
 
 func MathEvalSchema() Skill {
 	return Skill{Name: "math_eval",
@@ -347,8 +343,6 @@ func (p *parser) parseCall(name string) (float64, error) {
 	return fn(args)
 }
 
-// ── Cron Schedule ─────────────────────────────────────────────────────────
-
 func CronScheduleSchema() Skill {
 	return Skill{Name: "cron_schedule", Description: "Parse a cron expression, explain it, and calculate next run times.",
 		Parameters: map[string]Param{
@@ -423,7 +417,9 @@ func parseCronField(field string, lo, hi, idx int) (map[int]bool, error) {
 			lr := strings.SplitN(part, "/", 2)
 			part = lr[0]
 			s, err := strconv.Atoi(lr[1])
-			if err != nil {
+			if err != nil || s <= 0 {
+				// step<=0 must be rejected: the expansion loops below advance
+				// by step and would never terminate with step=0.
 				return nil, fmt.Errorf("invalid step in %q", field)
 			}
 			step = s

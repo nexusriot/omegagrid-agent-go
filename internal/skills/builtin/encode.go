@@ -1,7 +1,7 @@
 package builtin
 
 import (
-	"crypto/md5"  //nolint:gosec
+	"crypto/md5" //nolint:gosec
 	"crypto/rand"
 	"crypto/sha1" //nolint:gosec
 	"crypto/sha256"
@@ -15,8 +15,6 @@ import (
 
 	"github.com/google/uuid"
 )
-
-// ── Base64 ───────────────────────────────────────────────────────────────────
 
 func Base64Schema() Skill {
 	return Skill{Name: "base64_skill", Description: "Encode or decode a string using Base64.",
@@ -44,8 +42,6 @@ func Base64() Executor {
 		}
 	}
 }
-
-// ── Hash ─────────────────────────────────────────────────────────────────────
 
 func HashSchema() Skill {
 	return Skill{Name: "hash_skill", Description: "Hash a string using MD5, SHA1, SHA256, or SHA512.",
@@ -83,8 +79,6 @@ func Hash() Executor {
 	}
 }
 
-// ── UUID Gen ─────────────────────────────────────────────────────────────────
-
 func UuidGenSchema() Skill {
 	return Skill{Name: "uuid_gen", Description: "Generate UUIDs (v1/v3/v4/v5).",
 		Parameters: map[string]Param{
@@ -118,6 +112,9 @@ func UuidGen() Executor {
 			ns = uuid.NameSpaceDNS
 		}
 		name := str(args, "name")
+		if (version == 3 || version == 5) && name == "" {
+			return map[string]any{"error": "name is required for UUID v3/v5"}, nil
+		}
 
 		var uuids []string
 		for i := 0; i < count; i++ {
@@ -137,8 +134,6 @@ func UuidGen() Executor {
 		return map[string]any{"version": version, "count": count, "uuids": uuids}, nil
 	}
 }
-
-// ── Password Gen ─────────────────────────────────────────────────────────────
 
 func PasswordGenSchema() Skill {
 	return Skill{Name: "password_gen", Description: "Generate cryptographically secure passwords.",
@@ -223,8 +218,6 @@ func PasswordGen() Executor {
 	}
 }
 
-// ── CIDR Calc ────────────────────────────────────────────────────────────────
-
 func CidrCalcSchema() Skill {
 	return Skill{Name: "cidr_calc", Description: "Calculate CIDR network details.",
 		Parameters: map[string]Param{
@@ -246,42 +239,59 @@ func CidrCalc() Executor {
 		prefix = prefix.Masked()
 		addr := prefix.Addr()
 		bits := prefix.Bits()
-		total := uint64(1) << (addr.BitLen() - bits)
+		hostBits := addr.BitLen() - bits
+
+		// total as uint64 overflows for IPv6 prefixes shorter than /64
+		// (shift >= 64 wraps to 0); report those as a power-of-two string.
+		var total any
+		var total64 uint64
+		if hostBits < 64 {
+			total64 = uint64(1) << hostBits
+			total = total64
+		} else {
+			total = fmt.Sprintf("2^%d", hostBits)
+		}
 
 		var firstHost, lastHost, broadcast string
+		var usable any
 		if addr.Is4() {
-			net4 := prefix.Masked()
-			first := net4.Addr().As4()
-			first[3]++
-			last := firstAddrPlus(net4.Addr().As4(), total-2)
-			bc := firstAddrPlus(net4.Addr().As4(), total-1)
-			firstHost = netip.AddrFrom4(first).String()
-			lastHost = netip.AddrFrom4(last).String()
+			base := prefix.Addr().As4()
+			bc := firstAddrPlus(base, total64-1)
 			broadcast = netip.AddrFrom4(bc).String()
+			if total64 >= 4 {
+				// Normal subnet: network + broadcast are reserved.
+				first := firstAddrPlus(base, 1)
+				last := firstAddrPlus(base, total64-2)
+				firstHost = netip.AddrFrom4(first).String()
+				lastHost = netip.AddrFrom4(last).String()
+				usable = int64(total64) - 2
+			} else {
+				// /31 (point-to-point, RFC 3021) and /32 (single host): every
+				// address is usable; the old total-2 arithmetic underflowed here.
+				firstHost = netip.AddrFrom4(base).String()
+				lastHost = broadcast
+				usable = int64(total64)
+			}
 		} else {
 			firstHost = "N/A (IPv6)"
 			lastHost = "N/A (IPv6)"
-		}
-
-		usable := int64(total) - 2
-		if usable < 0 {
-			usable = 0
+			usable = total // IPv6 has no network/broadcast reservation
 		}
 
 		out := map[string]any{
-			"cidr":             cidr,
-			"version":          map[bool]string{true: "IPv4", false: "IPv6"}[addr.Is4()],
-			"network_address":  prefix.Addr().String(),
-			"prefix_length":    bits,
-			"total_addresses":  total,
-			"usable_hosts":     usable,
-			"first_host":       firstHost,
-			"last_host":        lastHost,
-			"is_private":       addr.IsPrivate(),
-			"is_global":        addr.IsGlobalUnicast(),
-			"is_multicast":     addr.IsMulticast(),
-			"is_loopback":      addr.IsLoopback(),
-			"is_link_local":    addr.IsLinkLocalUnicast(),
+			"cidr":            cidr,
+			"version":         map[bool]string{true: "IPv4", false: "IPv6"}[addr.Is4()],
+			"network_address": prefix.Addr().String(),
+			"prefix_length":   bits,
+			"total_addresses": total,
+			"usable_hosts":    usable,
+			"first_host":      firstHost,
+			"last_host":       lastHost,
+			"is_private":      addr.IsPrivate(),
+			"is_global":       addr.IsGlobalUnicast(),
+			"is_multicast":    addr.IsMulticast(),
+			"is_loopback":     addr.IsLoopback(),
+			"is_link_local":   addr.IsLinkLocalUnicast(),
 		}
 		if addr.Is4() {
 			out["broadcast_address"] = broadcast

@@ -18,7 +18,31 @@ func httpClient(timeoutSec float64) *http.Client {
 	return &http.Client{Timeout: time.Duration(timeoutSec * float64(time.Second))}
 }
 
-// ── Weather ──────────────────────────────────────────────────────────────────
+// getWithRetry issues a GET via cl, retrying transient transport errors
+// (TLS handshake timeouts, connection resets) up to 3 attempts total with a
+// short backoff. Only network-level errors are retried — HTTP error statuses
+// are returned to the caller as-is. GET is idempotent, so this is safe.
+func getWithRetry(cl *http.Client, url string, header http.Header) (*http.Response, error) {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * time.Second) // 1s, 2s
+		}
+		req, err := http.NewRequest(http.MethodGet, url, nil)
+		if err != nil {
+			return nil, err
+		}
+		for k, v := range header {
+			req.Header[k] = v
+		}
+		resp, err := cl.Do(req)
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
 
 func WeatherSchema() Skill {
 	return Skill{Name: "weather", Description: "Get the current weather for a city using the Open-Meteo API (no API key required).",
@@ -36,7 +60,7 @@ func Weather(timeoutSec float64) Executor {
 		}
 		// geocode
 		geoURL := fmt.Sprintf("https://geocoding-api.open-meteo.com/v1/search?name=%s&count=1&language=en&format=json", url.QueryEscape(city))
-		geoResp, err := cl.Get(geoURL)
+		geoResp, err := getWithRetry(cl, geoURL, nil)
 		if err != nil {
 			return map[string]any{"error": err.Error()}, nil
 		}
@@ -59,19 +83,19 @@ func Weather(timeoutSec float64) Executor {
 				"&timezone=UTC&forecast_days=1",
 			r.Latitude, r.Longitude,
 		)
-		wResp, err := cl.Get(wURL)
+		wResp, err := getWithRetry(cl, wURL, nil)
 		if err != nil {
 			return map[string]any{"error": err.Error()}, nil
 		}
 		defer wResp.Body.Close()
 		var w struct {
 			Current struct {
-				Time             string  `json:"time"`
-				Temperature      float64 `json:"temperature_2m"`
-				Humidity         float64 `json:"relative_humidity_2m"`
-				Windspeed        float64 `json:"windspeed_10m"`
-				WindDirection    float64 `json:"winddirection_10m"`
-				Weathercode      int     `json:"weathercode"`
+				Time          string  `json:"time"`
+				Temperature   float64 `json:"temperature_2m"`
+				Humidity      float64 `json:"relative_humidity_2m"`
+				Windspeed     float64 `json:"windspeed_10m"`
+				WindDirection float64 `json:"winddirection_10m"`
+				Weathercode   int     `json:"weathercode"`
 			} `json:"current"`
 		}
 		if err := json.NewDecoder(wResp.Body).Decode(&w); err != nil {
@@ -80,17 +104,15 @@ func Weather(timeoutSec float64) Executor {
 		return map[string]any{
 			"city": r.Name, "country": r.Country,
 			"latitude": r.Latitude, "longitude": r.Longitude,
-			"temperature_c":       w.Current.Temperature,
-			"humidity_percent":     w.Current.Humidity,
-			"windspeed_kmh":        w.Current.Windspeed,
-			"wind_direction_deg":   w.Current.WindDirection,
-			"weather_code":         w.Current.Weathercode,
-			"time":                 w.Current.Time,
+			"temperature_c":      w.Current.Temperature,
+			"humidity_percent":   w.Current.Humidity,
+			"windspeed_kmh":      w.Current.Windspeed,
+			"wind_direction_deg": w.Current.WindDirection,
+			"weather_code":       w.Current.Weathercode,
+			"time":               w.Current.Time,
 		}, nil
 	}
 }
-
-// ── HTTP Request ─────────────────────────────────────────────────────────────
 
 func HttpRequestSchema() Skill {
 	return Skill{Name: "http_request", Description: "Make an HTTP GET or POST request to any URL.",
@@ -146,8 +168,6 @@ func HttpRequest(timeoutSec float64) Executor {
 	}
 }
 
-// ── Web Scrape ───────────────────────────────────────────────────────────────
-
 func WebScrapeSchema() Skill {
 	return Skill{Name: "web_scrape", Description: "Fetch a URL and return its text content.",
 		Parameters: map[string]Param{
@@ -165,9 +185,7 @@ func WebScrape(timeoutSec float64) Executor {
 		}
 		maxChars := intOr(args, "max_chars", 4000)
 
-		req, _ := http.NewRequest(http.MethodGet, rawURL, nil)
-		req.Header.Set("User-Agent", "OmegaGridAgent/1.0")
-		resp, err := cl.Do(req)
+		resp, err := getWithRetry(cl, rawURL, http.Header{"User-Agent": {"OmegaGridAgent/1.0"}})
 		if err != nil {
 			return map[string]any{"error": err.Error()}, nil
 		}
@@ -229,8 +247,6 @@ func extractText(htmlStr string) string {
 	return sb.String()
 }
 
-// ── HTTP Health ──────────────────────────────────────────────────────────────
-
 func HttpHealthSchema() Skill {
 	return Skill{Name: "http_health", Description: "Check if an HTTP endpoint is healthy.",
 		Parameters: map[string]Param{
@@ -280,8 +296,6 @@ func HttpHealth() Executor {
 	}
 }
 
-// ── IP Info ──────────────────────────────────────────────────────────────────
-
 func IpInfoSchema() Skill {
 	return Skill{Name: "ip_info", Description: "Get geolocation and ISP info for an IP address (uses ip-api.com).",
 		Parameters: map[string]Param{
@@ -293,9 +307,11 @@ func IpInfo(timeoutSec float64) Executor {
 	cl := httpClient(timeoutSec)
 	return func(args map[string]any) (any, error) {
 		ip := str(args, "ip")
-		target := "https://ip-api.com/json/" + url.QueryEscape(ip)
+		// ip-api.com's free endpoint is HTTP-only; HTTPS requires a paid key
+		// and the request fails outright.
+		target := "http://ip-api.com/json/" + url.QueryEscape(ip)
 		target += "?fields=status,message,country,countryCode,region,regionName,city,zip,lat,lon,timezone,isp,org,as,reverse,mobile,proxy,hosting,query"
-		resp, err := cl.Get(target)
+		resp, err := getWithRetry(cl, target, nil)
 		if err != nil {
 			return map[string]any{"error": err.Error()}, nil
 		}

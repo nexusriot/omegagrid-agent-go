@@ -37,10 +37,14 @@ func NewStore(path string) (*Store, error) {
 	if dir := filepath.Dir(path); dir != "" {
 		_ = os.MkdirAll(dir, 0o755)
 	}
-	db, err := sql.Open("sqlite", path)
+	// busy_timeout matters here: the runner goroutine and HTTP handlers write
+	// concurrently, and without it a held write lock surfaces as
+	// "database is locked" instead of waiting.
+	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
 	if err != nil {
 		return nil, err
 	}
+	db.SetMaxOpenConns(1)
 	if _, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS scheduled_tasks (
 			id                      INTEGER PRIMARY KEY AUTOINCREMENT,

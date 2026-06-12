@@ -14,7 +14,9 @@ type historyStore struct {
 }
 
 func newHistoryStore(path string) (*historyStore, error) {
-	db, err := sql.Open("sqlite", path+"?_journal_mode=WAL&_busy_timeout=5000")
+	// modernc.org/sqlite expects pragmas as _pragma=name(value); the
+	// mattn-style _journal_mode/_busy_timeout keys are silently ignored.
+	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
 	if err != nil {
 		return nil, err
 	}
@@ -114,9 +116,14 @@ func (h *historyStore) listMessages(sessionID, limit, offset int) ([]StoredMessa
 }
 
 func (h *historyStore) loadTail(sessionID, limit int) ([]Message, error) {
+	// Select the LAST n messages (the conversation tail), then re-order them
+	// chronologically. A plain ORDER BY ts ASC LIMIT n would return the first
+	// n messages and silently drop everything recent in long sessions.
 	rows, err := h.db.Query(`
-		SELECT role, content_json FROM messages
-		WHERE session_id=? ORDER BY ts ASC LIMIT ?`, sessionID, limit)
+		SELECT role, content_json FROM (
+			SELECT id, role, content_json, ts FROM messages
+			WHERE session_id=? ORDER BY ts DESC, id DESC LIMIT ?
+		) ORDER BY ts ASC, id ASC`, sessionID, limit)
 	if err != nil {
 		return nil, err
 	}

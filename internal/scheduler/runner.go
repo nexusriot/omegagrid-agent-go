@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // SkillExecutor runs a registered skill by name.  Wired up by the gateway to
@@ -118,19 +119,27 @@ func (r *Runner) runTask(t *Task) {
 	}
 
 	if t.NotifyTelegramChatID != nil && r.botToken != "" {
-		preview := resultStr
-		if len(preview) > 3900 {
-			preview = preview[:3900]
-		}
+		preview := truncateUTF8(resultStr, 3900)
 		msg := fmt.Sprintf("⏰ Scheduled: %s\n\n%s", t.Name, preview)
 		sendTelegram(r.botToken, *t.NotifyTelegramChatID, msg)
 	}
 }
 
-func sendTelegram(token string, chatID int64, text string) {
-	if len(text) > 4096 {
-		text = text[:4096]
+// truncateUTF8 cuts s to at most n bytes without splitting a multi-byte rune;
+// Telegram rejects messages containing invalid UTF-8.
+func truncateUTF8(s string, n int) string {
+	if len(s) <= n {
+		return s
 	}
+	t := s[:n]
+	for len(t) > 0 && !utf8.ValidString(t) {
+		t = t[:len(t)-1]
+	}
+	return t
+}
+
+func sendTelegram(token string, chatID int64, text string) {
+	text = truncateUTF8(text, 4096)
 	body, err := json.Marshal(map[string]any{"chat_id": chatID, "text": text})
 	if err != nil {
 		log.Printf("telegram marshal error: %v", err)

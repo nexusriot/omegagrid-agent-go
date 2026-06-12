@@ -10,8 +10,11 @@ func (d *Deps) handleHealth(w http.ResponseWriter, _ *http.Request) {
 		embedErrStr = embedErr.Error()
 	}
 	embedModel := d.Cfg.OllamaEmbedModel
-	if d.Cfg.Provider == "openai" || d.Cfg.Provider == "openai-codex" || d.Cfg.Provider == "codex" {
+	switch d.Cfg.Provider {
+	case "openai", "openai-codex", "codex":
 		embedModel = d.Cfg.OpenAIEmbedModel
+	case "digitalocean", "do":
+		embedModel = d.Cfg.DigitalOceanEmbedModel
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":           embedOK, // false when vector memory is broken

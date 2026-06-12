@@ -139,6 +139,26 @@ Some shells (notably bash) treat `UID` as read-only and won't export it into
 `docker compose`'s environment — writing it into `.env` as shown above is the
 reliable way.
 
+### VPN on the host (WireGuard/OpenVPN): skills fail with "TLS handshake timeout"
+
+If the host routes traffic through a VPN tunnel (e.g. WireGuard `wg0`, MTU
+1420), container egress can hit an MTU blackhole: containers advertise a
+1500-byte MSS, some servers send full-size TLS packets that don't fit in the
+tunnel and are silently dropped. Symptom: outbound HTTPS skills (`weather`,
+`web_scrape`, …) fail with `net/http: TLS handshake timeout` while the same
+URL works from the host — and only for *some* destinations (CDNs like
+Cloudflare clamp MSS server-side and keep working, which makes it confusing).
+
+Fix: set the compose network MTU to your tunnel MTU and recreate the network:
+
+```bash
+echo "DOCKER_NETWORK_MTU=1420" >> .env   # wg0 default; check `ip link show wg0`
+docker compose down && docker compose up -d
+```
+
+(Alternatively, add an MSS-clamping iptables rule on the host:
+`iptables -t mangle -A FORWARD -o wg0 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu`.)
+
 ## Running locally (no Docker)
 
 The gateway auto-creates `DATA_DIR` and its subdirectories (`chromem/`, `skills/`,
@@ -395,6 +415,7 @@ rm data/vector_db.jsonl
 |---|---|---|
 | `BACKEND_PORT` | `8000` | Gateway listen port |
 | `FRONTEND_PORT` | `80` | nginx listen port (Docker Compose only) |
+| `DOCKER_NETWORK_MTU` | `1500` | Compose network MTU (Docker Compose only). Set to your VPN tunnel MTU (e.g. `1420` for WireGuard) when the host routes through a VPN |
 | `DATA_DIR` | `/app/data` | Root directory for all persistent data |
 | `LLM_PROVIDER` | `ollama` | `ollama` \| `openai` \| `openai-codex` \| `digitalocean` |
 | `OLLAMA_URL` | `http://127.0.0.1:11434` | Ollama server URL |

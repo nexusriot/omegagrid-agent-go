@@ -8,6 +8,17 @@
 #   gateway     :8000                   Go API (internal; also exposed for direct access)
 #   telegram-bot (no port)              Telegram bot
 
+# DOCKER_NETWORK_MTU: set this below your VPN tunnel MTU when the host routes
+# traffic through WireGuard/OpenVPN (e.g. 1420 for WireGuard). Without it,
+# containers advertise a 1500-byte MSS, large response packets get silently
+# dropped inside the tunnel, and outbound HTTPS from skills fails with
+# "TLS handshake timeout" while the same request works from the host.
+networks:
+  default:
+    driver: bridge
+    driver_opts:
+      com.docker.network.driver.mtu: ${DOCKER_NETWORK_MTU:-1500}
+
 services:
 
   gateway:

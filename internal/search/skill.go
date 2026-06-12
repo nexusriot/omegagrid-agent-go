@@ -78,7 +78,18 @@ func (s *WebSearchSkill) search(query string, maxResults int) ([]SearchResult, e
 	req.Header.Set("Accept", "text/html,application/xhtml+xml")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 
-	resp, err := s.client.Do(req)
+	// Retry transient transport errors (TLS handshake timeouts, connection
+	// resets) — GET is idempotent and DDG occasionally drops connections.
+	var resp *http.Response
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * time.Second)
+		}
+		resp, err = s.client.Do(req)
+		if err == nil {
+			break
+		}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("search request failed: %w", err)
 	}

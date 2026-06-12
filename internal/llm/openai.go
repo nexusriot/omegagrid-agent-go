@@ -3,8 +3,10 @@ package llm
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -66,6 +68,42 @@ func (o *OpenAIChat) authHeaders(req *http.Request) {
 	req.Header.Set("Content-Type", "application/json")
 }
 
+// postWithRetry POSTs body to url, retrying transient failures up to 3
+// attempts total: HTTP 429 (rate limit / "platform overloaded"), 5xx, and
+// transport-level errors such as connection resets. Client timeouts are NOT
+// retried — each attempt already waited the full configured timeout, and
+// stacking more multi-minute waits would make the agent look frozen.
+func (o *OpenAIChat) postWithRetry(url string, body []byte) (*http.Response, error) {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(1<<(attempt-1)) * 2 * time.Second) // 2s, 4s
+		}
+		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("build request: %w", err)
+		}
+		o.authHeaders(req)
+		resp, err := o.client.Do(req)
+		if err != nil {
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() {
+				return nil, err
+			}
+			lastErr = err
+			continue
+		}
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 400))
+			resp.Body.Close()
+			lastErr = fmt.Errorf("openai status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+			continue
+		}
+		return resp, nil
+	}
+	return nil, fmt.Errorf("%w (after 3 attempts)", lastErr)
+}
+
 func (o *OpenAIChat) completeChatCompletions(messages []Message) (string, float64, error) {
 	t0 := time.Now()
 	payload := map[string]any{
@@ -78,12 +116,7 @@ func (o *OpenAIChat) completeChatCompletions(messages []Message) (string, float6
 	if err != nil {
 		return "", 0, fmt.Errorf("marshal request: %w", err)
 	}
-	req, err := http.NewRequest(http.MethodPost, o.baseURL+"/chat/completions", bytes.NewReader(body))
-	if err != nil {
-		return "", 0, fmt.Errorf("build request: %w", err)
-	}
-	o.authHeaders(req)
-	resp, err := o.client.Do(req)
+	resp, err := o.postWithRetry(o.baseURL+"/chat/completions", body)
 	if err != nil {
 		return "", time.Since(t0).Seconds(), fmt.Errorf("openai post: %w", err)
 	}
@@ -125,12 +158,7 @@ func (o *OpenAIChat) completeResponses(messages []Message) (string, float64, err
 	if err != nil {
 		return "", 0, fmt.Errorf("marshal request: %w", err)
 	}
-	req, err := http.NewRequest(http.MethodPost, o.baseURL+"/responses", bytes.NewReader(body))
-	if err != nil {
-		return "", 0, fmt.Errorf("build request: %w", err)
-	}
-	o.authHeaders(req)
-	resp, err := o.client.Do(req)
+	resp, err := o.postWithRetry(o.baseURL+"/responses", body)
 	if err != nil {
 		return "", time.Since(t0).Seconds(), fmt.Errorf("openai responses post: %w", err)
 	}

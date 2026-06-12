@@ -291,6 +291,10 @@ func (b *Bot) processAgentText(chatID int64, text string, askMode bool) {
 		if streamErr != nil {
 			log.Printf("stream failed, falling back: %v", streamErr)
 		}
+		// The sync fallback re-runs the whole agent and can take minutes;
+		// without this edit the message keeps showing a stale "Thinking
+		// (step N)..." and looks frozen.
+		b.editStatus(chatID, sent.MessageID, "⚠️ Stream interrupted — retrying...")
 		resp, err := b.agent.Query(text, chatID, b.getSession(chatID))
 		if err != nil {
 			b.editStatus(chatID, sent.MessageID, "Error: "+err.Error())

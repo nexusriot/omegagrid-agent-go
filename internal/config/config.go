@@ -58,6 +58,11 @@ type Config struct {
 	AgentParallelTools bool
 	AgentMaxParallel   int
 
+	// Auto-memory extraction (post-turn fact distillation into vector memory)
+	AutoMemoryExtract      bool
+	AutoMemoryMaxFacts     int
+	AutoMemoryMinAnswerLen int
+
 	// Skill playground
 	PlaygroundEnabled bool
 
@@ -109,6 +114,9 @@ func Load() Config {
 		AgentMaxSteps:          atoiOr(os.Getenv("AGENT_MAX_STEPS"), 25),
 		AgentParallelTools:     isTruthy(os.Getenv("AGENT_PARALLEL_TOOLS")),
 		AgentMaxParallel:       atoiOr(os.Getenv("AGENT_MAX_PARALLEL"), 4),
+		AutoMemoryExtract:      isTruthy(os.Getenv("AUTO_MEMORY_EXTRACT")),
+		AutoMemoryMaxFacts:     atoiOr(os.Getenv("AUTO_MEMORY_MAX_FACTS"), 5),
+		AutoMemoryMinAnswerLen: atoiOr(os.Getenv("AUTO_MEMORY_MIN_ANSWER_LEN"), 80),
 		PlaygroundEnabled:      !isTruthy(os.Getenv("PLAYGROUND_DISABLED")),
 		SchedulerTickSec:       atoiOr(os.Getenv("SCHEDULER_TICK_SEC"), 60),
 		TelegramBotToken:       os.Getenv("TELEGRAM_BOT_TOKEN"),

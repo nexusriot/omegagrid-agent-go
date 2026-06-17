@@ -205,12 +205,12 @@ func listSchedule() ([]*scheduler.Task, error) {
 	return getLocal().Sched.ListAll()
 }
 
-func createScheduleTask(name, cron, skill string, args map[string]any) error {
+func createScheduleTask(name, cron, skill string, args map[string]any, oneShot bool) error {
 	if isRemote() {
 		return httpJSON("POST", "/api/scheduler/tasks",
-			map[string]any{"name": name, "cron_expr": cron, "skill": skill, "args": args}, nil)
+			map[string]any{"name": name, "cron_expr": cron, "skill": skill, "args": args, "one_shot": oneShot}, nil)
 	}
-	_, err := getLocal().Sched.Create(name, cron, skill, args, nil)
+	_, err := getLocal().Sched.Create(name, cron, skill, args, nil, oneShot)
 	return err
 }
 

@@ -328,7 +328,18 @@ func (b *Bot) processAgentText(chatID int64, text string, askMode bool) {
 		}
 		out = fmt.Sprintf("%s\n\n_model: %s | steps: %v_", out, model, steps)
 	}
-	b.editStatus(chatID, sent.MessageID, out)
+	// Telegram rejects messages over telegramMaxLen with a 400, which
+	// editStatus silently swallows — leaving the user staring at a stale
+	// "Processing..." status. Split the answer so every part fits: the first
+	// chunk replaces the status message, the rest are sent as follow-ups.
+	chunks := splitForTelegram(out)
+	if len(chunks) == 0 {
+		chunks = []string{"(empty answer)"}
+	}
+	b.editStatus(chatID, sent.MessageID, chunks[0])
+	for _, c := range chunks[1:] {
+		b.send(chatID, c)
+	}
 }
 
 // renderStatus produces the multi-line "Thinking / Calling X / X done" status
@@ -352,7 +363,71 @@ func renderStatus(events []Event) string {
 	if len(lines) == 0 {
 		return "Processing..."
 	}
+	// On long multi-step runs the accumulated status can exceed Telegram's
+	// message limit, after which every edit fails. Keep only the most recent
+	// lines so the status stays well under the cap.
+	const maxStatusLines = 25
+	if len(lines) > maxStatusLines {
+		lines = append([]string{"…"}, lines[len(lines)-maxStatusLines:]...)
+	}
 	return strings.Join(lines, "\n")
+}
+
+// telegramMaxLen is Telegram's per-message hard limit. We chunk on a slightly
+// smaller bound to stay clear of the UTF-16 code-unit counting Telegram uses.
+const telegramMaxLen = 4000
+
+// splitForTelegram breaks text into pieces that each fit within telegramMaxLen,
+// preferring to split on line boundaries and never splitting a multi-byte rune.
+// A single line longer than the limit is hard-split by runes.
+func splitForTelegram(text string) []string {
+	if text == "" {
+		return nil
+	}
+	if len([]rune(text)) <= telegramMaxLen {
+		return []string{text}
+	}
+
+	var chunks []string
+	var cur strings.Builder
+	curLen := 0
+	flush := func() {
+		if curLen > 0 {
+			chunks = append(chunks, cur.String())
+			cur.Reset()
+			curLen = 0
+		}
+	}
+
+	for _, line := range strings.Split(text, "\n") {
+		lineLen := len([]rune(line))
+		// A line that is itself too long must be hard-split by runes.
+		if lineLen > telegramMaxLen {
+			flush()
+			runes := []rune(line)
+			for len(runes) > 0 {
+				n := telegramMaxLen
+				if n > len(runes) {
+					n = len(runes)
+				}
+				chunks = append(chunks, string(runes[:n]))
+				runes = runes[n:]
+			}
+			continue
+		}
+		// +1 accounts for the newline that rejoins this line to the previous.
+		if curLen > 0 && curLen+1+lineLen > telegramMaxLen {
+			flush()
+		}
+		if curLen > 0 {
+			cur.WriteByte('\n')
+			curLen++
+		}
+		cur.WriteString(line)
+		curLen += lineLen
+	}
+	flush()
+	return chunks
 }
 
 func (b *Bot) send(chatID int64, text string) {

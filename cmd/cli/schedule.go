@@ -64,11 +64,12 @@ func scheduleCreate(args []string) {
 	name := fs.String("name", "", "Task name (required)")
 	cron := fs.String("cron", "", "5-field cron expression (required)")
 	skill := fs.String("skill", "", "Skill to run (required)")
+	oneShot := fs.Bool("one-shot", false, "Run once then auto-disable")
 	var argPairs multiFlag
 	fs.Var(&argPairs, "arg", "Skill argument in key=value form (repeatable)")
 	jsonOut := fs.Bool("json", false, "JSON output")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: omega schedule create --name NAME --cron EXPR --skill SKILL [--arg k=v ...]")
+		fmt.Fprintln(os.Stderr, "Usage: omega schedule create --name NAME --cron EXPR --skill SKILL [--arg k=v ...] [--one-shot]")
 		fs.PrintDefaults()
 	}
 	fs.Parse(args)
@@ -82,7 +83,7 @@ func scheduleCreate(args []string) {
 		fatalf("schedule create: %v", err)
 	}
 
-	if err := createScheduleTask(*name, *cron, *skill, skillArgs); err != nil {
+	if err := createScheduleTask(*name, *cron, *skill, skillArgs, *oneShot); err != nil {
 		fatalf("schedule create: %v", err)
 	}
 	if *jsonOut {

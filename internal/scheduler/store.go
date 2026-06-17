@@ -22,6 +22,7 @@ type Task struct {
 	Skill                string         `json:"skill"`
 	Args                 map[string]any `json:"args"`
 	NotifyTelegramChatID *int64         `json:"notify_telegram_chat_id"`
+	OneShot              bool           `json:"one_shot"`
 	Enabled              bool           `json:"enabled"`
 	CreatedAt            float64        `json:"created_at"`
 	LastRunAt            *float64       `json:"last_run_at"`
@@ -53,6 +54,7 @@ func NewStore(path string) (*Store, error) {
 			skill                   TEXT NOT NULL,
 			args_json               TEXT NOT NULL DEFAULT '{}',
 			notify_telegram_chat_id INTEGER,
+			one_shot                INTEGER NOT NULL DEFAULT 0,
 			enabled                 INTEGER NOT NULL DEFAULT 1,
 			created_at              REAL NOT NULL,
 			last_run_at             REAL,
@@ -61,12 +63,16 @@ func NewStore(path string) (*Store, error) {
 		)`); err != nil {
 		return nil, err
 	}
+	// Migration for databases created before one_shot existed.  SQLite has no
+	// ADD COLUMN IF NOT EXISTS, so the duplicate-column error is expected and
+	// ignored on every start after the first.
+	_, _ = db.Exec(`ALTER TABLE scheduled_tasks ADD COLUMN one_shot INTEGER NOT NULL DEFAULT 0`)
 	return &Store{db: db}, nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
 
-func (s *Store) Create(name, cronExpr, skill string, args map[string]any, notifyChat *int64) (*Task, error) {
+func (s *Store) Create(name, cronExpr, skill string, args map[string]any, notifyChat *int64, oneShot bool) (*Task, error) {
 	if args == nil {
 		args = map[string]any{}
 	}
@@ -74,10 +80,14 @@ func (s *Store) Create(name, cronExpr, skill string, args map[string]any, notify
 	if err != nil {
 		return nil, fmt.Errorf("marshal args: %w", err)
 	}
+	oneShotI := 0
+	if oneShot {
+		oneShotI = 1
+	}
 	now := float64(time.Now().UnixNano()) / 1e9
 	res, err := s.db.Exec(
-		`INSERT INTO scheduled_tasks (name, cron_expr, skill, args_json, notify_telegram_chat_id, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
-		name, cronExpr, skill, string(argsJSON), notifyChat, now,
+		`INSERT INTO scheduled_tasks (name, cron_expr, skill, args_json, notify_telegram_chat_id, one_shot, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		name, cronExpr, skill, string(argsJSON), notifyChat, oneShotI, now,
 	)
 	if err != nil {
 		return nil, err
@@ -87,16 +97,16 @@ func (s *Store) Create(name, cronExpr, skill string, args map[string]any, notify
 }
 
 func (s *Store) Get(id int64) (*Task, error) {
-	row := s.db.QueryRow(`SELECT id, name, cron_expr, skill, args_json, notify_telegram_chat_id, enabled, created_at, last_run_at, last_result, run_count FROM scheduled_tasks WHERE id = ?`, id)
+	row := s.db.QueryRow(`SELECT id, name, cron_expr, skill, args_json, notify_telegram_chat_id, one_shot, enabled, created_at, last_run_at, last_result, run_count FROM scheduled_tasks WHERE id = ?`, id)
 	return scanTask(row)
 }
 
 func (s *Store) ListAll() ([]*Task, error) {
-	return s.list("SELECT id, name, cron_expr, skill, args_json, notify_telegram_chat_id, enabled, created_at, last_run_at, last_result, run_count FROM scheduled_tasks ORDER BY id")
+	return s.list("SELECT id, name, cron_expr, skill, args_json, notify_telegram_chat_id, one_shot, enabled, created_at, last_run_at, last_result, run_count FROM scheduled_tasks ORDER BY id")
 }
 
 func (s *Store) ListEnabled() ([]*Task, error) {
-	return s.list("SELECT id, name, cron_expr, skill, args_json, notify_telegram_chat_id, enabled, created_at, last_run_at, last_result, run_count FROM scheduled_tasks WHERE enabled = 1 ORDER BY id")
+	return s.list("SELECT id, name, cron_expr, skill, args_json, notify_telegram_chat_id, one_shot, enabled, created_at, last_run_at, last_result, run_count FROM scheduled_tasks WHERE enabled = 1 ORDER BY id")
 }
 
 func (s *Store) list(query string) ([]*Task, error) {
@@ -169,13 +179,15 @@ func scanTask(row scanRow) (*Task, error) {
 		t          Task
 		argsJSON   string
 		notifyChat sql.NullInt64
+		oneShotI   int
 		enabledI   int
 		lastRunAt  sql.NullFloat64
 		lastResult sql.NullString
 	)
-	if err := row.Scan(&t.ID, &t.Name, &t.CronExpr, &t.Skill, &argsJSON, &notifyChat, &enabledI, &t.CreatedAt, &lastRunAt, &lastResult, &t.RunCount); err != nil {
+	if err := row.Scan(&t.ID, &t.Name, &t.CronExpr, &t.Skill, &argsJSON, &notifyChat, &oneShotI, &enabledI, &t.CreatedAt, &lastRunAt, &lastResult, &t.RunCount); err != nil {
 		return nil, err
 	}
+	t.OneShot = oneShotI != 0
 	if err := json.Unmarshal([]byte(argsJSON), &t.Args); err != nil {
 		return nil, fmt.Errorf("decode args_json: %w", err)
 	}

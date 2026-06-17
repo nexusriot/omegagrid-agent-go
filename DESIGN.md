@@ -3,7 +3,7 @@
 ## 1. Overview
 
 OmegaGrid Agent Go is a pure Go rewrite of the omegagrid-agent platform.
-The gateway, agent loop, scheduler, Telegram bot, all 21 skills, vector memory,
+The gateway, agent loop, scheduler, Telegram bot, all 22 skills, vector memory,
 and conversation history are compiled into static Go binaries — no Python sidecar.
 A React web UI is served by a dedicated **frontend** nginx service.
 All source is self-contained in this repository, making
@@ -94,12 +94,13 @@ omegagrid-agent-go/
 │   ├── skills/
 │   │   ├── client.go            #   Public API — List() / Execute() / Register(); wires registry
 │   │   ├── registry.go          #   Thread-safe sync.RWMutex skill map
-│   │   ├── builtin/             #   Go implementations of all 21 built-in skills
+│   │   ├── builtin/             #   Go implementations of all 22 built-in skills
 │   │   │   ├── helpers.go       #     Local types (Skill/Param/Executor) + arg helpers
 │   │   │   ├── web.go           #     weather, http_request, web_scrape, http_health, ip_info
 │   │   │   ├── network.go       #     dns_lookup, ping_check, port_scan, whois_lookup
 │   │   │   ├── encode.go        #     base64, hash, uuid_gen, password_gen, cidr_calc
 │   │   │   ├── eval.go          #     datetime, math_eval (safe AST parser), cron_schedule
+│   │   │   ├── reminder.go      #     reminder (echo message for one-shot scheduled tasks)
 │   │   │   ├── exec.go          #     shell_command, ssh_command
 │   │   │   └── qr.go            #     qr_generate
 │   │   └── markdown/            #   Markdown skill loader + pipeline executor
@@ -162,6 +163,7 @@ All configuration is environment-driven, matching the original `.env` pattern.
 | Frontend | `FRONTEND_PORT` | 80 (Docker Compose only) |
 | LLM | `LLM_PROVIDER`, `OLLAMA_URL`, `OLLAMA_MODEL`, `OLLAMA_TIMEOUT`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_CHAT_MODEL`, `OPENAI_TIMEOUT`, `OPENAI_API_MODE`, `OPENAI_REASONING_EFFORT` | ollama, `http://127.0.0.1:11434`, `llama3:latest`, 120s |
 | Agent | `AGENT_DB`, `AGENT_CONTEXT_TAIL`, `AGENT_MEMORY_HITS`, `AGENT_MAX_STEPS`, `AGENT_PARALLEL_TOOLS`, `AGENT_MAX_PARALLEL` | `{DATA_DIR}/agent_memory.sqlite3`, 30, 5, 25, false, 4 |
+| Auto-memory | `AUTO_MEMORY_EXTRACT`, `AUTO_MEMORY_MAX_FACTS`, `AUTO_MEMORY_MIN_ANSWER_LEN` | false, 5, 80 |
 | Playground | `PLAYGROUND_DISABLED` | false (playground enabled) |
 | CLI | `OMEGA_REMOTE` | unset (local mode); set to gateway URL for remote mode |
 | Vector memory | `AGENT_VECTOR_DIR`, `AGENT_VECTOR_COLLECTION`, `AGENT_DEDUP_DISTANCE` | `{DATA_DIR}/chromem`, `memories`, 0.08 |
@@ -255,6 +257,8 @@ startSession()
   ├─ create or load session (via memory.Client)
   ├─ semantic search for relevant memories (vector store)
   ├─ load message tail (last N turns from history store)
+  ├─ inject context block: relevant memories + current UTC datetime
+  │     (+ Telegram chat_id when called from the bot)
   └─ assemble tool table (in-process skills + native skills)
 
 for step = 1..MaxSteps:
@@ -263,7 +267,9 @@ for step = 1..MaxSteps:
   ├─ normalizeToolCall() — fix LLM mistakes, e.g. tool name in type field
   │
   ├─ if type == "final":
-  │     persist answer, return RunResult
+  │     persist answer
+  │     maybeExtractMemories() — background fact distillation (opt-in)
+  │     return RunResult
   │
   ├─ if type == "tool_calls":
   │     executeBatch(state, calls) — runOne() per call (parallel up to MaxParallel)
@@ -304,6 +310,32 @@ The system prompt instructs the LLM to:
 2. Use `vector_add` / `vector_search` for persistent memory.
 3. Call tools instead of hallucinating answers.
 4. Use `skill_creator` to self-extend when no existing skill fits.
+
+A second context message carries the semantic-search memory hits, the current
+UTC datetime, and (from the Telegram bot) the caller's chat_id.  The current
+datetime lets the LLM convert relative/local times ("at 3pm", "in 20 minutes")
+into UTC cron expressions for `schedule_task` without a `datetime_skill`
+round-trip — the scheduler matches cron in UTC.
+
+#### Auto-memory extraction (`extract.go`)
+
+When `AUTO_MEMORY_EXTRACT=true`, both `Run` and `RunStream` call
+`maybeExtractMemories()` immediately after persisting a `final` answer.  It
+spawns a **detached goroutine** so the user-facing response returns with no
+added latency, then runs one extra `CompleteJSON` call asking the model to
+distil the (query, answer) turn into at most `AUTO_MEMORY_MAX_FACTS` durable,
+self-contained facts.  Each fact is stored via `Memory.AddMemory` tagged
+`source=auto-extract`; the vector store's existing SHA256 + cosine dedup makes
+the pass idempotent.
+
+Guards: the feature is off by default; turns whose answer is shorter than
+`AUTO_MEMORY_MIN_ANSWER_LEN` are skipped; only clean `final` answers trigger it
+(fallback answers, parse failures, and max-steps bailouts do not); and all
+errors are logged, never surfaced — extraction must not affect the answer the
+user already received.  The extraction prompt requests a `{"facts": [...]}`
+object (not a bare array) because the OpenAI client pins
+`response_format=json_object`, which rejects top-level arrays; parsing also
+accepts a bare array or one embedded in surrounding text.
 
 #### Streaming
 
@@ -446,7 +478,7 @@ in a single pass.  `openAIEmbeddings` uses Bearer authentication and parses
 
 ### 3.5 Skills (`internal/skills`)
 
-All 21 skills run in-process inside the gateway binary via a thread-safe
+All 22 skills run in-process inside the gateway binary via a thread-safe
 `Registry`.  The `skills.Client` wraps the registry with the public `List()`
 and `Execute()` API consumed by the agent loop and HTTP handlers.
 
@@ -465,9 +497,10 @@ hold `mu.RLock` to support concurrent reads during agent loops.
 
 #### Built-in skills (`builtin/`)
 
-21 skills compiled directly into the gateway binary.  Local `Skill`/`Param`
-types are defined in `builtin/helpers.go` to avoid import cycles; `client.go`
-converts them to the top-level `skills.Skill` type via `toSkill()`.
+22 skills compiled directly into the gateway binary: 21 in `builtin/`, plus
+`skill_creator` (defined in `client.go`).  Local `Skill`/`Param` types are
+defined in `builtin/helpers.go` to avoid import cycles; `client.go` converts
+them to the top-level `skills.Skill` type via `toSkill()`.
 
 | File | Skills |
 |---|---|
@@ -475,6 +508,7 @@ converts them to the top-level `skills.Skill` type via `toSkill()`.
 | `network.go` | `dns_lookup`, `ping_check`, `port_scan`, `whois_lookup` |
 | `encode.go` | `base64_skill`, `hash_skill`, `uuid_gen`, `password_gen`, `cidr_calc` |
 | `eval.go` | `datetime_skill`, `math_eval`, `cron_schedule` |
+| `reminder.go` | `reminder` |
 | `exec.go` | `shell_command`, `ssh_command` |
 | `qr.go` | `qr_generate` |
 
@@ -543,6 +577,7 @@ CREATE TABLE IF NOT EXISTS scheduled_tasks (
     skill                   TEXT NOT NULL,
     args_json               TEXT NOT NULL DEFAULT '{}',
     notify_telegram_chat_id INTEGER,
+    one_shot                INTEGER NOT NULL DEFAULT 0,
     enabled                 INTEGER NOT NULL DEFAULT 1,
     created_at              REAL NOT NULL,
     last_run_at             REAL,
@@ -550,6 +585,12 @@ CREATE TABLE IF NOT EXISTS scheduled_tasks (
     run_count               INTEGER NOT NULL DEFAULT 0
 );
 ```
+
+`one_shot` marks a task that should run exactly once and then auto-disable
+(used for one-time reminders).  Databases created before this column existed
+are migrated on startup with a tolerated `ALTER TABLE ... ADD COLUMN` (SQLite
+has no `ADD COLUMN IF NOT EXISTS`, so the duplicate-column error is ignored
+after the first run).
 
 Operations: `Create`, `Get`, `ListAll`, `ListEnabled`, `UpdateLastRun`,
 `SetEnabled`, `Delete`, `DeleteAll`.  `DeleteAll` truncates the table in a
@@ -584,6 +625,8 @@ every SchedulerTickSec (default 60s):
     if Matches(task.CronExpr, now) AND not already run this minute:
       execute task.Skill with task.Args
       UpdateLastRun(task.ID, result)
+      if task.OneShot:
+        SetEnabled(task.ID, false)   # run once, then disable (not delete)
       if task.NotifyTelegramChatID != nil:
         send result via Telegram Bot API
 ```
@@ -591,13 +634,20 @@ every SchedulerTickSec (default 60s):
 Deduplication: compares `task.LastRunAt` with the current minute boundary to
 avoid double-firing if the tick period is shorter than a minute.
 
+One-shot tasks are **disabled** rather than deleted after firing, so their
+`last_result` / `run_count` audit trail survives.  When a one-shot task runs
+the `reminder` skill, the Telegram notification delivers the bare reminder
+text (`⏰ Reminder: <message>`) instead of the task's JSON result; all other
+skills keep the generic `⏰ Scheduled: <name>` + JSON format, and a *failed*
+reminder run also falls back to the JSON error so failures stay visible.
+
 #### Native skill (`skill.go`)
 
 `ScheduleTaskSkill` exposes six actions:
 
 | Action | Parameters | Returns |
 |---|---|---|
-| `create` | `cron_expr`, `skill`, `name`, `args`, `notify_telegram_chat_id` | `{created: true, task: {...}}` |
+| `create` | `cron_expr` (UTC), `skill`, `name`, `args`, `notify_telegram_chat_id`, `one_shot` | `{created: true, task: {...}}` |
 | `list` | — | `{count: N, tasks: [...]}` |
 | `delete` | `task_id` | `{deleted: true, task_id: N}` |
 | `delete_all` | — | `{deleted_all: true, deleted_count: N}` |
@@ -1267,7 +1317,7 @@ skill playground, and the gateway's own MCP server.
 - **SQLite via pure Go** — `modernc.org/sqlite` needs no CGO, simplifying
   cross-compilation and distroless deployment.
 - **Fast startup** — sub-second cold start vs Python's multi-second import chain.
-- **Single deploy unit** — one binary contains the gateway, all 21 skills,
+- **Single deploy unit** — one binary contains the gateway, all 22 skills,
   vector memory, history, and embeddings.  No sidecar to keep in sync.
 
 ### Why chromem-go instead of ChromaDB?

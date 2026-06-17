@@ -118,11 +118,41 @@ func (r *Runner) runTask(t *Task) {
 		log.Printf("scheduler update last_run failed: %v", err)
 	}
 
+	// One-shot tasks are disabled (not deleted) after their first run so the
+	// last_result / run_count audit trail survives.
+	if t.OneShot {
+		if _, derr := r.store.SetEnabled(t.ID, false); derr != nil {
+			log.Printf("scheduler one-shot disable failed for task #%d: %v", t.ID, derr)
+		} else {
+			log.Printf("scheduler one-shot task #%d %q disabled after run", t.ID, t.Name)
+		}
+	}
+
 	if t.NotifyTelegramChatID != nil && r.botToken != "" {
-		preview := truncateUTF8(resultStr, 3900)
-		msg := fmt.Sprintf("⏰ Scheduled: %s\n\n%s", t.Name, preview)
+		var msg string
+		if reminderText := reminderMessage(t, err, res); reminderText != "" {
+			// Plain reminder text reads better than a JSON blob.
+			msg = "⏰ Reminder: " + reminderText
+		} else {
+			preview := truncateUTF8(resultStr, 3900)
+			msg = fmt.Sprintf("⏰ Scheduled: %s\n\n%s", t.Name, preview)
+		}
 		sendTelegram(r.botToken, *t.NotifyTelegramChatID, msg)
 	}
+}
+
+// reminderMessage returns the bare reminder text for successful runs of the
+// reminder skill, or "" when the generic JSON notification should be used.
+func reminderMessage(t *Task, execErr error, res any) string {
+	if t.Skill != "reminder" || execErr != nil {
+		return ""
+	}
+	if m, ok := res.(map[string]any); ok {
+		if s, ok := m["reminder"].(string); ok {
+			return s
+		}
+	}
+	return ""
 }
 
 // truncateUTF8 cuts s to at most n bytes without splitting a multi-byte rune;

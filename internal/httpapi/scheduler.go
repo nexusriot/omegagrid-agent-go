@@ -15,6 +15,7 @@ type createTaskRequest struct {
 	Skill                string         `json:"skill"`
 	Args                 map[string]any `json:"args"`
 	NotifyTelegramChatID *int64         `json:"notify_telegram_chat_id"`
+	OneShot              bool           `json:"one_shot"`
 }
 
 func (d *Deps) handleSchedulerCreate(w http.ResponseWriter, r *http.Request) {
@@ -31,7 +32,7 @@ func (d *Deps) handleSchedulerCreate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid cron_expr: "+err.Error())
 		return
 	}
-	task, err := d.Scheduler.Create(req.Name, req.CronExpr, req.Skill, req.Args, req.NotifyTelegramChatID)
+	task, err := d.Scheduler.Create(req.Name, req.CronExpr, req.Skill, req.Args, req.NotifyTelegramChatID, req.OneShot)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

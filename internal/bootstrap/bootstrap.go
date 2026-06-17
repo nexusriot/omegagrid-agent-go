@@ -168,6 +168,10 @@ func New(cfg config.Config) (*Services, func(), error) {
 		MemoryHits:     cfg.MemoryHits,
 		ParallelEnabled: cfg.AgentParallelTools,
 		MaxParallel:    cfg.AgentMaxParallel,
+
+		AutoMemoryExtract:      cfg.AutoMemoryExtract,
+		AutoMemoryMaxFacts:     cfg.AutoMemoryMaxFacts,
+		AutoMemoryMinAnswerLen: cfg.AutoMemoryMinAnswerLen,
 	}
 
 	svc := &Services{

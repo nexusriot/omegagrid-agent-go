@@ -1,7 +1,7 @@
 # omegagrid-agent-go
 
 Pure Go rewrite of the [omegagrid-agent](https://github.com/nexusriot/omegagrid-agent) platform.
-The gateway, agent loop, scheduler, Telegram bot, all 21 skills, vector memory, and conversation
+The gateway, agent loop, scheduler, Telegram bot, all 22 skills, vector memory, and conversation
 history are compiled Go binaries — no Python sidecar.  A React web UI provides a browser
 interface for chat, memory, skills, and the scheduler.  All source is self-contained in this
 repository.
@@ -55,11 +55,12 @@ internal/
   skills/               In-process skill registry
     client.go           Public API — List() / Execute()
     registry.go         Thread-safe sync.RWMutex skill map
-    builtin/            Go implementations of all 21 built-in skills
+    builtin/            Go implementations of all 22 built-in skills
       web.go            weather, http_request, web_scrape, http_health, ip_info
       network.go        dns_lookup, ping_check, port_scan, whois_lookup
       encode.go         base64, hash, uuid_gen, password_gen, cidr_calc
       eval.go           datetime, math_eval (safe parser), cron_schedule
+      reminder.go       reminder (echo message for one-shot scheduled tasks)
       exec.go           shell_command, ssh_command
       qr.go             qr_generate
     markdown/           Markdown skill loader + pipeline executor
@@ -221,6 +222,7 @@ omega memory list --limit 50
 omega memory delete <memory-id>
 omega schedule list
 omega schedule create --name daily-news --cron "0 9 * * *" --skill web_search --arg query=hackernews
+omega schedule create --name standup --cron "0 15 * * *" --skill reminder --arg message="join the call" --one-shot
 omega schedule delete 7
 omega session list
 omega session export 42 > session-42.json
@@ -262,7 +264,7 @@ Everything is compiled into the gateway binary (pure Go, no CGO, distroless runt
 - `VectorStore` — chromem-go cosine-similarity memory with SHA256 + semantic dedup (0.08 threshold)
 - Embeddings clients — Ollama (3-endpoint fallback) + OpenAI
 
-**Built-in skills (21 total):**
+**Built-in skills (22 total):**
 
 | Skill | Description |
 |---|---|
@@ -283,6 +285,7 @@ Everything is compiled into the gateway binary (pure Go, no CGO, distroless runt
 | `cidr_calc` | CIDR network details + IP membership check |
 | `math_eval` | Safe expression evaluator (custom AST parser, no `eval`) |
 | `cron_schedule` | Parse cron expression, explain it, show next N run times |
+| `reminder` | Echo a message back; used by one-shot scheduled tasks to deliver reminders at a set time |
 | `shell_command` | Local shell (requires `SKILL_SHELL_ENABLED=true`) |
 | `ssh_command` | Remote SSH command (requires `SKILL_SSH_ENABLED=true`) |
 | `qr_generate` | QR code as base64 PNG |
@@ -292,7 +295,7 @@ Everything is compiled into the gateway binary (pure Go, no CGO, distroless runt
 
 | Skill | Description |
 |---|---|
-| `schedule_task` | Create / list / delete / enable / disable cron tasks against the Go scheduler. `cron_expr` is validated at creation time — a malformed expression is rejected instead of creating a task that never fires |
+| `schedule_task` | Create / list / delete / delete_all / enable / disable cron tasks against the Go scheduler. `cron_expr` is validated at creation time (UTC) — a malformed expression is rejected instead of creating a task that never fires. Pass `one_shot=true` for a one-time task that auto-disables after it first fires (e.g. a reminder at a specific time) |
 | `web_search` | DuckDuckGo HTML search (no API key); returns title / URL / snippet |
 
 Plus the two memory tools every run gets: `vector_add` and `vector_search`.
@@ -443,6 +446,9 @@ rm data/vector_db.jsonl
 | `AGENT_MAX_STEPS` | `25` | Maximum tool-call steps per agent run |
 | `AGENT_PARALLEL_TOOLS` | `false` | Allow the LLM to emit `tool_calls` batches that execute concurrently |
 | `AGENT_MAX_PARALLEL` | `4` | Max concurrent tool executions per batch when `AGENT_PARALLEL_TOOLS=true` |
+| `AUTO_MEMORY_EXTRACT` | `false` | After each final answer, run a background LLM pass that distils the turn into durable facts and stores them in vector memory (tagged `source=auto-extract`). Existing SHA256 + cosine dedup applies |
+| `AUTO_MEMORY_MAX_FACTS` | `5` | Maximum facts stored per turn by auto-extraction |
+| `AUTO_MEMORY_MIN_ANSWER_LEN` | `80` | Skip auto-extraction when the final answer is shorter than this many characters |
 | `PLAYGROUND_DISABLED` | `false` | Disable `POST /api/skills/{name}/invoke` (skill playground) |
 | `OMEGA_REMOTE` | — | Base URL of a running gateway; switches the `omega` CLI from local to remote mode |
 | `SKILLS_DIR` | `{DATA_DIR}/skills` | Directory for dynamic markdown skills |

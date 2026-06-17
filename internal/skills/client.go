@@ -128,6 +128,7 @@ func registerBuiltins(reg *Registry, cfg config.Config) {
 	reg.register(toSkill(builtin.DateTimeSchema()), builtin.DateTime())
 	reg.register(toSkill(builtin.MathEvalSchema()), builtin.MathEval())
 	reg.register(toSkill(builtin.CronScheduleSchema()), builtin.CronSchedule())
+	reg.register(toSkill(builtin.ReminderSchema()), builtin.Reminder())
 
 	reg.register(toSkill(builtin.ShellCommandSchema()), builtin.ShellCommand(cfg.SkillShellEnabled))
 	reg.register(toSkill(builtin.SshCommandSchema()), builtin.SshCommand(builtin.SSHConfig{

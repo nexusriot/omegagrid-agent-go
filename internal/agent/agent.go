@@ -115,6 +115,12 @@ type Service struct {
 	MemoryHits      int
 	ParallelEnabled bool
 	MaxParallel     int
+
+	// Auto-memory extraction: when enabled, a background goroutine distils
+	// each successful final answer into durable facts stored in vector memory.
+	AutoMemoryExtract      bool
+	AutoMemoryMaxFacts     int
+	AutoMemoryMinAnswerLen int
 }
 
 // RunRequest is the input contract for both Run and RunStream.
@@ -182,6 +188,7 @@ func (s *Service) Run(req RunRequest) (*RunResult, error) {
 		if respType == "final" {
 			answer := finalAnswer(data)
 			_ = s.Memory.AddMessage(state.sid, "assistant", answer)
+			s.maybeExtractMemories(state.sid, req.Query, answer)
 			return s.fallbackResult(state, answer, step, false), nil
 		}
 
@@ -336,6 +343,7 @@ func (s *Service) RunStream(ctx context.Context, req RunRequest, out chan<- Even
 		if respType == "final" {
 			answer := finalAnswer(data)
 			_ = s.Memory.AddMessage(state.sid, "assistant", answer)
+			s.maybeExtractMemories(state.sid, req.Query, answer)
 			send(Event{
 				Event:       "final",
 				SessionID:   state.sid,
@@ -592,7 +600,13 @@ func (s *Service) startSession(req RunRequest) (*runState, error) {
 
 	// Assemble the message list
 	systemPrompt := s.buildSystemPrompt(st.tools, st.skillNames)
-	contextParts := []string{formatMemoryHits(st.memories)}
+	// Current time lets the LLM convert relative/local times ("at 3pm",
+	// "in 20 minutes") into UTC cron expressions for schedule_task without
+	// a datetime_skill round-trip. The scheduler evaluates cron in UTC.
+	contextParts := []string{
+		formatMemoryHits(st.memories),
+		"Current UTC datetime: " + time.Now().UTC().Format("2006-01-02 15:04 (Monday)"),
+	}
 	if req.TelegramChatID != nil {
 		contextParts = append(contextParts, fmt.Sprintf("Current Telegram chat_id: %d (use this for notify_telegram_chat_id when user asks for Telegram notifications)", *req.TelegramChatID))
 	}

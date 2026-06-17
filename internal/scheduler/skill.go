@@ -18,16 +18,20 @@ type ScheduleTaskSkill struct {
 func (s *ScheduleTaskSkill) SkillSchema() map[string]any {
 	return map[string]any{
 		"name": "schedule_task",
-		"description": "Manage scheduled tasks. Actions: 'create' a new recurring task " +
+		"description": "Manage scheduled tasks. Actions: 'create' a new task " +
 			"(runs a skill on cron schedule, optionally notifies Telegram), 'list' all scheduled tasks, " +
 			"'delete' a task by id, 'delete_all' to remove every scheduled task (no task_id needed), " +
-			"'enable'/'disable' a task by id.",
+			"'enable'/'disable' a task by id. " +
+			"cron_expr is evaluated in UTC — convert local times the user mentions to UTC first. " +
+			"For one-time reminders ('tell me at 3pm') set one_shot=true and skill='reminder' " +
+			"with args={\"message\": \"...\"}; the task auto-disables after it fires.",
 		"parameters": map[string]any{
 			"action":                  map[string]any{"type": "string", "description": "Action: create, list, delete, delete_all, enable, disable", "required": true},
 			"name":                    map[string]any{"type": "string", "description": "Task name (for create)", "required": false},
-			"cron_expr":               map[string]any{"type": "string", "description": "Cron expression, e.g. '*/5 * * * *' (for create)", "required": false},
-			"skill":                   map[string]any{"type": "string", "description": "Skill to run, e.g. 'ping_check', 'weather' (for create)", "required": false},
+			"cron_expr":               map[string]any{"type": "string", "description": "Cron expression in UTC, e.g. '*/5 * * * *' (for create)", "required": false},
+			"skill":                   map[string]any{"type": "string", "description": "Skill to run, e.g. 'ping_check', 'weather', 'reminder' (for create)", "required": false},
 			"args":                    map[string]any{"type": "object", "description": "Arguments for the skill (for create)", "required": false},
+			"one_shot":                map[string]any{"type": "boolean", "description": "Run once then auto-disable (for create). Use for one-time reminders.", "required": false},
 			"notify_telegram_chat_id": map[string]any{"type": "number", "description": "Telegram chat ID to send results to (for create). Use the current chat_id if user asks for Telegram notifications.", "required": false},
 			"task_id":                 map[string]any{"type": "number", "description": "Task ID (for delete/enable/disable)", "required": false},
 		},
@@ -87,7 +91,7 @@ func (s *ScheduleTaskSkill) create(args map[string]any) any {
 		}
 	}
 
-	task, err := s.Store.Create(name, cron, skill, innerArgs, notifyChat)
+	task, err := s.Store.Create(name, cron, skill, innerArgs, notifyChat, asBool(args["one_shot"]))
 	if err != nil {
 		return map[string]any{"error": err.Error()}
 	}
@@ -148,6 +152,22 @@ func asString(v any) string {
 		return s
 	}
 	return fmt.Sprint(v)
+}
+
+// asBool coerces the loose types the LLM emits for boolean parameters.
+func asBool(v any) bool {
+	switch x := v.(type) {
+	case bool:
+		return x
+	case string:
+		s := strings.ToLower(strings.TrimSpace(x))
+		return s == "true" || s == "1" || s == "yes"
+	case float64:
+		return x != 0
+	case int:
+		return x != 0
+	}
+	return false
 }
 
 func asInt64(v any) int64 {

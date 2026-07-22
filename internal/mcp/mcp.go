@@ -76,7 +76,6 @@ const (
 	codeParseError     = -32700
 	codeInvalidRequest = -32600
 	codeMethodNotFound = -32601
-	codeInternalError  = -32603
 )
 
 // isNotification reports whether a parsed request carries no ID (JSON-RPC

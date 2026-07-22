@@ -15,25 +15,27 @@ import (
 // OpenAIChat speaks to either /chat/completions (regular OpenAI/Azure/etc.)
 // or /responses (Codex-style models). Mode is selected at construction time.
 type OpenAIChat struct {
-	apiKey    string
-	baseURL   string
-	model     string
-	mode      string // "chat_completions" or "responses"
-	reasoning string
-	client    *http.Client
+	apiKey      string
+	baseURL     string
+	model       string
+	mode        string // "chat_completions" or "responses"
+	reasoning   string
+	temperature *float64 // nil omits temperature from chat_completions requests
+	client      *http.Client
 }
 
-func NewOpenAIChat(apiKey, baseURL, model, mode, reasoning string, timeoutSec float64) *OpenAIChat {
+func NewOpenAIChat(apiKey, baseURL, model, mode, reasoning string, temperature *float64, timeoutSec float64) *OpenAIChat {
 	if mode == "" {
 		mode = "chat_completions"
 	}
 	return &OpenAIChat{
-		apiKey:    apiKey,
-		baseURL:   strings.TrimRight(baseURL, "/"),
-		model:     model,
-		mode:      strings.ToLower(mode),
-		reasoning: reasoning,
-		client:    &http.Client{Timeout: time.Duration(timeoutSec * float64(time.Second))},
+		apiKey:      apiKey,
+		baseURL:     strings.TrimRight(baseURL, "/"),
+		model:       model,
+		mode:        strings.ToLower(mode),
+		reasoning:   reasoning,
+		temperature: temperature,
+		client:      &http.Client{Timeout: time.Duration(timeoutSec * float64(time.Second))},
 	}
 }
 
@@ -109,8 +111,10 @@ func (o *OpenAIChat) completeChatCompletions(messages []Message) (string, float6
 	payload := map[string]any{
 		"model":           o.model,
 		"messages":        o.mapMessages(messages),
-		"temperature":     0.2,
 		"response_format": map[string]string{"type": "json_object"},
+	}
+	if o.temperature != nil {
+		payload["temperature"] = *o.temperature
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {

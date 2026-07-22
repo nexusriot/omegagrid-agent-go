@@ -11,8 +11,10 @@ import (
 )
 
 type queryRequest struct {
-	Query          string `json:"query"`
-	SessionID      int    `json:"session_id,omitempty"`
+	Query     string `json:"query"`
+	SessionID int    `json:"session_id,omitempty"`
+	// Remember is accepted for backward compatibility with the original API but
+	// is a no-op: memory writes are driven by the agent's vector_add tool.
 	Remember       *bool  `json:"remember,omitempty"`
 	MaxSteps       int    `json:"max_steps,omitempty"`
 	TelegramChatID *int64 `json:"telegram_chat_id,omitempty"`
@@ -28,14 +30,9 @@ func (req queryRequest) toAgentReq(defaultMaxSteps int) agent.RunRequest {
 	if maxSteps > maxStepsHardLimit {
 		maxSteps = maxStepsHardLimit
 	}
-	remember := true
-	if req.Remember != nil {
-		remember = *req.Remember
-	}
 	return agent.RunRequest{
 		Query:          req.Query,
 		SessionID:      req.SessionID,
-		Remember:       remember,
 		MaxSteps:       maxSteps,
 		TelegramChatID: req.TelegramChatID,
 	}

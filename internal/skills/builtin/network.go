@@ -11,8 +11,6 @@ import (
 	"time"
 )
 
-// ── DNS Lookup ───────────────────────────────────────────────────────────────
-
 func DnsLookupSchema() Skill {
 	return Skill{Name: "dns_lookup", Description: "Perform a DNS lookup for a domain.",
 		Parameters: map[string]Param{
@@ -98,8 +96,6 @@ func DnsLookup() Executor {
 	}
 }
 
-// ── Ping Check (TCP connect) ─────────────────────────────────────────────────
-
 func PingCheckSchema() Skill {
 	return Skill{Name: "ping_check", Description: "Check if a host is reachable (TCP connect).",
 		Parameters: map[string]Param{
@@ -145,8 +141,6 @@ func PingCheck() Executor {
 		}, nil
 	}
 }
-
-// ── Port Scan ────────────────────────────────────────────────────────────────
 
 func PortScanSchema() Skill {
 	return Skill{Name: "port_scan", Description: "Scan TCP ports on a host.",
@@ -251,8 +245,6 @@ func sortInts(a []int) {
 	}
 }
 
-// ── WHOIS Lookup ─────────────────────────────────────────────────────────────
-
 func WhoisLookupSchema() Skill {
 	return Skill{Name: "whois_lookup", Description: "Perform a WHOIS lookup for a domain.",
 		Parameters: map[string]Param{
@@ -315,18 +307,18 @@ func whoisQuery(server, domain string) (string, error) {
 func parseWhois(raw string) map[string]any {
 	out := map[string]any{}
 	fieldMap := map[string]string{
-		"registrar":        "registrar",
-		"creation date":    "creation_date",
-		"created":          "creation_date",
-		"expiry date":      "expiry_date",
-		"expiration date":  "expiry_date",
+		"registrar":            "registrar",
+		"creation date":        "creation_date",
+		"created":              "creation_date",
+		"expiry date":          "expiry_date",
+		"expiration date":      "expiry_date",
 		"registry expiry date": "expiry_date",
-		"updated date":     "updated_date",
-		"last updated":     "updated_date",
-		"name server":      "nameservers",
-		"nserver":          "nameservers",
-		"domain status":    "status",
-		"status":           "status",
+		"updated date":         "updated_date",
+		"last updated":         "updated_date",
+		"name server":          "nameservers",
+		"nserver":              "nameservers",
+		"domain status":        "status",
+		"status":               "status",
 	}
 	for _, line := range strings.Split(raw, "\n") {
 		if strings.HasPrefix(line, "%") || strings.HasPrefix(line, "#") {

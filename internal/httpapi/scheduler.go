@@ -83,7 +83,7 @@ func (d *Deps) toggleEnabled(w http.ResponseWriter, r *http.Request, enabled boo
 		return
 	}
 	if !ok {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "Task not found"})
+		writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "error": "Task not found"})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "task_id": id, "enabled": enabled})
@@ -101,7 +101,7 @@ func (d *Deps) handleSchedulerDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !ok {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "Task not found"})
+		writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "error": "Task not found"})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "task_id": id})

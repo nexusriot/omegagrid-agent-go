@@ -24,7 +24,7 @@ repository.
          ▲                        └─────────────────┬────────────────────────┘
          │ Telegram Bot API                         │ HTTP
          │                                          ▼
-         └──────────── telegram-bot (Go) ──► Ollama / OpenAI / OpenAI Codex
+         └──────────── telegram-bot (Go) ──► Ollama / OpenAI / OpenAI Codex / DigitalOcean
 ```
 
 ## Repository layout
@@ -407,10 +407,10 @@ wc -l data/vector_db.jsonl
 rm data/vector_db.jsonl
 ```
 
-**New environment variable:**  the gateway now reads the vector database from
-`AGENT_VECTOR_DIR` (default `DATA_DIR/chromem`) instead of the old
-`AGENT_VECTOR_DIR` pointing at the ChromaDB directory.  If you customised
-`AGENT_VECTOR_DIR` in `.env`, update it to point at `data/chromem`.
+**Vector database location:**  the gateway reads the vector database from
+`AGENT_VECTOR_DIR` (default `DATA_DIR/chromem`) — the new chromem-go directory,
+not the legacy ChromaDB `data/vector_db/` path used by the Python sidecar.  If
+you customised `AGENT_VECTOR_DIR` in `.env`, point it at `data/chromem`.
 
 ## Environment variables
 

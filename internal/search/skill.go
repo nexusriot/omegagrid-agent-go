@@ -122,9 +122,8 @@ func parseResults(html string, maxResults int) []SearchResult {
 	snippetMatches := snippetRe.FindAllStringSubmatch(html, -1)
 
 	var results []SearchResult
-	si := 0 // snippet index (may lag if some titles have no snippet)
 
-	for _, m := range titleMatches {
+	for i, m := range titleMatches {
 		if len(results) >= maxResults {
 			break
 		}
@@ -135,16 +134,16 @@ func parseResults(html string, maxResults int) []SearchResult {
 			continue
 		}
 
-		title := cleanHTML(m[2])
-
+		// Pair each result with the snippet at the same document position, so a
+		// skipped title (an ad or DDG-internal link) does not shift every
+		// following snippet onto the wrong result.
 		snippet := ""
-		if si < len(snippetMatches) {
-			snippet = cleanHTML(snippetMatches[si][1])
-			si++
+		if i < len(snippetMatches) {
+			snippet = cleanHTML(snippetMatches[i][1])
 		}
 
 		results = append(results, SearchResult{
-			Title:   title,
+			Title:   cleanHTML(m[2]),
 			URL:     realURL,
 			Snippet: snippet,
 		})
@@ -165,12 +164,10 @@ func extractRealURL(href string) string {
 		return href
 	}
 
-	// DDG redirect: /l/?uddg=<encoded-url>
+	// DDG redirect: /l/?uddg=<url-encoded target>. url.Query() already unescapes
+	// the value exactly once; decoding it again would corrupt any target that
+	// legitimately contains a percent-escape (e.g. %20 in the path).
 	if uddg := u.Query().Get("uddg"); uddg != "" {
-		decoded, err := url.QueryUnescape(uddg)
-		if err == nil {
-			return decoded
-		}
 		return uddg
 	}
 

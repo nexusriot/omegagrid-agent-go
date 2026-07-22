@@ -25,6 +25,10 @@ type Config struct {
 	OpenAITimeoutSec float64
 	OpenAIAPIMode    string // chat_completions or responses
 	OpenAIReasoning  string
+	// OpenAITemperature is sent on the chat_completions path. A nil value omits
+	// temperature entirely, which reasoning models (o-series / gpt-5 family)
+	// require since they reject any non-default temperature.
+	OpenAITemperature *float64
 
 	// DigitalOcean Serverless Inference (OpenAI-compatible).
 	// https://docs.digitalocean.com/reference/api/reference/inference-apis/
@@ -128,6 +132,7 @@ func Load() Config {
 	c.VectorDir = getOr(os.Getenv("AGENT_VECTOR_DIR"), dataDir+"/chromem")
 	c.SkillsDir = getOr(os.Getenv("SKILLS_DIR"), dataDir+"/skills")
 	c.SchedulerDB = getOr(os.Getenv("SCHEDULER_DB"), dataDir+"/scheduler.sqlite3")
+	c.OpenAITemperature = parseTemperature(os.Getenv("OPENAI_TEMPERATURE"))
 
 	// Default chat model + api mode resolution
 	switch c.Provider {
@@ -163,6 +168,26 @@ func splitCSV(v string) []string {
 		}
 	}
 	return out
+}
+
+// parseTemperature reads OPENAI_TEMPERATURE. Empty (unset) → default 0.2.
+// "none"/"omit"/"off" → nil, which tells the chat client to leave temperature
+// out of the request entirely (reasoning models reject a non-default value).
+// An unparseable value falls back to the 0.2 default.
+func parseTemperature(v string) *float64 {
+	v = strings.ToLower(strings.TrimSpace(v))
+	switch v {
+	case "none", "omit", "off":
+		return nil
+	case "":
+		def := 0.2
+		return &def
+	}
+	if f, err := strconv.ParseFloat(v, 64); err == nil {
+		return &f
+	}
+	def := 0.2
+	return &def
 }
 
 func isTruthy(v string) bool {

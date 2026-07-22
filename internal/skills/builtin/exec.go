@@ -13,8 +13,6 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// ── Shell Command ─────────────────────────────────────────────────────────
-
 func ShellCommandSchema() Skill {
 	return Skill{Name: "shell_command", Description: "Execute a shell command on the local machine (requires SKILL_SHELL_ENABLED=true).",
 		Parameters: map[string]Param{
@@ -64,8 +62,6 @@ func ShellCommand(enabled bool) Executor {
 		}, nil
 	}
 }
-
-// ── SSH Command ───────────────────────────────────────────────────────────
 
 func SshCommandSchema() Skill {
 	return Skill{Name: "ssh_command", Description: "Execute a command on a remote host via SSH (requires SKILL_SSH_ENABLED=true).",

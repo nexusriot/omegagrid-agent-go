@@ -51,9 +51,7 @@ func sessionList(args []string) {
 
 func sessionExport(args []string) {
 	fs := flag.NewFlagSet("session export", flag.ExitOnError)
-	jsonOut := fs.Bool("json", true, "JSON output (default true)")
 	fs.Parse(args)
-	_ = jsonOut
 
 	idStr := fs.Arg(0)
 	if idStr == "" {
@@ -68,13 +66,10 @@ func sessionExport(args []string) {
 	if err != nil {
 		fatalf("session export: %v", err)
 	}
-	// Always print as JSON — this output is meant for piping.
+	// Always emitted as JSON — this output is meant for piping.
 	printJSON(map[string]any{
-		"session_id": id,
-		"messages":   msgs,
+		"session_id":  id,
+		"messages":    msgs,
 		"exported_at": time.Now().UTC().Format(time.RFC3339),
 	})
 }
-
-// suppress unused import warning
-var _ = os.Stderr

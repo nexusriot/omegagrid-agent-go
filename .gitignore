@@ -1,7 +1,30 @@
+# Editors / IDEs
 .idea/
+.vscode/
+*.swp
+*~
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Build output (all binaries land in ./bin via the Makefile: gateway, telegram-bot, migrate-vector, omega)
 build/
+/bin/
+
+# Go test / coverage artifacts
+*.test
+*.out
+coverage.*
+*.prof
+
+# Runtime state: SQLite DBs, chromem-go vector store, dynamic markdown skills
 data/
 
-bin/omega
-
+# Secrets / local env (‑ .env.example stays tracked)
 .env
+.env.local
+.env.*.local
+
+# Frontend build artifacts (web/node_modules and web/dist are covered by web/.gitignore)
+*.tsbuildinfo

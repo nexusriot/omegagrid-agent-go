@@ -1,0 +1,30 @@
+# Keep the Docker build context small and free of secrets/state.
+# The gateway, telegram-bot, and migrate images all run `COPY . .`, so anything
+# not excluded here is uploaded to the build daemon and can end up in a layer.
+
+# VCS / editor
+.git/
+.gitignore
+.idea/
+.vscode/
+
+# Runtime state — SQLite DBs, chromem-go vectors, dynamic skills (never build with it)
+data/
+
+# Local secrets — must never enter the build context
+.env
+.env.local
+.env.*.local
+
+# Prebuilt binaries / build output
+/bin/
+build/
+
+# Frontend deps & build output (the frontend image runs `npm ci` + `npm run build` fresh)
+web/node_modules/
+web/dist/
+*.tsbuildinfo
+
+# Docs / assets not needed at build time (no //go:embed in this project)
+*.md
+b-claw-go.png

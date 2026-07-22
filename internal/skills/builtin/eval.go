@@ -381,8 +381,10 @@ func CronSchedule() Executor {
 			parsed[i] = vs
 		}
 
+		domRestricted := strings.TrimSpace(parts[2]) != "*"
+		dowRestricted := strings.TrimSpace(parts[4]) != "*"
 		explanation := cronExplain(parts)
-		nextRuns := cronNextRuns(parsed, count)
+		nextRuns := cronNextRuns(parsed, count, domRestricted, dowRestricted)
 		fields := make(map[string]string, 5)
 		for i, n := range fieldNames {
 			fields[n] = parts[i]
@@ -446,6 +448,11 @@ func parseCronField(field string, lo, hi, idx int) (map[int]bool, error) {
 			out[n] = true
 		}
 	}
+	if idx == 4 && out[7] {
+		// 7 is an alternate spelling of Sunday (0).
+		out[0] = true
+		delete(out, 7)
+	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("field %q produced no values", field)
 	}
@@ -492,15 +499,23 @@ func cronExplain(parts []string) string {
 	return strings.Join(pieces, ", ")
 }
 
-func cronNextRuns(parsed []map[int]bool, count int) []string {
+func cronNextRuns(parsed []map[int]bool, count int, domRestricted, dowRestricted bool) []string {
 	now := time.Now().UTC()
 	now = now.Truncate(time.Minute).Add(time.Minute)
 	var results []string
 	limit := 366 * 24 * 60
 	for checked := 0; len(results) < count && checked < limit; checked++ {
 		dow := int(now.Weekday()) // 0=Sun
-		if parsed[0][now.Minute()] && parsed[1][now.Hour()] &&
-			parsed[2][now.Day()] && parsed[3][int(now.Month())] && parsed[4][dow] {
+		domOK := parsed[2][now.Day()]
+		dowOK := parsed[4][dow]
+		// Standard Vixie cron: when both day fields are restricted the run fires
+		// if EITHER matches; otherwise the unrestricted ("*") field always
+		// matches, so a plain AND yields the correct single-field behaviour.
+		dayOK := domOK && dowOK
+		if domRestricted && dowRestricted {
+			dayOK = domOK || dowOK
+		}
+		if parsed[0][now.Minute()] && parsed[1][now.Hour()] && parsed[3][int(now.Month())] && dayOK {
 			results = append(results, now.Format(time.RFC3339))
 		}
 		now = now.Add(time.Minute)

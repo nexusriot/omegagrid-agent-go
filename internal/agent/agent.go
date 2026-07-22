@@ -127,7 +127,6 @@ type Service struct {
 type RunRequest struct {
 	Query          string
 	SessionID      int
-	Remember       bool
 	MaxSteps       int
 	TelegramChatID *int64
 }

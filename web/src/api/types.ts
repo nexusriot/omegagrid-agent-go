@@ -84,7 +84,7 @@ export interface QueryResult {
   session_id: number
   answer: string
   meta: {
-    steps: number
+    step_count: number
     model: string
     timings: Record<string, number>
   }

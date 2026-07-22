@@ -21,7 +21,7 @@ All source is self-contained in this repository, making
                                           └──────────────┬─────────────────────┘
 ┌─────────────────────┐       HTTP                       │ HTTP
 │  telegram-bot       │  ───────────────►                ▼
-│  (Go binary)        │  /api/query[/str]    Ollama / OpenAI / OpenAI Codex
+│  (Go binary)        │  /api/query[/str]    Ollama / OpenAI / OpenAI Codex / DigitalOcean
 └─────────────────────┘
 ```
 
@@ -162,6 +162,7 @@ All configuration is environment-driven, matching the original `.env` pattern.
 | Gateway | `BACKEND_PORT`, `DATA_DIR` | 8000, `/app/data` |
 | Frontend | `FRONTEND_PORT` | 80 (Docker Compose only) |
 | LLM | `LLM_PROVIDER`, `OLLAMA_URL`, `OLLAMA_MODEL`, `OLLAMA_TIMEOUT`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_CHAT_MODEL`, `OPENAI_TIMEOUT`, `OPENAI_API_MODE`, `OPENAI_REASONING_EFFORT` | ollama, `http://127.0.0.1:11434`, `llama3:latest`, 120s |
+| LLM (DigitalOcean) | `DIGITALOCEAN_API_KEY`, `DIGITALOCEAN_BASE_URL`, `DIGITALOCEAN_CHAT_MODEL`, `DIGITALOCEAN_EMBED_MODEL`, `DIGITALOCEAN_TIMEOUT` | —, `https://inference.do-ai.run/v1`, `meta-llama/Llama-3.3-70B-Instruct`, `qwen3-embedding-0.6b`, 120s |
 | Agent | `AGENT_DB`, `AGENT_CONTEXT_TAIL`, `AGENT_MEMORY_HITS`, `AGENT_MAX_STEPS`, `AGENT_PARALLEL_TOOLS`, `AGENT_MAX_PARALLEL` | `{DATA_DIR}/agent_memory.sqlite3`, 30, 5, 25, false, 4 |
 | Auto-memory | `AUTO_MEMORY_EXTRACT`, `AUTO_MEMORY_MAX_FACTS`, `AUTO_MEMORY_MIN_ANSWER_LEN` | false, 5, 80 |
 | Playground | `PLAYGROUND_DISABLED` | false (playground enabled) |
@@ -176,7 +177,10 @@ All configuration is environment-driven, matching the original `.env` pattern.
 
 `LLM_PROVIDER` determines both the chat client and the embeddings backend.
 When set to `openai-codex` or when the model name contains `codex`, the
-OpenAI client automatically switches to the `/responses` API endpoint.
+OpenAI client automatically switches to the `/responses` API endpoint (the
+default codex chat model is `gpt-5.3-codex`).  `digitalocean` (alias `do`) is
+served through the same OpenAI-compatible client in `chat_completions` mode,
+pointed at `DIGITALOCEAN_BASE_URL`.
 
 ### 3.2 LLM clients (`internal/llm`)
 
@@ -205,6 +209,14 @@ Two code paths selected by the `mode` field:
 Both modes map `role: "tool"` messages to `role: "user"` with a
 `"[Tool result]:"` prefix, since the APIs do not accept a native tool role
 without a preceding tool-use turn.
+
+#### DigitalOcean
+
+DigitalOcean Serverless Inference is OpenAI-compatible, so there is no separate
+client type: `bootstrap.BuildChat` constructs an `OpenAIChat` in
+`chat_completions` mode using `DIGITALOCEAN_API_KEY` / `DIGITALOCEAN_BASE_URL` /
+`DIGITALOCEAN_CHAT_MODEL`. Embeddings likewise reuse `openAIEmbeddings` against
+the DigitalOcean base URL (`DIGITALOCEAN_EMBED_MODEL`).
 
 ### 3.3 Agent loop (`internal/agent`)
 
@@ -368,7 +380,12 @@ The agent must tolerate malformed LLM output:
    the parser unwraps it.
 4. **normalizeToolCall** — if the LLM puts the tool name in the `type` field
    instead of `tool`, the parser auto-corrects.
-5. On total failure — return a fallback answer containing the raw LLM output.
+5. On unrecoverable parse failure — the non-streaming `Run` returns a graceful
+   fallback answer (*"I had trouble processing that request. Please try
+   rephrasing."*), whereas `RunStream` emits an `error` event and stops. The two
+   entry points deliberately differ here: streaming does **not** synthesise the
+   fallback answer. When the envelope parses but is not a recognised `type`, the
+   loop falls back to the model's best-effort text via `bestAnswer`.
 
 ### 3.4 Memory & history (`internal/memory`)
 
@@ -889,7 +906,7 @@ React app is built and served exclusively by the nginx frontend container.
 For local UI development without Docker, run `make dev-web` (Vite dev
 server at `:5173/ui/`, proxying `/api` to the gateway on `:8000`).
 
-### 3.11 Bootstrap (`internal/bootstrap`)
+### 3.12 Bootstrap (`internal/bootstrap`)
 
 A single `bootstrap.New(cfg)` function constructs every runtime service
 (LLM chat, memory, skills, scheduler store, scheduler runner, native
@@ -914,7 +931,7 @@ func New(cfg config.Config) (*Services, func(), error)
 This refactor reduced `cmd/gateway/main.go` from 168 to 52 lines and let the
 CLI reuse the gateway's exact construction without duplication.
 
-### 3.12 CLI (`cmd/cli` — `omega` binary)
+### 3.13 CLI (`cmd/cli` — `omega` binary)
 
 A single static Go binary that exposes the agent's full surface without
 requiring a running HTTP gateway.  Built with stdlib only (no cobra) using
@@ -947,6 +964,8 @@ internally branch on `isRemote()` to pick the right path.
 | `omega skills run NAME --arg k=v` | Invoke a skill directly (uses the same execution path as the playground endpoint). |
 | `omega memory search "Q" -k N` | Semantic search over vector memory. |
 | `omega memory add "TEXT" --meta k=v` | Manually add a memory. |
+| `omega memory list [-limit N] [-offset N]` | List stored memories newest-first. |
+| `omega memory delete ID` | Delete a memory by ID (alias `rm`). |
 | `omega schedule list / create / delete` | CRUD for scheduled cron tasks. |
 | `omega session list` | List sessions with message counts. |
 | `omega session export ID` | Dump a session's full message history as JSON (for piping to `jq`). |
@@ -1268,9 +1287,14 @@ POST /api/invocations/{id}/replay   → {"replayed_from":42,"skill":"weather","r
 #### Health
 
 ```
-GET /health → {"ok": true, "provider": "ollama", "chat_model": "llama3:latest",
-               "skills_dir": "/app/data/skills", "scheduler_db": "..."}
+GET /health → {"ok": true, "provider": "ollama",
+               "chat_base": "http://127.0.0.1:11434", "chat_model": "llama3:latest",
+               "skills_dir": "/app/data/skills", "scheduler_db": "...",
+               "embed_model": "nomic-embed-text", "embed_ok": true, "embed_error": ""}
 ```
+
+`ok` mirrors `embed_ok`: it is `false` when the embeddings backend (vector
+memory) is unreachable, so `/health` doubles as an embeddings readiness probe.
 
 #### MCP (Model Context Protocol)
 
@@ -1378,7 +1402,7 @@ the only path that serves the UI in any deployment.
 
 | Scenario | Behaviour |
 |---|---|
-| LLM returns invalid JSON | Agent parser tries three recovery strategies; falls back to returning raw LLM output as the answer. |
+| LLM returns invalid JSON | Agent parser tries several recovery strategies (embedded-JSON regex, `raw_model_json` unwrap, `normalizeToolCall`); on unrecoverable failure `Run` returns a graceful "please rephrase" fallback answer while `RunStream` emits an `error` event and stops. |
 | LLM calls unknown tool | Agent returns an error message listing valid tools; LLM can retry. |
 | Skill execution fails | Executor returns `(nil, err)`; agent loop wraps it as `{error: "..."}` and appends as tool result; LLM can retry or answer. |
 | Embeddings unreachable | `addText` and `searchMemory` return errors surfaced in the agent loop; agent continues without memory injection. |

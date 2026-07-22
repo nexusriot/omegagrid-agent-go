@@ -49,12 +49,12 @@ func ensureDataDirs(cfg config.Config) error {
 
 // Services holds every initialised service.
 type Services struct {
-	Chat    llm.ChatClient
-	Memory  *memory.Client
-	Skills  *skills.Client
-	Sched   *scheduler.Store
-	Runner  *scheduler.Runner
-	Agent   *agent.Service
+	Chat   llm.ChatClient
+	Memory *memory.Client
+	Skills *skills.Client
+	Sched  *scheduler.Store
+	Runner *scheduler.Runner
+	Agent  *agent.Service
 
 	// Exposed so callers can build httpapi.Deps without re-importing agent.
 	NativeSkills map[string]agent.Skill
@@ -160,14 +160,14 @@ func New(cfg config.Config) (*Services, func(), error) {
 	runner.Start()
 
 	ag := &agent.Service{
-		Memory:         mem,
-		Skills:         sk,
-		Chat:           chat,
-		NativeSkills:   native,
-		ContextTail:    cfg.ContextTail,
-		MemoryHits:     cfg.MemoryHits,
+		Memory:          mem,
+		Skills:          sk,
+		Chat:            chat,
+		NativeSkills:    native,
+		ContextTail:     cfg.ContextTail,
+		MemoryHits:      cfg.MemoryHits,
 		ParallelEnabled: cfg.AgentParallelTools,
-		MaxParallel:    cfg.AgentMaxParallel,
+		MaxParallel:     cfg.AgentMaxParallel,
 
 		AutoMemoryExtract:      cfg.AutoMemoryExtract,
 		AutoMemoryMaxFacts:     cfg.AutoMemoryMaxFacts,
@@ -203,7 +203,7 @@ func BuildChat(cfg config.Config) (llm.ChatClient, error) {
 		}
 		return llm.NewOpenAIChat(
 			cfg.OpenAIAPIKey, cfg.OpenAIBaseURL, cfg.OpenAIChatModel,
-			cfg.OpenAIAPIMode, cfg.OpenAIReasoning, cfg.OpenAITimeoutSec,
+			cfg.OpenAIAPIMode, cfg.OpenAIReasoning, cfg.OpenAITemperature, cfg.OpenAITimeoutSec,
 		), nil
 	case "digitalocean", "do":
 		if cfg.DigitalOceanAPIKey == "" {
@@ -213,7 +213,7 @@ func BuildChat(cfg config.Config) (llm.ChatClient, error) {
 		// bearer auth) so we reuse the OpenAI chat client.
 		return llm.NewOpenAIChat(
 			cfg.DigitalOceanAPIKey, cfg.DigitalOceanBaseURL, cfg.DigitalOceanChatModel,
-			"chat_completions", "", cfg.DigitalOceanTimeoutSec,
+			"chat_completions", "", cfg.OpenAITemperature, cfg.DigitalOceanTimeoutSec,
 		), nil
 	default:
 		return llm.NewOllamaChat(cfg.OllamaURL, cfg.OllamaModel, cfg.OllamaTimeoutSec), nil

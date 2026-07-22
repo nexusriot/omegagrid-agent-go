@@ -59,6 +59,12 @@ func (d *Deps) handleGetInvocation(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *Deps) handleReplayInvocation(w http.ResponseWriter, r *http.Request) {
+	// Replay re-executes a skill outside the agent loop, exactly like the
+	// playground, so it is gated by the same flag.
+	if !d.Cfg.PlaygroundEnabled {
+		writeError(w, http.StatusForbidden, "skill playground is disabled (set PLAYGROUND_DISABLED=false to enable)")
+		return
+	}
 	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid id")
@@ -71,6 +77,13 @@ func (d *Deps) handleReplayInvocation(w http.ResponseWriter, r *http.Request) {
 	}
 	if rec == nil {
 		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	// Only registry skills are replayable. Built-in agent tools (vector_add,
+	// vector_search) and audit-only rows (replay/unknown) are not in the skill
+	// registry and must not be re-executed here.
+	if rec.Kind != "skill" {
+		writeError(w, http.StatusBadRequest, "replay is only supported for skill invocations (kind=skill)")
 		return
 	}
 

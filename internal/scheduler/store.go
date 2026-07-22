@@ -127,9 +127,7 @@ func (s *Store) list(query string) ([]*Task, error) {
 }
 
 func (s *Store) UpdateLastRun(id int64, result string) error {
-	if len(result) > 4000 {
-		result = result[:4000]
-	}
+	result = truncateUTF8(result, 4000)
 	_, err := s.db.Exec(
 		`UPDATE scheduled_tasks SET last_run_at = ?, last_result = ?, run_count = run_count + 1 WHERE id = ?`,
 		float64(time.Now().UnixNano())/1e9, result, id,

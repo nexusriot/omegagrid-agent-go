@@ -47,7 +47,6 @@ func runAskLocal(query string, sessionID, maxSteps int, stream, jsonOut bool) {
 	req := agent.RunRequest{
 		Query:     query,
 		SessionID: sessionID,
-		Remember:  true,
 		MaxSteps:  steps,
 	}
 

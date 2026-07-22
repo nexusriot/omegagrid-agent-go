@@ -159,13 +159,13 @@ Non-admin users will be ignored until the admin allowlists them.
 ## 7. (Optional) Use the `omega` CLI against the running gateway
 
 The CLI can talk to a local or remote gateway. Build it once on the host
-(needs Go ≥ 1.22):
+(needs Go ≥ 1.25 — see `go.mod`):
 
 ```bash
-make build              # produces ./bin/omega and ./bin/gateway
+make cli                # produces ./bin/omega
 export OMEGA_REMOTE=http://localhost:8000
 ./bin/omega skills list
-./bin/omega chat "hello"
+./bin/omega ask "hello"
 ```
 
 ---

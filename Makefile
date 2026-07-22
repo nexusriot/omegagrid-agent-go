@@ -3,7 +3,7 @@
 export UID := $(shell id -u)
 export GID := $(shell id -g)
 
-.PHONY: web build build-all cli dev-web migrate-vector vector-export vector-import vector-migrate vet init
+.PHONY: web build build-all cli dev-web migrate-vector vector-export vector-import vector-migrate vet test init
 
 ## Create ./data with correct ownership (run once before first docker compose up)
 init:
@@ -31,6 +31,11 @@ cli:
 ## Run go vet on all packages
 vet:
 	go vet ./...
+
+## Run the full Go test suite isolated in a Docker container (builds Dockerfile.test).
+## Needs only Docker on the host — no local Go toolchain required.
+test:
+	./run_tests.sh --docker
 
 ## Run the Vite dev server (proxies /api to localhost:8000)
 dev-web:

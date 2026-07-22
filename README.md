@@ -193,6 +193,7 @@ make build-all    # web + build gateway + telegram-bot + migrate-vector + omega 
 make cli          # go build -o bin/omega ./cmd/cli
 make dev-web      # cd web && npm run dev  (Vite dev server, hot-reload)
 make vet          # go vet ./...
+make test         # run the Go test suite inside a Docker container (Dockerfile.test)
 make vector-migrate   # ChromaDB → chromem-go migration (see below)
 ```
 

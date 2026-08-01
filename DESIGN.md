@@ -1562,6 +1562,14 @@ Coverage per package is listed in the README.
 | Remote MCP servers | an `httptest` JSON-RPC server; one test also serves the single-event SSE variant |
 | SQLite / chromem-go | real stores in `t.TempDir()` — they are pure Go and fast enough to use for real |
 
+**Verifying the web UI — use `npm run build` (or `make web`), not `tsc --noEmit`.**
+`web/tsconfig.json` is a solution-style file: `"files": []` plus references to
+`tsconfig.app.json` / `tsconfig.node.json`. A bare `tsc --noEmit` therefore
+compiles *nothing* and exits 0 no matter what is broken. Only build mode
+(`tsc -b`, which `npm run build` runs) follows the references into
+`tsconfig.app.json`, where `noUnusedLocals` / `noUnusedParameters` live — so an
+unused import fails the Docker frontend image but passes `tsc --noEmit`.
+
 Two deliberate exceptions: `weather` and `ip_info` build hardcoded third-party
 URLs with no injection point, so only their argument handling is covered.
 `dns_lookup` and `ping_check` are exercised against `localhost` and a local

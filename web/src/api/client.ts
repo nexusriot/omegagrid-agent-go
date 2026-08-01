@@ -2,7 +2,7 @@ import type {
   Session, Message, Skill, SchedulerTask,
   CreateTaskRequest, MemoryHit, MemoryAddResult,
   HealthStatus, QueryResult, QueryRequest,
-  Invocation, InvocationListResult, InvocationFilter, ReplayResult,
+  InvocationListResult, InvocationFilter, ReplayResult,
 } from './types'
 
 const BASE = import.meta.env.VITE_API_BASE ?? ''

@@ -3,7 +3,6 @@ package httpapi
 import (
 	"encoding/json"
 	"net/http"
-	"strconv"
 
 	"github.com/go-chi/chi/v5"
 )
@@ -65,8 +64,8 @@ func (d *Deps) handleMemorySearch(w http.ResponseWriter, r *http.Request) {
 // handleMemoryList returns a newest-first page of stored memories.
 // Query params: limit (default 100, 0 = all), offset (default 0).
 func (d *Deps) handleMemoryList(w http.ResponseWriter, r *http.Request) {
-	limit := atoiDefault(r.URL.Query().Get("limit"), 100)
-	offset := atoiDefault(r.URL.Query().Get("offset"), 0)
+	limit := queryInt(r.URL.Query().Get("limit"), 100)
+	offset := queryInt(r.URL.Query().Get("offset"), 0)
 
 	hits, total, err := d.Memory.ListMemories(limit, offset)
 	if err != nil {
@@ -110,14 +109,4 @@ func (d *Deps) handleMemoryDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "deleted": id})
-}
-
-func atoiDefault(s string, def int) int {
-	if s == "" {
-		return def
-	}
-	if n, err := strconv.Atoi(s); err == nil {
-		return n
-	}
-	return def
 }

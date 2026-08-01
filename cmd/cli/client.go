@@ -27,6 +27,13 @@ func remoteBase() string {
 // isRemote reports whether a remote URL is configured.
 func isRemote() bool { return remoteBase() != "" }
 
+// The remote branches below deliberately call httpJSON on its own line before
+// returning the decoded value. `return out.X, httpJSON(..., &out)` reads out.X
+// and calls httpJSON in the same statement, and the spec does not order a plain
+// operand against a call in the same expression — gc happens to fill out first,
+// but nothing guarantees it, and the failure mode is every remote command
+// silently printing an empty result.
+
 // httpJSON makes a JSON request to the remote gateway and decodes the response.
 func httpJSON(method, path string, reqBody, out any) error {
 	base := remoteBase()
@@ -126,7 +133,8 @@ func listSkills() ([]skills.Skill, error) {
 		var out struct {
 			Skills []skills.Skill `json:"skills"`
 		}
-		return out.Skills, httpJSON("GET", "/api/skills", nil, &out)
+		err := httpJSON("GET", "/api/skills", nil, &out)
+		return out.Skills, err
 	}
 	return getLocal().Skills.List()
 }
@@ -134,8 +142,9 @@ func listSkills() ([]skills.Skill, error) {
 func invokeSkill(name string, args map[string]any) (map[string]any, error) {
 	if isRemote() {
 		var out map[string]any
-		return out, httpJSON("POST", "/api/skills/"+name+"/invoke",
+		err := httpJSON("POST", "/api/skills/"+name+"/invoke",
 			map[string]any{"args": args}, &out)
+		return out, err
 	}
 	result, err := getLocal().Skills.Execute(name, args)
 	if err != nil {
@@ -152,8 +161,9 @@ func searchMemory(query string, k int) ([]memory.MemoryHit, error) {
 		var out struct {
 			Hits []memory.MemoryHit `json:"hits"`
 		}
-		return out.Hits, httpJSON("POST", "/api/memory/search",
+		err := httpJSON("POST", "/api/memory/search",
 			map[string]any{"query": query, "k": k}, &out)
+		return out.Hits, err
 	}
 	res, err := getLocal().Memory.SearchMemory(query, k)
 	if err != nil {
@@ -178,7 +188,8 @@ func listMemories(limit, offset int) ([]memory.MemoryHit, int, error) {
 			Total int                `json:"total"`
 		}
 		path := fmt.Sprintf("/api/memory?limit=%d&offset=%d", limit, offset)
-		return out.Hits, out.Total, httpJSON("GET", path, nil, &out)
+		err := httpJSON("GET", path, nil, &out)
+		return out.Hits, out.Total, err
 	}
 	return getLocal().Memory.ListMemories(limit, offset)
 }
@@ -200,7 +211,8 @@ func deleteMemory(id string) error {
 func listSchedule() ([]*scheduler.Task, error) {
 	if isRemote() {
 		var out []*scheduler.Task
-		return out, httpJSON("GET", "/api/scheduler/tasks", nil, &out)
+		err := httpJSON("GET", "/api/scheduler/tasks", nil, &out)
+		return out, err
 	}
 	return getLocal().Sched.ListAll()
 }
@@ -227,7 +239,8 @@ func listSessions() ([]memory.SessionInfo, error) {
 		var out struct {
 			Sessions []memory.SessionInfo `json:"sessions"`
 		}
-		return out.Sessions, httpJSON("GET", "/api/sessions", nil, &out)
+		err := httpJSON("GET", "/api/sessions", nil, &out)
+		return out.Sessions, err
 	}
 	return getLocal().Memory.ListSessions(50)
 }
@@ -237,7 +250,8 @@ func exportSession(id int) ([]memory.StoredMessage, error) {
 		var out struct {
 			Messages []memory.StoredMessage `json:"messages"`
 		}
-		return out.Messages, httpJSON("GET", fmt.Sprintf("/api/sessions/%d/messages?limit=10000", id), nil, &out)
+		err := httpJSON("GET", fmt.Sprintf("/api/sessions/%d/messages?limit=10000", id), nil, &out)
+		return out.Messages, err
 	}
 	return getLocal().Memory.ListMessages(id, 10000, 0)
 }

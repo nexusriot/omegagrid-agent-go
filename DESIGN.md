@@ -161,7 +161,7 @@ All configuration is environment-driven, matching the original `.env` pattern.
 |---|---|---|
 | Gateway | `BACKEND_PORT`, `DATA_DIR` | 8000, `/app/data` |
 | Frontend | `FRONTEND_PORT` | 80 (Docker Compose only) |
-| LLM | `LLM_PROVIDER`, `OLLAMA_URL`, `OLLAMA_MODEL`, `OLLAMA_TIMEOUT`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_CHAT_MODEL`, `OPENAI_TIMEOUT`, `OPENAI_API_MODE`, `OPENAI_REASONING_EFFORT` | ollama, `http://127.0.0.1:11434`, `llama3:latest`, 120s |
+| LLM | `LLM_PROVIDER`, `OLLAMA_URL`, `OLLAMA_MODEL`, `OLLAMA_TIMEOUT`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_CHAT_MODEL`, `OPENAI_TIMEOUT`, `OPENAI_API_MODE`, `OPENAI_REASONING_EFFORT`, `OPENAI_TEMPERATURE` | ollama, `http://127.0.0.1:11434`, `llama3:latest`, 120s, auto, —, 0.2 |
 | LLM (DigitalOcean) | `DIGITALOCEAN_API_KEY`, `DIGITALOCEAN_BASE_URL`, `DIGITALOCEAN_CHAT_MODEL`, `DIGITALOCEAN_EMBED_MODEL`, `DIGITALOCEAN_TIMEOUT` | —, `https://inference.do-ai.run/v1`, `meta-llama/Llama-3.3-70B-Instruct`, `qwen3-embedding-0.6b`, 120s |
 | Agent | `AGENT_DB`, `AGENT_CONTEXT_TAIL`, `AGENT_MEMORY_HITS`, `AGENT_MAX_STEPS`, `AGENT_PARALLEL_TOOLS`, `AGENT_MAX_PARALLEL` | `{DATA_DIR}/agent_memory.sqlite3`, 30, 5, 25, false, 4 |
 | Auto-memory | `AUTO_MEMORY_EXTRACT`, `AUTO_MEMORY_MAX_FACTS`, `AUTO_MEMORY_MIN_ANSWER_LEN` | false, 5, 80 |
@@ -181,6 +181,14 @@ OpenAI client automatically switches to the `/responses` API endpoint (the
 default codex chat model is `gpt-5.3-codex`).  `digitalocean` (alias `do`) is
 served through the same OpenAI-compatible client in `chat_completions` mode,
 pointed at `DIGITALOCEAN_BASE_URL`.
+
+`OPENAI_TEMPERATURE` is parsed into a `*float64` so that "unset" and "omit"
+stay distinguishable: an empty value means the 0.2 default, an unparseable one
+falls back to it, and `none` / `omit` / `off` yield `nil`, which drops the
+`temperature` field from the request body altogether. Reasoning models
+(o-series, gpt-5 family) reject any non-default temperature, so sending the
+field at all makes them fail. The Ollama client is unaffected — it pins
+`options.temperature` to 0.2.
 
 ### 3.2 LLM clients (`internal/llm`)
 
@@ -208,7 +216,15 @@ Two code paths selected by the `mode` field:
 
 Both modes map `role: "tool"` messages to `role: "user"` with a
 `"[Tool result]:"` prefix, since the APIs do not accept a native tool role
-without a preceding tool-use turn.
+without a preceding tool-use turn.  (Ollama accepts the tool role verbatim, so
+`OllamaChat` sends the message list unchanged.)
+
+`postWithRetry` retries HTTP 429, any 5xx, and transport-level errors up to
+three attempts, backing off 2s then 4s.  Client **timeouts** are deliberately
+not retried: each attempt already waited the full configured timeout, and
+stacking two more multi-minute waits makes the agent look frozen.  The backoff
+call goes through an injectable `sleep` field so tests can assert the schedule
+without actually waiting — the only reason that field exists.
 
 #### DigitalOcean
 
@@ -254,7 +270,14 @@ addendum is appended to the system prompt:
 }
 ```
 
-Calls in a batch run concurrently up to `AGENT_MAX_PARALLEL` (default 4) via a
+`AGENT_MAX_PARALLEL` (default 4) is both the concurrency limit and the batch
+size limit: `Service.capBatch` truncates an oversized `calls` array to that many
+entries before anything executes, and the follow-up message tells the model how
+many calls were dropped so it can re-issue them in a later batch.  Without that
+cap a single LLM reply could fan out arbitrarily many concurrent executions —
+port scans, shell commands — regardless of the limit the system prompt states.
+
+Calls in a batch run concurrently up to `AGENT_MAX_PARALLEL` via a
 semaphore-bounded goroutine pool (`Service.executeBatch`).  Results are
 appended to the LLM context in the order the model emitted them — not in
 completion order — so the LLM's view stays deterministic.  A failure in one
@@ -284,6 +307,7 @@ for step = 1..MaxSteps:
   │     return RunResult
   │
   ├─ if type == "tool_calls":
+  │     capBatch(calls) — keep at most MaxParallel, report the rest as dropped
   │     executeBatch(state, calls) — runOne() per call (parallel up to MaxParallel)
   │     append combined results to messages, continue
   │
@@ -312,7 +336,13 @@ if MaxSteps exceeded:
 
 All registered skills (weather, dns_lookup, shell_command, etc.) are listed
 directly from the in-process `skills.Registry` on each run, so hot-registered
-skills (via `skill_creator`) appear immediately without a restart.
+skills (via `skill_creator`) appear immediately without a restart.  The list is
+name-sorted, which keeps the system prompt byte-identical between runs — see
+§3.5.
+
+`vector_add` and `vector_search` are agent-loop tools, not registry skills, so
+they are not exposed via `/api/skills`, the playground, or `/api/…/replay`
+(which only accepts `kind=skill` rows).  `/api/tools` documents them instead.
 
 #### System prompt
 
@@ -358,8 +388,8 @@ accepts a bare array or one embedded in surrounding text.
 | `thinking` | Step number |
 | `tool_call` | Tool name, args, why |
 | `tool_result` | Tool name, result text, elapsed seconds |
-| `final` | Session ID, answer, metadata |
-| `error` | Error message |
+| `final` | Session ID, answer, metadata (`meta.fallback = true` when the answer is a recovery, not a real model answer) |
+| `error` | Error message — the run could not proceed (session creation or LLM transport failure). A model reply the parser cannot use is *not* an error; it arrives as a `final` with `meta.fallback = true` |
 
 The HTTP handler in `httpapi/chat.go` serializes these as SSE:
 ```
@@ -380,12 +410,17 @@ The agent must tolerate malformed LLM output:
    the parser unwraps it.
 4. **normalizeToolCall** — if the LLM puts the tool name in the `type` field
    instead of `tool`, the parser auto-corrects.
-5. On unrecoverable parse failure — the non-streaming `Run` returns a graceful
-   fallback answer (*"I had trouble processing that request. Please try
-   rephrasing."*), whereas `RunStream` emits an `error` event and stops. The two
-   entry points deliberately differ here: streaming does **not** synthesise the
-   fallback answer. When the envelope parses but is not a recognised `type`, the
-   loop falls back to the model's best-effort text via `bestAnswer`.
+5. On unrecoverable parse failure — **both** `Run` and `RunStream` return the
+   same graceful fallback answer (*"I had trouble processing that request. Please
+   try rephrasing."*) with `meta.fallback = true`; streaming delivers it as a
+   normal `final` event carrying the session id, so the client can continue the
+   conversation. `RunStream` used to emit an `error` event instead, which showed
+   the raw parser message (*"model did not return JSON. Got: …"*) in the web UI
+   and Telegram bot for a reply the non-streaming endpoint answered politely.
+   An `error` event now means the run genuinely could not proceed (session
+   creation or LLM transport failure), not that the model phrased itself badly.
+   When the envelope parses but is not a recognised `type`, the loop falls back
+   to the model's best-effort text via `bestAnswer`.
 
 ### 3.4 Memory & history (`internal/memory`)
 
@@ -512,6 +547,14 @@ type Registry struct {
 hot-registration by `skill_creator`).  `list()` and `execute(name, args)`
 hold `mu.RLock` to support concurrent reads during agent loops.
 
+`list()` returns the schemas **sorted by name**. The order is not cosmetic: it
+is rendered in the web UI's skill list and spliced into the agent's system
+prompt, and raw Go map iteration reshuffled both on every call — churning the UI
+between refreshes and rewriting the system prompt on every run, which defeats
+provider-side prompt caching and makes identical queries answer differently.
+`agent.buildSystemPrompt` sorts the merged tool table (and each skill's
+parameter list) for the same reason.
+
 #### Built-in skills (`builtin/`)
 
 22 skills compiled directly into the gateway binary: 21 in `builtin/`, plus
@@ -539,10 +582,16 @@ Key implementation notes:
 
 - **`dns_lookup`** — tries `exec.LookPath("dig")` first for full record-type
   coverage (MX, TXT, CNAME, NS); falls back to Go stdlib (`net.LookupHost`,
-  `net.LookupMX`, etc.).
+  `net.LookupMX`, etc.).  The `domain` argument is validated against
+  `isHostname()` before either path runs: `dig` interprets leading `-` and `@`
+  tokens as its own options (`-f <file>` reads a file, `@host` picks a server),
+  so an unvalidated domain straight from the model could redirect the query.
 
 - **`port_scan`** — bounded concurrency via semaphore channel (100 slots),
   `net.DialTimeout` with configurable timeout; returns sorted open port list.
+  `parsePorts` enforces the 1–65535 range while expanding, so an out-of-range
+  spec such as `1-1000000` is rejected instead of materialising a million-entry
+  slice that the caller then trims back to 1024.
 
 - **`whois_lookup`** — raw TCP port 43 to `whois.iana.org`, parses `refer:`
   line, re-queries the authoritative WHOIS server.
@@ -553,11 +602,31 @@ Key implementation notes:
 - **`shell_command`** — blocked-pattern list, `context.WithTimeout`, captures
   both stdout and stderr.  Disabled by default (`SKILL_SHELL_ENABLED=false`).
 
-- **`qr_generate`** — uses `github.com/skip2/go-qrcode`; `qr.Bitmap()` returns
-  `[][]bool`; module count derived from `len(bitmap)`.
+- **`qr_generate`** — uses `github.com/skip2/go-qrcode` with
+  `DisableBorder = true`, so the reported `modules` (from `len(qr.Bitmap())`) is
+  the symbol size without a quiet zone and the image is exactly
+  `box_size × modules` pixels; `padImage` then adds the `border × box_size`
+  quiet zone by copying the symbol pixels verbatim.  Rendering with the
+  library's built-in border instead made `box_size` only an approximate
+  pixels-per-module figure and reduced `border` to an image-wide scale factor
+  that always left a 4-module quiet zone.  The result reports `image_size_px`
+  alongside `size_bytes` so callers can check both.
 
 - **`skill_creator`** — writes `.md` files to `SKILLS_DIR` and calls
   `reg.register()` directly on the live registry for instant hot-registration.
+  Every action that turns the `name` argument into a path (`create`, `show`,
+  `delete`) validates it with `safeNameChars` first — lowercase letters, digits
+  and underscores, 2–49 chars, starting with a letter — so a name can only ever
+  name a file *inside* `SKILLS_DIR`. `delete` additionally resolves the file's
+  frontmatter `name`, which is the key the registry actually uses and need not
+  match the filename, before unregistering.
+
+- **Loose argument types** — `builtin/helpers.go` (`str`, `intOr`, `floatOr`,
+  `boolOr`) coerces across JSON types on purpose. LLMs quote numbers
+  (`"port": "443"`), unquote strings (`"ports": 443`) and spell booleans as words
+  (`"use_symbols": "yes"`); rejecting the wrong type silently substituted the
+  default instead, so `port_scan` would scan its stock list and `ping_check`
+  would dial port 80 with nothing in the result explaining why.
 
 #### Markdown / pipeline skills (`markdown/`)
 
@@ -579,6 +648,18 @@ for each step:
 `LoadDir(dir)` scans `SKILLS_DIR` for `*.md` files on startup.
 `skill_creator` calls `Load(path)` after writing a new file for immediate
 hot-registration without a restart.
+
+All HTTP requests — single-endpoint and pipeline steps alike — go through one
+`doRequest()` helper.  It exists because endpoints come from markdown
+frontmatter after `{{placeholder}}` substitution and may be anything, including
+an unresolved placeholder: `http.NewRequest` returns a **nil** request together
+with its error for a URL it cannot parse (a space in the host, a malformed
+scheme), and the previous `req, _ :=` call sites then panicked on `req.Header`.
+Inside a parallel tool batch such a panic runs on its own goroutine and takes
+the whole gateway down.  `doRequest` honours the error and the step reports it
+as an ordinary skill error instead.  GET steps send the caller's kwargs as query
+parameters (explicit step `params` win on conflict); POST steps send the
+resolved `body` as JSON with `params` in the query string.
 
 ### 3.6 Scheduler (`internal/scheduler`)
 
@@ -638,8 +719,9 @@ A background goroutine started by the gateway:
 
 ```
 every SchedulerTickSec (default 60s):
+  minutes = every whole minute not yet evaluated, oldest first (see below)
   for each enabled task:
-    if Matches(task.CronExpr, now) AND not already run this minute:
+    if task.CronExpr matches ANY of those minutes AND not already run this minute:
       execute task.Skill with task.Args
       UpdateLastRun(task.ID, result)
       if task.OneShot:
@@ -648,8 +730,25 @@ every SchedulerTickSec (default 60s):
         send result via Telegram Bot API
 ```
 
+**Missed-minute sweep.** Cron matching works on whole minutes, but a 60s ticker
+drifts: fire at `12:00:59.8` and the next fire lands at `12:02:00.1`, so `12:01`
+was never examined and anything scheduled for it was lost — silently, with no
+error anywhere. `Runner.pendingMinutes` therefore records the last minute it
+evaluated and returns every minute since, oldest first; `tick` then asks whether
+a task matches *any* of them. The same mechanism covers a suspended host and a
+tick delayed past a minute by a long-running task.
+
+The sweep is bounded by `maxCatchupMinutes` (60): a machine asleep for a day
+resumes with the last hour checked and logs how many minutes it skipped, rather
+than replaying a day of cron. A task matching several swept minutes still runs
+**once** — the sweep exists to avoid losing a run, not to replay a backlog.
+
 Deduplication: compares `task.LastRunAt` with the current minute boundary to
 avoid double-firing if the tick period is shorter than a minute.
+
+Tasks run **sequentially inside the tick**, so one slow skill delays the rest of
+that tick's tasks; the missed-minute sweep is what stops that delay from turning
+into a lost run.
 
 One-shot tasks are **disabled** rather than deleted after firing, so their
 `last_result` / `run_count` audit trail survives.  When a one-shot task runs
@@ -668,15 +767,19 @@ reminder run also falls back to the JSON error so failures stay visible.
 | `list` | — | `{count: N, tasks: [...]}` |
 | `delete` | `task_id` | `{deleted: true, task_id: N}` |
 | `delete_all` | — | `{deleted_all: true, deleted_count: N}` |
-| `enable` | `task_id` | `{enabled: true}` |
-| `disable` | `task_id` | `{disabled: true}` |
+| `enable` | `task_id` | `{ok: true, task_id: N, enabled: true}` |
+| `disable` | `task_id` | `{ok: true, task_id: N, enabled: false}` |
 
 `delete_all` (aliases `deleteall`, `delete-all`) requires no `task_id` and
 removes every scheduled task — this is what the agent calls for requests like
 "remove all scheduled tasks".
 
-Registered as a **native** Go skill in `cmd/gateway/main.go`, operating
-directly on the `Store` struct — no HTTP round-trip required.
+Registered as a **native** Go skill by `bootstrap.New()` (so the gateway, the
+CLI's local mode and the MCP tool provider all share one registration),
+operating directly on the `Store` struct — no HTTP round-trip required.
+
+`delete`, `enable` and `disable` return `{error: "Task N not found"}` for an
+unknown id rather than reporting success.
 
 ### 3.7 HTTP gateway (`internal/httpapi`)
 
@@ -697,26 +800,26 @@ Built on [go-chi/chi v5](https://github.com/go-chi/chi).
 | `POST` | `/api/query` | `handleQuery` | Synchronous agent query |
 | `POST` | `/api/query/stream` | `handleQueryStream` | SSE agent query |
 | `POST` | `/api/sessions/new` | `handleNewSession` | In-process history store |
-| `GET` | `/api/sessions` | `handleListSessions` | In-process history store |
-| `GET` | `/api/sessions/{sid}/messages` | `handleSessionMessages` | In-process history store |
+| `GET` | `/api/sessions` | `handleListSessions` | In-process history store; `limit` (default 50, non-positive → default) |
+| `GET` | `/api/sessions/{sid}/messages` | `handleSessionMessages` | In-process history store; `limit` (default 200, non-positive → default), `offset` (clamped to ≥0) |
 | `POST` | `/api/memory/add` | `handleMemoryAdd` | In-process vector store |
 | `POST` | `/api/memory/search` | `handleMemorySearch` | In-process vector store |
 | `GET` | `/api/memory` | `handleMemoryList` | List stored memories newest-first; `limit` (default 100, 0=all), `offset` |
 | `GET` | `/api/memory/{id}` | `handleMemoryGet` | Single memory by ID (404 if absent) |
 | `DELETE` | `/api/memory/{id}` | `handleMemoryDelete` | Delete a memory by ID (404 if absent) |
 | `POST` | `/mcp` | `mcp.Server.Handler` | MCP server (JSON-RPC 2.0) exposing skills as tools. Gated by `MCP_SERVER_DISABLED`. |
-| `GET` | `/api/skills` | `handleListSkills` | In-process skill registry |
+| `GET` | `/api/skills` | `handleListSkills` | In-process skill registry, sorted by name |
 | `POST` | `/api/skills/{name}/invoke` | `handleSkillInvoke` | **Skill playground** — direct skill execution, no agent loop. Gated by `PLAYGROUND_DISABLED`. |
 | `GET` | `/api/tools` | `handleListTools` | Built-in tool schemas |
 | `GET` | `/api/invocations` | `handleListInvocations` | Audit log — filter by skill, session, errors; paginated |
 | `GET` | `/api/invocations/{id}` | `handleGetInvocation` | Single audit record |
-| `POST` | `/api/invocations/{id}/replay` | `handleReplayInvocation` | Re-run skill with same args; writes a new `replay` row |
-| `POST` | `/api/scheduler/tasks` | `handleSchedulerCreate` | In-process scheduler store |
+| `POST` | `/api/invocations/{id}/replay` | `handleReplayInvocation` | Re-run skill with same args; writes a new `replay` row. Gated by `PLAYGROUND_DISABLED` and restricted to `kind=skill` rows |
+| `POST` | `/api/scheduler/tasks` | `handleSchedulerCreate` | In-process scheduler store; `cron_expr` validated up front (400 on a malformed expression) |
 | `GET` | `/api/scheduler/tasks` | `handleSchedulerList` | In-process scheduler store |
 | `GET` | `/api/scheduler/tasks/{id}` | `handleSchedulerGet` | In-process scheduler store |
-| `POST` | `/api/scheduler/tasks/{id}/enable` | `handleSchedulerEnable` | In-process scheduler store |
-| `POST` | `/api/scheduler/tasks/{id}/disable` | `handleSchedulerDisable` | In-process scheduler store |
-| `DELETE` | `/api/scheduler/tasks/{id}` | `handleSchedulerDelete` | In-process scheduler store |
+| `POST` | `/api/scheduler/tasks/{id}/enable` | `handleSchedulerEnable` | In-process scheduler store; 404 when the task is gone |
+| `POST` | `/api/scheduler/tasks/{id}/disable` | `handleSchedulerDisable` | In-process scheduler store; 404 when the task is gone |
+| `DELETE` | `/api/scheduler/tasks/{id}` | `handleSchedulerDelete` | In-process scheduler store; 404 when the task is gone |
 
 The gateway router serves `/health`, `/api/*`, and (unless disabled) `/mcp`.
 The gateway binary contains no static-file serving and no UI assets; all
@@ -739,7 +842,7 @@ event: tool_result
 data: {"step":1,"tool":"weather","result":"{...}","elapsed_s":0.34}
 
 event: final
-data: {"session_id":42,"answer":"It's 15°C and cloudy in London.","meta":{"steps":1,"model":"llama3:latest"}}
+data: {"session_id":42,"answer":"It's 15°C and cloudy in London.","meta":{"step_count":1,"model":"llama3:latest"}}
 ```
 
 ### 3.8 Telegram bot (`internal/telegram`)
@@ -1185,7 +1288,7 @@ POST /api/query
 → {
   "session_id": 42,
   "answer": "It's 15°C and cloudy in London.",
-  "meta": {"steps": 1, "model": "llama3:latest", "timings": {...}},
+  "meta": {"step_count": 1, "model": "llama3:latest", "timings": {...}},
   "memories": [...],
   "debug_log": "..."
 }
@@ -1197,13 +1300,28 @@ POST /api/query/stream
 → SSE stream of event: thinking | tool_call | tool_result | final | error
 ```
 
+An `error` event means the run could not proceed at all (session creation or LLM
+transport failure). A model reply the parser cannot make sense of is **not** an
+error: it arrives as a normal `final` event with `meta.fallback = true`, matching
+what `POST /api/query` returns for the same reply.
+
+`max_steps` is clamped to `maxStepsHardLimit` (100); `0` or a negative value
+falls back to `AGENT_MAX_STEPS`.
+
 #### Sessions & history
 
 ```
 POST /api/sessions/new           → {"session_id": 43}
 GET  /api/sessions?limit=50      → {"sessions": [{id, created_at, message_count}]}
-GET  /api/sessions/42/messages   → {"session_id": 42, "messages": [{id, session_id, ts, role, content}]}
+GET  /api/sessions/42/messages?limit=200&offset=0
+                                 → {"session_id": 42, "messages": [{id, session_id, ts, role, content}]}
 ```
+
+Both `limit` parameters are page sizes: a zero, negative or unparseable value
+falls back to the endpoint default (50 sessions, 200 messages) rather than
+reaching SQLite as `LIMIT 0` (empty result) or `LIMIT -1` (no limit at all).
+Note the deliberate difference from `GET /api/memory`, where `limit=0` means
+"every memory" — that endpoint paginates in memory, not in SQL.
 
 #### Vector memory
 
@@ -1329,6 +1447,13 @@ is unreachable at startup is logged and skipped — it never blocks boot. Once
 registered, remote tools are reachable from the agent loop, the scheduler, the
 skill playground, and the gateway's own MCP server.
 
+Because remote tools become ordinary skills, one `mcp.Client` can be driven from
+several goroutines at once — a parallel tool batch calling two tools from the
+same server. Its JSON-RPC request counter and the server-assigned session id are
+therefore mutex-guarded (`takeID`, `getSessionID`, `setSessionID`); previously
+both were read and written unsynchronised, which the race detector flags and
+which could hand two in-flight requests the same JSON-RPC id.
+
 ---
 
 ## 8. Key design decisions
@@ -1402,11 +1527,15 @@ the only path that serves the UI in any deployment.
 
 | Scenario | Behaviour |
 |---|---|
-| LLM returns invalid JSON | Agent parser tries several recovery strategies (embedded-JSON regex, `raw_model_json` unwrap, `normalizeToolCall`); on unrecoverable failure `Run` returns a graceful "please rephrase" fallback answer while `RunStream` emits an `error` event and stops. |
+| LLM returns invalid JSON | Agent parser tries several recovery strategies (embedded-JSON regex, `raw_model_json` unwrap, `normalizeToolCall`); on unrecoverable failure both `Run` and `RunStream` return the same graceful "please rephrase" fallback answer with `meta.fallback = true`. |
 | LLM calls unknown tool | Agent returns an error message listing valid tools; LLM can retry. |
 | Skill execution fails | Executor returns `(nil, err)`; agent loop wraps it as `{error: "..."}` and appends as tool result; LLM can retry or answer. |
 | Embeddings unreachable | `addText` and `searchMemory` return errors surfaced in the agent loop; agent continues without memory injection. |
+| Model emits an unusable URL | Skills honour the `http.NewRequest` error (it returns a **nil** request alongside it) and report it as a skill error. Dereferencing that nil used to panic — fatal for the process when it happened on a parallel batch's goroutine. |
+| Oversized `tool_calls` batch | `capBatch` keeps the first `AGENT_MAX_PARALLEL` calls, executes only those, and tells the model how many it dropped. |
 | Scheduler task fails | Runner captures the error, stores it in `last_result`, optionally notifies via Telegram. |
+| Scheduler tick drifts or the host sleeps | The next tick sweeps every whole minute since the last one it evaluated (bounded to 60), so a cron minute skipped by ticker drift still fires — once, not once per missed minute. |
+| Non-UTF-8 tool output | Truncation helpers trim only a trailing partial rune (and, on the Telegram path, drop stray invalid bytes). Trimming until the whole prefix validated returned an empty string, silently discarding binary-ish results from debug logs, audit previews and `last_result`. |
 | Telegram stream breaks | Bot falls back to synchronous `/api/query` endpoint. |
 | MaxSteps exceeded | Agent returns "could not finish" with partial debug log. |
 | SQLite directory missing | `os.MkdirAll` creates it before opening the database. |
@@ -1415,16 +1544,52 @@ the only path that serves the UI in any deployment.
 
 ---
 
-## 10. Extending the system
+## 10. Testing
+
+`./run_tests.sh` runs the suite locally with `-race`; `make test` runs it in the
+container from `Dockerfile.test` (no race detector — Alpine builds with CGO off).
+Coverage per package is listed in the README.
+
+**No test touches the network.** The seams that make that possible:
+
+| Dependency | How tests replace it |
+|---|---|
+| LLM providers | `httptest` servers; `OpenAIChat.sleep` is injected so the retry backoff is asserted, not waited out |
+| Embeddings | `mockEmbeddings` derives a deterministic vector from the text, so dedup distances are reproducible; `errEmbeddings` covers the backend-down paths |
+| The model, in agent/gateway tests | a scripted `ChatClient` that replays canned envelopes and records the message list it was handed |
+| DuckDuckGo | an injected `http.RoundTripper` on `WebSearchSkill.client` (the URL is hardcoded, so the transport is the seam) |
+| Telegram | `tgbotapi.NewBotAPIWithAPIEndpoint` pointed at an `httptest` server that answers `getMe` and records outgoing messages |
+| Remote MCP servers | an `httptest` JSON-RPC server; one test also serves the single-event SSE variant |
+| SQLite / chromem-go | real stores in `t.TempDir()` — they are pure Go and fast enough to use for real |
+
+Two deliberate exceptions: `weather` and `ip_info` build hardcoded third-party
+URLs with no injection point, so only their argument handling is covered.
+`dns_lookup` and `ping_check` are exercised against `localhost` and a local
+listener respectively.
+
+Things worth testing that are easy to get wrong here, and are covered:
+ordering guarantees (the skill list and system prompt must be byte-stable
+across runs), the UTF-8 truncation helpers, the scheduler's missed-minute
+sweep, `skill_creator`'s hand-written YAML (generated files are loaded back and
+compared), and concurrent access to the MCP client and the bot's session map
+(both are `-race` tests that fail without their mutexes).
+
+---
+
+## 11. Extending the system
 
 ### Adding a new built-in Go skill
 
-1. Create (or add to) a file in `internal/skills/builtin/`, defining a `Skill`
-   struct and an `Executor` function using the local types from `helpers.go`.
-2. Add the skill to the `All()` slice returned by that file (or a new `All()`
-   function if in a new file).
-3. Wire the new `All()` slice in `internal/skills/client.go` where the registry
-   is populated at construction time.
+1. Create (or add to) a file in `internal/skills/builtin/`, exporting two
+   functions: `XSchema() Skill` returning the schema (local types from
+   `helpers.go`), and `X(...) Executor` returning the implementation. Read
+   arguments through `str` / `intOr` / `floatOr` / `boolOr` so the skill tolerates
+   the loose JSON types an LLM emits.
+2. Register it in `registerBuiltins()` in `internal/skills/client.go`:
+   `reg.register(toSkill(builtin.XSchema()), builtin.X(cfg.SkillHTTPTimeout))` —
+   pass whatever slice of `cfg` the executor needs (timeouts, enable flags).
+3. Return `map[string]any{"error": "..."}, nil` for user-facing failures rather
+   than a Go error, so the agent sees the reason and can react to it.
 
 ### Adding a new markdown skill at runtime
 

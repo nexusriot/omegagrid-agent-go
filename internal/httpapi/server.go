@@ -6,6 +6,7 @@ package httpapi
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -105,4 +106,27 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]any{"error": msg})
+}
+
+// queryInt reads a numeric query parameter, falling back to def when it is
+// absent or unparseable. A garbage ?limit= is a client mistake, not a reason to
+// fail the request.
+func queryInt(s string, def int) int {
+	if s == "" {
+		return def
+	}
+	if n, err := strconv.Atoi(s); err == nil {
+		return n
+	}
+	return def
+}
+
+func queryFloat(s string, def float64) float64 {
+	if s == "" {
+		return def
+	}
+	if f, err := strconv.ParseFloat(s, 64); err == nil {
+		return f
+	}
+	return def
 }

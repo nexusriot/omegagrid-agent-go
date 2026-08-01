@@ -32,7 +32,7 @@ func Base64() Executor {
 		case "encode":
 			return map[string]any{"action": "encode", "input": text, "output": base64.StdEncoding.EncodeToString([]byte(text))}, nil
 		case "decode":
-			dec, err := base64.StdEncoding.DecodeString(text)
+			dec, err := decodeBase64Any(text)
 			if err != nil {
 				return map[string]any{"action": "decode", "input": text, "error": err.Error()}, nil
 			}
@@ -41,6 +41,29 @@ func Base64() Executor {
 			return map[string]any{"error": "action must be 'encode' or 'decode'"}, nil
 		}
 	}
+}
+
+// decodeBase64Any accepts all four common base64 spellings: standard and
+// URL-safe alphabets, padded or not. Only padded-standard used to decode, so a
+// URL-safe token (a JWT segment, an API key) came back as an error even though
+// the input was perfectly valid base64.
+func decodeBase64Any(text string) ([]byte, error) {
+	text = strings.TrimSpace(text)
+	encodings := []*base64.Encoding{
+		base64.StdEncoding, base64.URLEncoding,
+		base64.RawStdEncoding, base64.RawURLEncoding,
+	}
+	var firstErr error
+	for _, enc := range encodings {
+		dec, err := enc.DecodeString(text)
+		if err == nil {
+			return dec, nil
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	return nil, firstErr
 }
 
 func HashSchema() Skill {

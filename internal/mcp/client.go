@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -17,24 +18,27 @@ import (
 // proxies tools/call. Responses are accepted as either application/json or
 // text/event-stream (single-event SSE), covering the common server variants.
 type Client struct {
-	Name string // local namespace for the server's tools
-
 	url     string
 	headers map[string]string
 	http    *http.Client
 
+	// Remote MCP tools are registered as ordinary skills, so a parallel tool
+	// batch can drive one Client from several goroutines at once. mu guards the
+	// request counter and the server-assigned session id, which were previously
+	// read and written unsynchronised (duplicate JSON-RPC ids, torn session id).
+	mu        sync.Mutex
 	sessionID string
 	nextID    int
 }
 
 // NewClient builds an MCP client for url. headers are sent on every request
-// (e.g. an Authorization bearer token).
-func NewClient(name, url string, headers map[string]string, timeout time.Duration) *Client {
+// (e.g. an Authorization bearer token). The server's local namespace is the
+// caller's business — bootstrap prefixes tool names with it when registering.
+func NewClient(url string, headers map[string]string, timeout time.Duration) *Client {
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
 	return &Client{
-		Name:    name,
 		url:     url,
 		headers: headers,
 		http:    &http.Client{Timeout: timeout},
@@ -124,8 +128,7 @@ func (c *Client) CallTool(ctx context.Context, name string, args map[string]any)
 
 // call sends a JSON-RPC request and returns the raw result payload.
 func (c *Client) call(ctx context.Context, method string, params any) (json.RawMessage, error) {
-	c.nextID++
-	idBytes, _ := json.Marshal(c.nextID)
+	idBytes, _ := json.Marshal(c.takeID())
 	body := rpcRequest{JSONRPC: "2.0", ID: idBytes, Method: method}
 	if params != nil {
 		pb, _ := json.Marshal(params)
@@ -180,7 +183,7 @@ func (c *Client) post(ctx context.Context, body rpcRequest) (*rpcResponse, error
 	defer resp.Body.Close()
 
 	if sid := resp.Header.Get("Mcp-Session-Id"); sid != "" {
-		c.sessionID = sid
+		c.setSessionID(sid)
 	}
 	if resp.StatusCode >= 400 {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
@@ -201,12 +204,32 @@ func (c *Client) post(ctx context.Context, body rpcRequest) (*rpcResponse, error
 func (c *Client) setHeaders(req *http.Request) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
-	if c.sessionID != "" {
-		req.Header.Set("Mcp-Session-Id", c.sessionID)
+	if sid := c.getSessionID(); sid != "" {
+		req.Header.Set("Mcp-Session-Id", sid)
 	}
 	for k, v := range c.headers {
 		req.Header.Set(k, v)
 	}
+}
+
+// takeID returns the next JSON-RPC request id.
+func (c *Client) takeID() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.nextID++
+	return c.nextID
+}
+
+func (c *Client) getSessionID() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.sessionID
+}
+
+func (c *Client) setSessionID(sid string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sessionID = sid
 }
 
 // readResponseBody extracts the JSON-RPC payload from either a plain JSON

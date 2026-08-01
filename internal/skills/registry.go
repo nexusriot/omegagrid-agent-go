@@ -1,6 +1,9 @@
 package skills
 
-import "sync"
+import (
+	"sort"
+	"sync"
+)
 
 // entry holds a skill schema + its executor.
 type entry struct {
@@ -30,6 +33,9 @@ func (r *Registry) unregister(name string) {
 	delete(r.entries, name)
 }
 
+// list returns every registered schema, sorted by name. The order matters:
+// callers render it in the UI's skill list and splice it into the agent's
+// system prompt, and Go's map iteration reshuffled both on every single call.
 func (r *Registry) list() []Skill {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -37,6 +43,7 @@ func (r *Registry) list() []Skill {
 	for _, e := range r.entries {
 		out = append(out, e.schema)
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
 

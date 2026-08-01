@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -25,7 +26,19 @@ type Runner struct {
 
 	stop chan struct{}
 	wg   sync.WaitGroup
+
+	// lastMinute is the newest minute already evaluated. Ticks only ever look
+	// at whole minutes, and a 60s ticker drifts: fire at :59.8 and the next
+	// fire at :01:00.9 lands two minutes later, so the minute in between was
+	// never examined and everything scheduled for it silently never ran.
+	// Tracking the last minute lets a tick sweep every minute it missed —
+	// which also covers a suspended host or a tick blocked by a slow task.
+	lastMinute time.Time
 }
+
+// maxCatchupMinutes bounds the sweep so a machine that was asleep for a week
+// does not replay a week of cron minutes on the next tick.
+const maxCatchupMinutes = 60
 
 func NewRunner(store *Store, exec SkillExecutor, botToken string, checkInterval time.Duration) *Runner {
 	if checkInterval <= 0 {
@@ -74,13 +87,18 @@ func (r *Runner) tick() {
 		}
 	}()
 	now := time.Now().UTC().Truncate(time.Minute)
+	minutes := r.pendingMinutes(now)
+	r.lastMinute = now
+
 	tasks, err := r.store.ListEnabled()
 	if err != nil {
 		log.Printf("scheduler list failed: %v", err)
 		return
 	}
 	for _, task := range tasks {
-		if !Matches(task.CronExpr, now) {
+		// A task matching several of the swept minutes still runs once: the
+		// sweep exists to not lose a run, not to replay a backlog.
+		if !matchesAny(task.CronExpr, minutes) {
 			continue
 		}
 		// Skip tasks already executed inside this same minute window.
@@ -92,6 +110,33 @@ func (r *Runner) tick() {
 		}
 		r.runTask(task)
 	}
+}
+
+// pendingMinutes returns every minute that still needs evaluating, oldest
+// first: the current one plus any skipped since the previous tick.
+func (r *Runner) pendingMinutes(now time.Time) []time.Time {
+	if r.lastMinute.IsZero() || !r.lastMinute.Before(now) {
+		return []time.Time{now}
+	}
+	gap := int(now.Sub(r.lastMinute) / time.Minute)
+	if gap > maxCatchupMinutes {
+		log.Printf("scheduler: %d minute(s) missed, only the last %d are checked", gap, maxCatchupMinutes)
+		gap = maxCatchupMinutes
+	}
+	out := make([]time.Time, 0, gap)
+	for i := gap - 1; i >= 0; i-- {
+		out = append(out, now.Add(-time.Duration(i)*time.Minute))
+	}
+	return out
+}
+
+func matchesAny(cronExpr string, minutes []time.Time) bool {
+	for _, m := range minutes {
+		if Matches(cronExpr, m) {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *Runner) runTask(t *Task) {
@@ -155,17 +200,23 @@ func reminderMessage(t *Task, execErr error, res any) string {
 	return ""
 }
 
-// truncateUTF8 cuts s to at most n bytes without splitting a multi-byte rune;
-// Telegram rejects messages containing invalid UTF-8.
+// truncateUTF8 cuts s to at most n bytes and returns valid UTF-8; Telegram
+// rejects messages containing invalid UTF-8, and so does SQLite's TEXT type for
+// last_result. Trailing partial runes are trimmed and any stray invalid bytes
+// already present in the payload (binary shell output, say) are dropped —
+// scanning back until the whole prefix validated used to return "", wiping a
+// task's stored result and its notification body.
 func truncateUTF8(s string, n int) string {
-	if len(s) <= n {
+	if n <= 0 {
+		return ""
+	}
+	if len(s) > n {
+		s = s[:n]
+	}
+	if utf8.ValidString(s) {
 		return s
 	}
-	t := s[:n]
-	for len(t) > 0 && !utf8.ValidString(t) {
-		t = t[:len(t)-1]
-	}
-	return t
+	return strings.ToValidUTF8(s, "")
 }
 
 func sendTelegram(token string, chatID int64, text string) {

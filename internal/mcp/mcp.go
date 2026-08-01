@@ -49,8 +49,8 @@ type ToolProvider interface {
 	Call(name string, args map[string]any) (any, error)
 }
 
-// --- JSON-RPC 2.0 envelope ---
-
+// rpcRequest is a JSON-RPC 2.0 request. An absent ID marks a notification,
+// which gets no response.
 type rpcRequest struct {
 	JSONRPC string          `json:"jsonrpc"`
 	ID      json.RawMessage `json:"id,omitempty"`

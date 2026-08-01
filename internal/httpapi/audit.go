@@ -12,13 +12,13 @@ import (
 func (d *Deps) handleListInvocations(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	f := memory.AuditFilter{
-		SessionID:  atoiQ(q.Get("session_id")),
+		SessionID:  queryInt(q.Get("session_id"), 0),
 		Skill:      q.Get("skill"),
-		Since:      atofQ(q.Get("since")),
-		Until:      atofQ(q.Get("until")),
+		Since:      queryFloat(q.Get("since"), 0),
+		Until:      queryFloat(q.Get("until"), 0),
 		OnlyErrors: q.Get("only_errors") == "true" || q.Get("only_errors") == "1",
-		Limit:      atoiQ(q.Get("limit")),
-		Offset:     atoiQ(q.Get("offset")),
+		Limit:      queryInt(q.Get("limit"), 0),
+		Offset:     queryInt(q.Get("offset"), 0),
 	}
 	recs, total, err := d.Memory.ListInvocations(f)
 	if err != nil {
@@ -122,20 +122,4 @@ func (d *Deps) handleReplayInvocation(w http.ResponseWriter, r *http.Request) {
 		"duration_ms":   elapsed.Milliseconds(),
 		"error":         errMsg,
 	})
-}
-
-func atoiQ(s string) int {
-	if s == "" {
-		return 0
-	}
-	n, _ := strconv.Atoi(s)
-	return n
-}
-
-func atofQ(s string) float64 {
-	if s == "" {
-		return 0
-	}
-	f, _ := strconv.ParseFloat(s, 64)
-	return f
 }

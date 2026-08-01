@@ -86,7 +86,13 @@ func (c *AgentClient) Query(text string, chatID int64, sessionID int) (*queryRes
 func (c *AgentClient) QueryStream(text string, chatID int64, sessionID int, out chan<- Event) error {
 	defer close(out)
 	body, _ := json.Marshal(queryRequest{Query: text, SessionID: sessionID, TelegramChatID: chatID})
-	req, _ := http.NewRequest(http.MethodPost, c.baseURL+"/api/query/stream", bytes.NewReader(body))
+	// A malformed GATEWAY_URL makes NewRequest return a nil request together
+	// with its error; setting a header on it panicked instead of reporting the
+	// misconfiguration.
+	req, err := http.NewRequest(http.MethodPost, c.baseURL+"/api/query/stream", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("build stream request: %w", err)
+	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
 

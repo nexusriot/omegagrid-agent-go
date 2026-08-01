@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/net/html"
 )
@@ -200,9 +201,11 @@ func WebScrape(timeoutSec float64) Executor {
 			text = string(raw)
 		}
 		text = strings.TrimSpace(collapseWhitespace(text))
+		// max_chars means characters: byte-slicing a UTF-8 page cut runes in
+		// half, so a Cyrillic or CJK page came back with a mangled tail.
 		truncated := false
-		if len(text) > maxChars {
-			text = text[:maxChars]
+		if utf8.RuneCountInString(text) > maxChars {
+			text = string([]rune(text)[:maxChars])
 			truncated = true
 		}
 		return map[string]any{
@@ -274,7 +277,15 @@ func HttpHealth() Executor {
 		cl := httpClient(timeout)
 
 		start := time.Now()
-		req, _ := http.NewRequest(method, rawURL, nil)
+		// http.NewRequest returns a NIL request together with its error for a
+		// URL it cannot parse (a space in the host, a bad scheme) — exactly the
+		// kind of value an LLM produces. Dereferencing it panicked, and inside a
+		// parallel tool batch that panic runs on its own goroutine and takes the
+		// whole process down.
+		req, err := http.NewRequest(method, rawURL, nil)
+		if err != nil {
+			return map[string]any{"url": rawURL, "ok": false, "error": err.Error(), "response_time_ms": 0}, nil
+		}
 		req.Header.Set("User-Agent", "OmegaGridAgent/1.0")
 		resp, err := cl.Do(req)
 		elapsed := time.Since(start).Milliseconds()

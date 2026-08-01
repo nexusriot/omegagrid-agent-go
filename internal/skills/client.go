@@ -96,13 +96,14 @@ func (c *Client) Register(name, description string, params map[string]Param, exe
 	c.reg.register(Skill{Name: name, Description: description, Parameters: params}, exec)
 }
 
-// toSkill converts a builtin.Skill to the public skills.Skill type.
+// toSkill converts a builtin.Skill to the public skills.Skill type. Body stays
+// empty: only markdown skills carry an instructions block.
 func toSkill(b builtin.Skill) Skill {
 	params := make(map[string]Param, len(b.Parameters))
 	for k, v := range b.Parameters {
 		params[k] = Param{Type: v.Type, Description: v.Description, Required: v.Required}
 	}
-	return Skill{Name: b.Name, Description: b.Description, Parameters: params, Body: b.Body}
+	return Skill{Name: b.Name, Description: b.Description, Parameters: params}
 }
 
 func registerBuiltins(reg *Registry, cfg config.Config) {
@@ -164,6 +165,15 @@ func skillCreatorSchema() Skill {
 	}
 }
 
+func invalidNameMsg(name string) string {
+	return fmt.Sprintf("invalid skill name %q (lowercase + underscores, 2-49 chars, start with letter)", name)
+}
+
+// safeNameChars is what keeps a skill name usable as a bare filename inside
+// SKILLS_DIR. Every action that turns a name into a path must apply it: show
+// and delete used to join the raw argument, so an LLM (or a playground caller)
+// asking for "../../../etc/cron.d/x" read — or removed — files outside the
+// skills directory.
 var safeNameChars = func(name string) bool {
 	if len(name) < 2 || len(name) > 49 {
 		return false
@@ -206,7 +216,7 @@ func scCreate(dir string, reg *Registry, executor markdown.SkillExecutor, args m
 		return map[string]any{"error": "name is required for create"}, nil
 	}
 	if !safeNameChars(name) {
-		return map[string]any{"error": fmt.Sprintf("invalid skill name %q (lowercase + underscores, 2-49 chars, start with letter)", name)}, nil
+		return map[string]any{"error": invalidNameMsg(name)}, nil
 	}
 	desc := strings.TrimSpace(strArg(args, "description"))
 	if desc == "" {
@@ -318,6 +328,9 @@ func scShow(dir string, args map[string]any) (any, error) {
 	if name == "" {
 		return map[string]any{"error": "name is required for show"}, nil
 	}
+	if !safeNameChars(name) {
+		return map[string]any{"error": invalidNameMsg(name)}, nil
+	}
 	fpath := filepath.Join(dir, name+".md")
 	raw, err := os.ReadFile(fpath)
 	if err != nil {
@@ -331,15 +344,28 @@ func scDelete(dir string, reg *Registry, args map[string]any) (any, error) {
 	if name == "" {
 		return map[string]any{"error": "name is required for delete"}, nil
 	}
+	if !safeNameChars(name) {
+		return map[string]any{"error": invalidNameMsg(name)}, nil
+	}
 	fpath := filepath.Join(dir, name+".md")
+	// A hand-written skill file may declare a frontmatter name that differs from
+	// its filename; that declared name is what the registry is keyed by, so
+	// resolve it before unlinking or the skill stays callable after deletion.
+	registered := name
+	if s, err := markdown.Load(fpath); err == nil && s.Schema.Name != "" {
+		registered = s.Schema.Name
+	}
 	if err := os.Remove(fpath); err != nil {
 		if os.IsNotExist(err) {
 			return map[string]any{"error": fmt.Sprintf("skill file not found: %s.md", name)}, nil
 		}
 		return map[string]any{"error": err.Error()}, nil
 	}
-	reg.unregister(name)
-	return map[string]any{"status": "deleted", "skill_name": name}, nil
+	reg.unregister(registered)
+	if registered != name {
+		reg.unregister(name)
+	}
+	return map[string]any{"status": "deleted", "skill_name": registered, "file": fpath}, nil
 }
 
 func strArg(args map[string]any, key string) string {

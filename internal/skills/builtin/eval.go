@@ -401,8 +401,25 @@ func CronSchedule() Executor {
 var monthNames = map[string]int{"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6, "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
 var dowNames = map[string]int{"sun": 0, "mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6}
 
+// parseCronField expands one cron field into the set of values it matches.
+// Values outside [lo,hi] are rejected rather than stored: an out-of-range field
+// such as minute "99" produced a field set that could never match, so the skill
+// answered with an empty next_runs list and no hint that the expression was
+// simply wrong (and scheduling it would create a task that never fires).
 func parseCronField(field string, lo, hi, idx int) (map[int]bool, error) {
 	out := map[int]bool{}
+	// Day-of-week accepts 7 as an alias for Sunday, normalised below.
+	limit := hi
+	if idx == 4 {
+		limit = 7
+	}
+	add := func(v int) error {
+		if v < lo || v > limit {
+			return fmt.Errorf("value %d in field %q is outside %d-%d", v, field, lo, limit)
+		}
+		out[v] = true
+		return nil
+	}
 	for _, part := range strings.Split(field, ",") {
 		part = strings.ToLower(strings.TrimSpace(part))
 		if idx == 3 {
@@ -432,20 +449,27 @@ func parseCronField(field string, lo, hi, idx int) (map[int]bool, error) {
 			}
 		} else if strings.Contains(part, "-") {
 			lr := strings.SplitN(part, "-", 2)
-			a, err1 := strconv.Atoi(lr[0])
-			b, err2 := strconv.Atoi(lr[1])
+			a, err1 := strconv.Atoi(strings.TrimSpace(lr[0]))
+			b, err2 := strconv.Atoi(strings.TrimSpace(lr[1]))
 			if err1 != nil || err2 != nil {
 				return nil, fmt.Errorf("invalid range in %q", field)
 			}
+			if a > b {
+				return nil, fmt.Errorf("descending range in %q", field)
+			}
 			for i := a; i <= b; i += step {
-				out[i] = true
+				if err := add(i); err != nil {
+					return nil, err
+				}
 			}
 		} else {
 			n, err := strconv.Atoi(part)
 			if err != nil {
 				return nil, fmt.Errorf("invalid value %q in field", part)
 			}
-			out[n] = true
+			if err := add(n); err != nil {
+				return nil, err
+			}
 		}
 	}
 	if idx == 4 && out[7] {

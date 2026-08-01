@@ -17,8 +17,7 @@ func (d *Deps) handleNewSession(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (d *Deps) handleListSessions(w http.ResponseWriter, r *http.Request) {
-	limit := atoiOr(r.URL.Query().Get("limit"), 50)
-	sessions, err := d.Memory.ListSessions(limit)
+	sessions, err := d.Memory.ListSessions(pageSize(r.URL.Query().Get("limit"), 50))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -32,8 +31,9 @@ func (d *Deps) handleSessionMessages(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid session id")
 		return
 	}
-	limit := atoiOr(r.URL.Query().Get("limit"), 200)
-	offset := atoiOr(r.URL.Query().Get("offset"), 0)
+	limit := pageSize(r.URL.Query().Get("limit"), 200)
+	offset := max(queryInt(r.URL.Query().Get("offset"), 0), 0)
+
 	msgs, err := d.Memory.ListMessages(sid, limit, offset)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -42,11 +42,13 @@ func (d *Deps) handleSessionMessages(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"session_id": sid, "messages": msgs})
 }
 
-func atoiOr(s string, def int) int {
-	if s == "" {
-		return def
-	}
-	if n, err := strconv.Atoi(s); err == nil {
+// pageSize reads a limit that reaches SQLite as a LIMIT clause, where a
+// non-positive value would misbehave: ?limit=0 becomes "LIMIT 0" and returns an
+// empty list, ?limit=-1 becomes "no limit at all". Neither is what a caller
+// asking for zero or a negative page means. Note that /api/memory deliberately
+// differs — it paginates in memory, so limit=0 there means "everything".
+func pageSize(s string, def int) int {
+	if n := queryInt(s, def); n > 0 {
 		return n
 	}
 	return def

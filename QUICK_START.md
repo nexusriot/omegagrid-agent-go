@@ -178,8 +178,8 @@ export OMEGA_REMOTE=http://localhost:8000
 | `mkdir /app/data/chromem: permission denied` | Docker auto-created `./data/` as `root` because you skipped step 3 | `docker compose down && sudo chown -R $(id -u):$(id -g) data/ && docker compose up -d` |
 | `nginx: host not found in upstream "gateway"` | Cascade — the `gateway` container crashed (see its logs) | Fix the gateway error (almost always the `./data/` permission issue above), then `docker compose up -d` again |
 | `/health` shows `embed: ...` error | Embed model not pulled / wrong API key | `ollama pull nomic-embed-text` or check `*_API_KEY` and `*_EMBED_MODEL` in `.env` |
-| Bot starts but ignores every message | `BOT_AUTH_ENABLED=true` and you're not the admin | Set the correct `BOT_ADMIN_ID`, or have the admin message the bot and run `/auth add <user_id>` |
-| Chat returns JSON-parse errors | Local model too small to emit clean JSON | Switch to a stronger model (`llama3:70b`, `gpt-4o-mini`, `Llama-3.3-70B-Instruct`) |
+| Bot starts but ignores every message | `BOT_AUTH_ENABLED=true` and you're not the admin | Set the correct `BOT_ADMIN_ID`, or have the admin message the bot and run `/auth_add <telegram_id>` (`/auth_list` shows the allowlist) |
+| Every answer is *"I had trouble processing that request. Please try rephrasing."* | Local model too small to emit the clean JSON envelope the agent requires (the reply is reported as `meta.fallback: true`) | Switch to a stronger model (`llama3:70b`, `gpt-4o-mini`, `Llama-3.3-70B-Instruct`) |
 | Port 80 already in use | Another service occupies the port | Set `FRONTEND_PORT=8080` in `.env`, then `docker compose up -d --force-recreate frontend` |
 | `DIGITALOCEAN_API_KEY required` on startup | `LLM_PROVIDER=digitalocean` without a key | Add `DIGITALOCEAN_API_KEY=...` to `.env` |
 

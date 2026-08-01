@@ -4,10 +4,28 @@ import (
 	"bytes"
 	"encoding/base64"
 	"fmt"
+	"image"
+	"image/color"
+	"image/draw"
 	"image/png"
+	"strings"
 
 	qrcode "github.com/skip2/go-qrcode"
 )
+
+// padImage surrounds src with a white quiet zone of pad pixels on every side.
+// The symbol pixels are copied verbatim, so module rendering (and therefore
+// scannability) stays exactly as go-qrcode produced it.
+func padImage(src image.Image, pad int) image.Image {
+	if pad <= 0 {
+		return src
+	}
+	b := src.Bounds()
+	out := image.NewRGBA(image.Rect(0, 0, b.Dx()+2*pad, b.Dy()+2*pad))
+	draw.Draw(out, out.Bounds(), &image.Uniform{color.White}, image.Point{}, draw.Src)
+	draw.Draw(out, image.Rect(pad, pad, pad+b.Dx(), pad+b.Dy()), src, b.Min, draw.Src)
+	return out
+}
 
 func QrGenerateSchema() Skill {
 	return Skill{Name: "qr_generate", Description: "Generate a QR code image (returned as base64 PNG).",
@@ -32,7 +50,9 @@ func QrGenerate() Executor {
 		levelMap := map[string]qrcode.RecoveryLevel{
 			"L": qrcode.Low, "M": qrcode.Medium, "Q": qrcode.High, "H": qrcode.Highest,
 		}
-		levelKey := str(args, "error_correction")
+		// Case-insensitive: "l"/"m"/"q"/"h" are at least as likely from an LLM
+		// as the documented upper-case spellings, and used to be rejected.
+		levelKey := strings.ToUpper(strings.TrimSpace(str(args, "error_correction")))
 		if levelKey == "" {
 			levelKey = "M"
 		}
@@ -60,11 +80,17 @@ func QrGenerate() Executor {
 		if err != nil {
 			return map[string]any{"error": err.Error()}, nil
 		}
-		qr.DisableBorder = false
+		// Render the symbol without go-qrcode's fixed 4-module quiet zone and
+		// add our own, so box_size and border mean what the schema says.
+		// Previously the size argument was boxSize*(modules+2*border) against a
+		// bitmap that already included the quiet zone, which made box_size only
+		// approximately the pixels-per-module and left `border` doing nothing but
+		// scaling the whole image — a 4-module border no matter what was asked.
+		qr.DisableBorder = true
 
-		bitmap := qr.Bitmap()
-		modules := len(bitmap)
-		img := qr.Image(boxSize * (modules + border*2))
+		modules := len(qr.Bitmap())
+		img := padImage(qr.Image(boxSize*modules), border*boxSize)
+
 		var buf bytes.Buffer
 		if err := png.Encode(&buf, img); err != nil {
 			return map[string]any{"error": err.Error()}, nil
@@ -77,7 +103,8 @@ func QrGenerate() Executor {
 			"error_correction": levelKey,
 			"box_size":         boxSize,
 			"border":           border,
-			"modules":          modules,
+			"modules":          modules, // symbol modules per side, quiet zone excluded
+			"image_size_px":    img.Bounds().Dx(),
 			"image_format":     "png",
 			"image_base64":     b64,
 			"data_uri":         "data:image/png;base64," + b64,

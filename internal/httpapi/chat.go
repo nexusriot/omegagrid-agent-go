@@ -20,12 +20,24 @@ type queryRequest struct {
 	TelegramChatID *int64 `json:"telegram_chat_id,omitempty"`
 }
 
-const maxStepsHardLimit = 100
+const (
+	maxStepsHardLimit = 100
+
+	// maxStepsFloor guards against a non-positive configured default. The agent
+	// loop is `for step := 1; step <= MaxSteps`, so a zero would skip the loop
+	// body entirely and every single query would come back with "I could not
+	// finish within max_steps" — a config typo (AGENT_MAX_STEPS=0) that looks
+	// like a broken model.
+	maxStepsFloor = 1
+)
 
 func (req queryRequest) toAgentReq(defaultMaxSteps int) agent.RunRequest {
 	maxSteps := req.MaxSteps
 	if maxSteps <= 0 {
 		maxSteps = defaultMaxSteps
+	}
+	if maxSteps <= 0 {
+		maxSteps = maxStepsFloor
 	}
 	if maxSteps > maxStepsHardLimit {
 		maxSteps = maxStepsHardLimit

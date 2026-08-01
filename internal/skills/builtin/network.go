@@ -25,6 +25,9 @@ func DnsLookup() Executor {
 		if domain == "" {
 			return map[string]any{"error": "domain is required"}, nil
 		}
+		if !isHostname(domain) {
+			return map[string]any{"error": fmt.Sprintf("invalid domain: %q", domain)}, nil
+		}
 		rtype := strings.ToUpper(str(args, "record_type"))
 		if rtype == "" {
 			rtype = "A"
@@ -33,7 +36,10 @@ func DnsLookup() Executor {
 		var records []string
 		var method string
 
-		// Try dig first; fall back to stdlib
+		// Try dig first; fall back to stdlib. The isHostname guard above is what
+		// makes passing `domain` as an argv entry safe: dig reads leading "-"/"@"
+		// tokens as its own options (`-f <file>`, `@<server>`), so an unvalidated
+		// domain from the model could redirect the query or read a local file.
 		if digPath, err := exec.LookPath("dig"); err == nil {
 			out, err := exec.Command(digPath, "+short", "+time=5", domain, rtype).Output()
 			if err == nil {
@@ -96,6 +102,35 @@ func DnsLookup() Executor {
 	}
 }
 
+// isHostname reports whether s is a plausible DNS name or IP literal: labels of
+// letters, digits and hyphens, no leading dash, nothing shell- or argv-special.
+func isHostname(s string) bool {
+	if s == "" || len(s) > 253 {
+		return false
+	}
+	s = strings.TrimSuffix(s, ".")
+	if net.ParseIP(s) != nil {
+		return true
+	}
+	for _, label := range strings.Split(s, ".") {
+		if label == "" || len(label) > 63 {
+			return false
+		}
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			ok := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+				(c >= '0' && c <= '9') || c == '-' || c == '_'
+			if !ok {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func PingCheckSchema() Skill {
 	return Skill{Name: "ping_check", Description: "Check if a host is reachable (TCP connect).",
 		Parameters: map[string]Param{
@@ -119,6 +154,9 @@ func PingCheck() Executor {
 		dnsMs := time.Since(t0).Milliseconds()
 		if err != nil {
 			return map[string]any{"host": host, "reachable": false, "error": err.Error(), "dns_ms": dnsMs}, nil
+		}
+		if len(addrs) == 0 {
+			return map[string]any{"host": host, "reachable": false, "error": "no addresses returned for host", "dns_ms": dnsMs}, nil
 		}
 		resolvedIP := addrs[0]
 
@@ -195,7 +233,6 @@ func PortScan() Executor {
 		}
 		wg.Wait()
 
-		// sort open ports
 		sortInts(open)
 		return map[string]any{
 			"host":          host,
@@ -207,16 +244,27 @@ func PortScan() Executor {
 	}
 }
 
+// parsePorts expands a ports specification into individual port numbers.
+// Bounds are enforced while parsing: an out-of-range range such as "1-1000000"
+// used to expand into a million-element slice before the caller trimmed it back
+// to 1024, and negative or zero ports produced dial addresses that could never
+// connect.
 func parsePorts(s string) ([]int, error) {
+	const minPort, maxPort = 1, 65535
+	inRange := func(p int) bool { return p >= minPort && p <= maxPort }
+
 	var out []int
 	for _, part := range strings.Split(s, ",") {
 		part = strings.TrimSpace(part)
 		if strings.Contains(part, "-") {
 			lr := strings.SplitN(part, "-", 2)
-			lo, err1 := strconv.Atoi(lr[0])
-			hi, err2 := strconv.Atoi(lr[1])
+			lo, err1 := strconv.Atoi(strings.TrimSpace(lr[0]))
+			hi, err2 := strconv.Atoi(strings.TrimSpace(lr[1]))
 			if err1 != nil || err2 != nil || lo > hi {
 				return nil, fmt.Errorf("invalid port range: %s", part)
+			}
+			if !inRange(lo) || !inRange(hi) {
+				return nil, fmt.Errorf("port range %s outside %d-%d", part, minPort, maxPort)
 			}
 			for p := lo; p <= hi; p++ {
 				out = append(out, p)
@@ -225,6 +273,9 @@ func parsePorts(s string) ([]int, error) {
 			p, err := strconv.Atoi(part)
 			if err != nil {
 				return nil, fmt.Errorf("invalid port: %s", part)
+			}
+			if !inRange(p) {
+				return nil, fmt.Errorf("port %d outside %d-%d", p, minPort, maxPort)
 			}
 			out = append(out, p)
 		}

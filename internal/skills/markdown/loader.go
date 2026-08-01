@@ -77,25 +77,11 @@ func (s *Skill) Execute(args map[string]any, executor SkillExecutor) (any, error
 
 func (s *Skill) execSingle(args map[string]any) (any, error) {
 	cl := &http.Client{Timeout: time.Duration(s.timeout * float64(time.Second))}
-	hdrs := http.Header{"User-Agent": {"OmegaGridAgent/1.0"}}
-	var resp *http.Response
-	var err error
-	if strings.ToUpper(s.method) == "POST" {
-		hdrs.Set("Content-Type", "application/json")
-		b, _ := json.Marshal(args)
-		req, _ := http.NewRequest(http.MethodPost, s.endpoint, strings.NewReader(string(b)))
-		req.Header = hdrs
-		resp, err = cl.Do(req)
-	} else {
-		req, _ := http.NewRequest(http.MethodGet, s.endpoint, nil)
-		req.Header = hdrs
-		q := req.URL.Query()
-		for k, v := range args {
-			q.Set(k, fmt.Sprintf("%v", v))
-		}
-		req.URL.RawQuery = q.Encode()
-		resp, err = cl.Do(req)
+	var query map[string]any
+	if strings.ToUpper(s.method) != "POST" {
+		query = args
 	}
+	resp, err := doRequest(cl, s.method, s.endpoint, nil, query, args)
 	if err != nil {
 		return map[string]any{"error": err.Error()}, nil
 	}
@@ -106,6 +92,49 @@ func (s *Skill) execSingle(args map[string]any) (any, error) {
 		body = string(raw[:min(4000, len(raw))])
 	}
 	return map[string]any{"status_code": resp.StatusCode, "body": body}, nil
+}
+
+// doRequest builds and sends one skill HTTP request. method selects GET/POST,
+// query is added as URL parameters and body is JSON-encoded for POST.
+//
+// The error from http.NewRequest is honoured here: it returns a NIL request
+// alongside the error for a URL it cannot parse, and skill endpoints come from
+// markdown files whose {{placeholders}} may resolve to anything (or stay
+// unresolved). The old `req, _ :=` sites panicked on those.
+func doRequest(cl *http.Client, method, endpoint string, headers map[string]any, query, body map[string]any) (*http.Response, error) {
+	hdrs := http.Header{"User-Agent": {"OmegaGridAgent/1.0"}}
+	for k, v := range headers {
+		hdrs.Set(k, fmt.Sprintf("%v", v))
+	}
+
+	var reader io.Reader
+	post := strings.ToUpper(method) == "POST"
+	if post {
+		hdrs.Set("Content-Type", "application/json")
+		b, err := json.Marshal(body)
+		if err != nil {
+			return nil, fmt.Errorf("encode request body: %w", err)
+		}
+		reader = strings.NewReader(string(b))
+	}
+
+	verb := http.MethodGet
+	if post {
+		verb = http.MethodPost
+	}
+	req, err := http.NewRequest(verb, endpoint, reader)
+	if err != nil {
+		return nil, err
+	}
+	req.Header = hdrs
+	if len(query) > 0 {
+		q := req.URL.Query()
+		for k, v := range query {
+			q.Set(k, fmt.Sprintf("%v", v))
+		}
+		req.URL.RawQuery = q.Encode()
+	}
+	return cl.Do(req)
 }
 
 func (s *Skill) execPipeline(kwargs map[string]any, executor SkillExecutor) (any, error) {
@@ -143,54 +172,30 @@ func (s *Skill) execPipeline(kwargs map[string]any, executor SkillExecutor) (any
 		}
 		resolvedParams := resolveObj(st.Params, kwargs, ctx).(map[string]any)
 		resolvedBody := resolveObj(st.Body, kwargs, ctx).(map[string]any)
-		hdrs := http.Header{"User-Agent": {"OmegaGridAgent/1.0"}}
-		for k, v := range st.Headers {
-			hdrs.Set(k, fmt.Sprintf("%v", v))
+		// GET steps also inherit the skill's own kwargs as query parameters;
+		// explicit step params win on conflict.
+		query := resolvedParams
+		if method != "POST" {
+			query = make(map[string]any, len(kwargs)+len(resolvedParams))
+			for k, v := range kwargs {
+				query[k] = v
+			}
+			for k, v := range resolvedParams {
+				query[k] = v
+			}
 		}
+
 		var parsed any
 		var statusCode int
-		if method == "POST" {
-			hdrs.Set("Content-Type", "application/json")
-			b, _ := json.Marshal(resolvedBody)
-			req, _ := http.NewRequest(http.MethodPost, endpoint, strings.NewReader(string(b)))
-			req.Header = hdrs
-			q := req.URL.Query()
-			for k, v := range resolvedParams {
-				q.Set(k, fmt.Sprintf("%v", v))
-			}
-			req.URL.RawQuery = q.Encode()
-			resp, err := cl.Do(req)
-			if err != nil {
-				parsed = map[string]any{"error": err.Error()}
-			} else {
-				statusCode = resp.StatusCode
-				raw, _ := io.ReadAll(resp.Body)
-				resp.Body.Close()
-				if jerr := json.Unmarshal(raw, &parsed); jerr != nil {
-					parsed = string(raw[:min(4000, len(raw))])
-				}
-			}
+		resp, err := doRequest(cl, method, endpoint, st.Headers, query, resolvedBody)
+		if err != nil {
+			parsed = map[string]any{"error": err.Error()}
 		} else {
-			req, _ := http.NewRequest(http.MethodGet, endpoint, nil)
-			req.Header = hdrs
-			q := req.URL.Query()
-			for k, v := range kwargs {
-				q.Set(k, fmt.Sprintf("%v", v))
-			}
-			for k, v := range resolvedParams {
-				q.Set(k, fmt.Sprintf("%v", v))
-			}
-			req.URL.RawQuery = q.Encode()
-			resp, err := cl.Do(req)
-			if err != nil {
-				parsed = map[string]any{"error": err.Error()}
-			} else {
-				statusCode = resp.StatusCode
-				raw, _ := io.ReadAll(resp.Body)
-				resp.Body.Close()
-				if jerr := json.Unmarshal(raw, &parsed); jerr != nil {
-					parsed = string(raw[:min(4000, len(raw))])
-				}
+			statusCode = resp.StatusCode
+			raw, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if jerr := json.Unmarshal(raw, &parsed); jerr != nil {
+				parsed = string(raw[:min(4000, len(raw))])
 			}
 		}
 		ctx[name] = parsed

@@ -22,6 +22,10 @@ type OpenAIChat struct {
 	reasoning   string
 	temperature *float64 // nil omits temperature from chat_completions requests
 	client      *http.Client
+
+	// sleep is the retry backoff, injectable so tests can assert the schedule
+	// without actually waiting seconds for it.
+	sleep func(time.Duration)
 }
 
 func NewOpenAIChat(apiKey, baseURL, model, mode, reasoning string, temperature *float64, timeoutSec float64) *OpenAIChat {
@@ -36,6 +40,7 @@ func NewOpenAIChat(apiKey, baseURL, model, mode, reasoning string, temperature *
 		reasoning:   reasoning,
 		temperature: temperature,
 		client:      &http.Client{Timeout: time.Duration(timeoutSec * float64(time.Second))},
+		sleep:       time.Sleep,
 	}
 }
 
@@ -65,6 +70,16 @@ func (o *OpenAIChat) mapMessages(messages []Message) []map[string]string {
 	return out
 }
 
+// sleepFor waits out the retry backoff, tolerating a zero-valued client built
+// without NewOpenAIChat.
+func (o *OpenAIChat) sleepFor(d time.Duration) {
+	if o.sleep != nil {
+		o.sleep(d)
+		return
+	}
+	time.Sleep(d)
+}
+
 func (o *OpenAIChat) authHeaders(req *http.Request) {
 	req.Header.Set("Authorization", "Bearer "+o.apiKey)
 	req.Header.Set("Content-Type", "application/json")
@@ -79,7 +94,7 @@ func (o *OpenAIChat) postWithRetry(url string, body []byte) (*http.Response, err
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
-			time.Sleep(time.Duration(1<<(attempt-1)) * 2 * time.Second) // 2s, 4s
+			o.sleepFor(time.Duration(1<<(attempt-1)) * 2 * time.Second) // 2s, 4s
 		}
 		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
 		if err != nil {

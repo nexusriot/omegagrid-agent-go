@@ -197,6 +197,43 @@ make test         # run the Go test suite inside a Docker container (Dockerfile.
 make vector-migrate   # ChromaDB → chromem-go migration (see below)
 ```
 
+### Tests
+
+`make test` needs only Docker. With a local Go toolchain, drive the same suite
+directly — this is the faster loop and the only way to get the race detector,
+which the Alpine container build cannot run:
+
+```bash
+./run_tests.sh              # local, with -race (default)
+./run_tests.sh --no-race    # local, faster
+./run_tests.sh --docker     # what `make test` runs
+```
+
+Coverage, by package:
+
+| Package | Coverage | Notes |
+|---|---|---|
+| `internal/config` | 100% | |
+| `internal/observability` | 100% | |
+| `internal/search` | 95% | DuckDuckGo HTML parsing driven through a fake `http.RoundTripper` |
+| `internal/llm` | 94% | both providers against `httptest`, including the retry schedule |
+| `internal/skills` | 93% | `skill_creator` YAML output is loaded back and compared |
+| `internal/mcp` | 90% | JSON and single-event SSE transports, both directions |
+| `internal/bootstrap` | 89% | `New()` wires real stores against a temp dir |
+| `internal/skills/markdown` | 86% | |
+| `internal/telegram` | 85% | handlers run against a fake Telegram API (`NewBotAPIWithAPIEndpoint`) |
+| `internal/skills/builtin` | 83% | everything except the skills hardcoded to third-party URLs |
+| `internal/memory` | 82% | vector store uses a deterministic fake embeddings client |
+| `internal/scheduler` | 79% | |
+| `internal/agent` | 78% | the loop is driven end-to-end with a scripted model |
+| `internal/httpapi` | 73% | router-level, real stores, scripted model |
+| `cmd/cli` | 19% | the HTTP/parsing helpers; the `flag`-parsing subcommands call `os.Exit` |
+| `cmd/gateway`, `cmd/telegram-bot`, `cmd/migrate-vector` | 0% | `main()` wrappers over `internal/` |
+
+No test reaches the network: outbound calls go to `httptest` servers, injected
+transports, or local listeners. `weather` and `ip_info` are the exception — their
+endpoints are hardcoded, so only their argument handling is covered.
+
 ## CLI (`omega`)
 
 A single static Go binary that exposes the full agent surface — agent queries,
@@ -272,25 +309,25 @@ Everything is compiled into the gateway binary (pure Go, no CGO, distroless runt
 | `weather` | Current weather via Open-Meteo (no API key) |
 | `datetime_skill` | Current UTC date and time |
 | `http_request` | Arbitrary HTTP GET / POST |
-| `web_scrape` | Fetch URL and extract readable text |
+| `web_scrape` | Fetch URL and extract readable text (`max_chars` counts characters, not bytes) |
 | `http_health` | HTTP endpoint health check with timing |
 | `ip_info` | Geolocation for an IP via ip-api.com (free tier — plain HTTP by design) |
-| `dns_lookup` | A / AAAA / MX / TXT / CNAME / NS lookup (`dig` + stdlib fallback) |
+| `dns_lookup` | A / AAAA / MX / TXT / CNAME / NS lookup (`dig` + stdlib fallback; the domain is validated so it cannot smuggle `dig` options) |
 | `ping_check` | TCP connect reachability check |
-| `port_scan` | Concurrent TCP port scanner (up to 1024 ports) |
+| `port_scan` | Concurrent TCP port scanner (up to 1024 ports, each within 1–65535) |
 | `whois_lookup` | WHOIS via raw TCP (IANA → authoritative server) |
-| `base64_skill` | Encode / decode Base64 |
+| `base64_skill` | Encode / decode Base64 (decoding accepts standard and URL-safe alphabets, padded or not) |
 | `hash_skill` | MD5 / SHA1 / SHA256 / SHA512 |
 | `uuid_gen` | UUID v1 / v3 / v4 / v5 |
 | `password_gen` | Cryptographically secure password generator |
 | `cidr_calc` | CIDR network details + IP membership check |
 | `math_eval` | Safe expression evaluator (custom AST parser, no `eval`) |
-| `cron_schedule` | Parse cron expression, explain it, show next N run times |
+| `cron_schedule` | Parse cron expression, explain it, show next N run times. Out-of-range fields are rejected rather than yielding an empty run list |
 | `reminder` | Echo a message back; used by one-shot scheduled tasks to deliver reminders at a set time |
 | `shell_command` | Local shell (requires `SKILL_SHELL_ENABLED=true`) |
 | `ssh_command` | Remote SSH command (requires `SKILL_SSH_ENABLED=true`) |
-| `qr_generate` | QR code as base64 PNG |
-| `skill_creator` | Hot-register new skills from YAML + Markdown at runtime |
+| `qr_generate` | QR code as base64 PNG. `error_correction` is case-insensitive; `box_size` is the exact pixels per module and `border` the exact quiet-zone width in modules |
+| `skill_creator` | Hot-register new skills from YAML + Markdown at runtime. Skill names are validated on every action, so they always resolve inside `SKILLS_DIR` |
 
 **Native agent skills (registered directly into the agent's tool table):**
 
@@ -432,6 +469,7 @@ you customised `AGENT_VECTOR_DIR` in `.env`, point it at `data/chromem`.
 | `OPENAI_EMBED_MODEL` | `text-embedding-3-small` | OpenAI embeddings model (for vector memory) |
 | `OPENAI_API_MODE` | auto | `chat_completions` \| `responses` (auto-selected for codex models) |
 | `OPENAI_REASONING_EFFORT` | — | Reasoning effort for the `responses` API (omitted from requests when unset) |
+| `OPENAI_TEMPERATURE` | `0.2` | Sampling temperature for the `chat_completions` path (also used by the `digitalocean` provider). Set to `none` (or `omit` / `off`) to leave temperature out of the request entirely — reasoning models such as the o-series and gpt-5 family reject any non-default value |
 | `OPENAI_TIMEOUT` | `120` | OpenAI request timeout (seconds) |
 | `DIGITALOCEAN_API_KEY` | — | Required for `digitalocean` provider (model access key or DO personal access token) |
 | `DIGITALOCEAN_BASE_URL` | `https://inference.do-ai.run/v1` | DigitalOcean Serverless Inference base URL |
@@ -446,7 +484,7 @@ you customised `AGENT_VECTOR_DIR` in `.env`, point it at `data/chromem`.
 | `AGENT_MEMORY_HITS` | `5` | Vector memory results injected into context |
 | `AGENT_MAX_STEPS` | `25` | Maximum tool-call steps per agent run |
 | `AGENT_PARALLEL_TOOLS` | `false` | Allow the LLM to emit `tool_calls` batches that execute concurrently |
-| `AGENT_MAX_PARALLEL` | `4` | Max concurrent tool executions per batch when `AGENT_PARALLEL_TOOLS=true` |
+| `AGENT_MAX_PARALLEL` | `4` | Max tool calls per `tool_calls` batch when `AGENT_PARALLEL_TOOLS=true` — both the concurrency limit and the batch-size cap. Extra calls in an oversized batch are dropped before execution and the model is told to re-issue them |
 | `AUTO_MEMORY_EXTRACT` | `false` | After each final answer, run a background LLM pass that distils the turn into durable facts and stores them in vector memory (tagged `source=auto-extract`). Existing SHA256 + cosine dedup applies |
 | `AUTO_MEMORY_MAX_FACTS` | `5` | Maximum facts stored per turn by auto-extraction |
 | `AUTO_MEMORY_MIN_ANSWER_LEN` | `80` | Skip auto-extraction when the final answer is shorter than this many characters |
@@ -460,7 +498,7 @@ you customised `AGENT_VECTOR_DIR` in `.env`, point it at `data/chromem`.
 | `SKILL_SSH_DEFAULT_USER` | `root` | Default SSH username |
 | `SKILL_SSH_PRIVATE_KEY` | — | PEM or base64-encoded PEM private key (alternative to identity file) |
 | `SCHEDULER_DB` | `{DATA_DIR}/scheduler.sqlite3` | Scheduler database path |
-| `SCHEDULER_TICK_SEC` | `60` | Scheduler poll interval (seconds) |
+| `SCHEDULER_TICK_SEC` | `60` | Scheduler poll interval (seconds). Each tick also sweeps any whole minutes skipped since the previous one (up to 60), so ticker drift or a suspended host does not lose a scheduled run |
 | `TELEGRAM_BOT_TOKEN` | — | Telegram bot token |
 | `BOT_AUTH_ENABLED` | `false` | Enable Telegram user allowlist |
 | `BOT_ADMIN_ID` | `0` | Telegram user ID of the admin |

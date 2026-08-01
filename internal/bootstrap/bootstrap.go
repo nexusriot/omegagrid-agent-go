@@ -259,7 +259,7 @@ func connectMCPServers(cfg config.Config, sk *skills.Client) {
 			log.Printf("mcp client: skipping %q: %v", entry, err)
 			continue
 		}
-		client := mcp.NewClient(name, url, headers, 30*time.Second)
+		client := mcp.NewClient(url, headers, 30*time.Second)
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		if err := client.Initialize(ctx); err != nil {
 			cancel()

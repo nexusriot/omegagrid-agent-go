@@ -87,9 +87,6 @@ export const fetchInvocations = (f: InvocationFilter = {}) => {
   return json<InvocationListResult>(`/api/invocations${qs ? '?' + qs : ''}`)
 }
 
-export const fetchInvocation = (id: number) =>
-  json<Invocation>(`/api/invocations/${id}`)
-
 export const replayInvocation = (id: number) =>
   json<ReplayResult>(`/api/invocations/${id}/replay`, { method: 'POST' })
 

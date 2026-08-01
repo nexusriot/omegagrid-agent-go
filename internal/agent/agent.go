@@ -5,10 +5,13 @@
 package agent
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -199,6 +202,10 @@ func (s *Service) Run(req RunRequest) (*RunResult, error) {
 				_ = s.Memory.AddMessage(state.sid, "assistant", answer)
 				return s.fallbackResult(state, answer, step, true), nil
 			}
+			calls, dropped := s.capBatch(calls)
+			if dropped > 0 {
+				state.debug = append(state.debug, fmt.Sprintf("[batch] dropped %d call(s) over the batch limit of %d", dropped, s.maxBatch()))
+			}
 			for i := range calls {
 				calls[i].Step = step
 			}
@@ -222,7 +229,7 @@ func (s *Service) Run(req RunRequest) (*RunResult, error) {
 			state.messages = append(state.messages,
 				llm.Message{Role: "assistant", Content: string(batchJSON)},
 				llm.Message{Role: "tool", Content: string(allJSON)},
-				llm.Message{Role: "user", Content: batchFollowup(results)},
+				llm.Message{Role: "user", Content: batchFollowup(results, dropped)},
 			)
 			continue
 		}
@@ -333,7 +340,21 @@ func (s *Service) RunStream(ctx context.Context, req RunRequest, out chan<- Even
 
 		data, err := parseJSONSafely(raw)
 		if err != nil {
-			send(Event{Event: "error", Error: err.Error()})
+			// Same graceful recovery as Run: a model that emits non-JSON is a
+			// bad reply, not a broken agent. Emitting "error" here instead left
+			// the web UI and the Telegram bot showing a raw parser message
+			// ("model did not return JSON. Got: ...") while the non-streaming
+			// endpoint answered the very same query politely.
+			answer := "I had trouble processing that request. Please try rephrasing."
+			_ = s.Memory.AddMessage(state.sid, "assistant", answer)
+			meta := s.buildMeta(state, step, true)
+			send(Event{
+				Event:       "final",
+				SessionID:   state.sid,
+				Answer:      answer,
+				Meta:        meta,
+				Attachments: state.attachments,
+			})
 			return
 		}
 		data = normalizeToolCall(data, state.toolNames)
@@ -364,6 +385,7 @@ func (s *Service) RunStream(ctx context.Context, req RunRequest, out chan<- Even
 				return
 			}
 			// Emit tool_call events upfront so the UI shows them immediately.
+			calls, dropped := s.capBatch(calls)
 			for i := range calls {
 				calls[i].Step = step
 			}
@@ -394,7 +416,7 @@ func (s *Service) RunStream(ctx context.Context, req RunRequest, out chan<- Even
 			state.messages = append(state.messages,
 				llm.Message{Role: "assistant", Content: string(batchJSON)},
 				llm.Message{Role: "tool", Content: string(allJSON)},
-				llm.Message{Role: "user", Content: batchFollowup(results)},
+				llm.Message{Role: "user", Content: batchFollowup(results, dropped)},
 			)
 			continue
 		}
@@ -597,7 +619,6 @@ func (s *Service) startSession(req RunRequest) (*runState, error) {
 	st.debug = append(st.debug, fmt.Sprintf("[init] tools=%v", keys(st.tools)))
 	st.debug = append(st.debug, fmt.Sprintf("[init] skills_count=%d", len(st.skillNames)))
 
-	// Assemble the message list
 	systemPrompt := s.buildSystemPrompt(st.tools, st.skillNames)
 	// Current time lets the LLM convert relative/local times ("at 3pm",
 	// "in 20 minutes") into UTC cron expressions for schedule_task without
@@ -657,12 +678,19 @@ var sensitiveSkills = map[string]bool{
 func (s *Service) buildSystemPrompt(tools map[string]Skill, skillNames map[string]bool) string {
 	var skillSection string
 	if len(skillNames) > 0 {
-		var lines []string
-		lines = append(lines, "", "You also have skills (call them like tools):")
+		// Sorted, not map order: an unstable skill list rewrites the system
+		// prompt on every run, which defeats provider-side prompt caching and
+		// makes identical queries produce different answers.
+		names := make([]string, 0, len(skillNames))
 		for name := range tools {
-			if !skillNames[name] {
-				continue
+			if skillNames[name] {
+				names = append(names, name)
 			}
+		}
+		sort.Strings(names)
+
+		lines := []string{"", "You also have skills (call them like tools):"}
+		for _, name := range names {
 			lines = append(lines, formatSkillLine(tools[name].Schema))
 		}
 		skillSection = strings.Join(lines, "\n")
@@ -679,10 +707,15 @@ func (s *Service) buildSystemPrompt(tools map[string]Skill, skillNames map[strin
 }
 
 func formatSkillLine(s skills.Skill) string {
-	var params []string
-	for k, p := range s.Parameters {
+	keys := make([]string, 0, len(s.Parameters))
+	for k := range s.Parameters {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys) // stable parameter order — see buildSystemPrompt
+	params := make([]string, 0, len(keys))
+	for _, k := range keys {
 		req := " (optional)"
-		if p.Required {
+		if s.Parameters[k].Required {
 			req = " (required)"
 		}
 		params = append(params, k+req)
@@ -818,12 +851,25 @@ func bestAnswer(data map[string]any) string {
 // truncate cuts s to at most n bytes without splitting a multi-byte rune.
 // Truncated results travel to consumers that reject invalid UTF-8 (Telegram,
 // JSON encoders), so a plain byte slice is not safe here.
+//
+// Only a trailing partial rune is trimmed — at most 3 bytes. Trimming until the
+// whole prefix validates (the previous approach) emptied the result completely
+// whenever the input already carried an invalid byte before the cut, which is
+// how binary tool output — shell_command stdout, web_scrape of a non-UTF-8
+// page — used to vanish from debug logs and stream events entirely.
 func truncate(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
 	if len(s) <= n {
 		return s
 	}
 	t := s[:n]
-	for len(t) > 0 && !utf8.ValidString(t) {
+	for i := 0; i < utf8.UTFMax-1 && len(t) > 0; i++ {
+		r, size := utf8.DecodeLastRuneInString(t)
+		if r != utf8.RuneError || size > 1 {
+			break // complete rune (or a genuine U+FFFD) — nothing to trim
+		}
 		t = t[:len(t)-1]
 	}
 	return t
@@ -841,11 +887,16 @@ func nonempty(s, def string) string {
 	return s
 }
 
-func keys[K comparable, V any](m map[K]V) []K {
+// keys returns a map's keys in sorted order. The order is visible: these lists
+// go into the "available tools" hint the model gets after calling something that
+// does not exist, and into the debug log's tool inventory. Map order made both
+// reshuffle on every run for no reason.
+func keys[K cmp.Ordered, V any](m map[K]V) []K {
 	out := make([]K, 0, len(m))
 	for k := range m {
 		out = append(out, k)
 	}
+	slices.Sort(out)
 	return out
 }
 
@@ -960,8 +1011,7 @@ func (s *Service) runOne(state *runState, c batchCall) batchResult {
 	elapsed := dur.Seconds()
 	atts, cleaned := ExtractAttachments(c.Name, result)
 
-	auditArgs := any(c.Args)
-	auditResult := any(cleaned)
+	var auditArgs, auditResult any = c.Args, cleaned
 	if sensitiveSkills[c.Name] {
 		auditArgs = map[string]any{"redacted": true}
 		auditResult = map[string]any{"redacted": true}
@@ -983,6 +1033,27 @@ func (s *Service) runOne(state *runState, c batchCall) batchResult {
 	})
 
 	return batchResult{Call: c, Result: cleaned, Elapsed: elapsed, Atts: atts}
+}
+
+// maxBatch is the number of calls one tool_calls envelope may contain. The
+// system prompt advertises this limit, but nothing stopped the model from
+// ignoring it, so a runaway batch could fan out arbitrarily many concurrent
+// tool executions (network scans, shell commands) from a single LLM reply.
+func (s *Service) maxBatch() int {
+	if s.MaxParallel > 0 {
+		return s.MaxParallel
+	}
+	return 4
+}
+
+// capBatch enforces maxBatch, returning the kept calls and how many were
+// dropped so the caller can tell the model what happened.
+func (s *Service) capBatch(calls []batchCall) ([]batchCall, int) {
+	limit := s.maxBatch()
+	if len(calls) <= limit {
+		return calls, 0
+	}
+	return calls[:limit], len(calls) - limit
 }
 
 // parseBatchCalls extracts the calls array from a tool_calls envelope.
@@ -1016,7 +1087,9 @@ func parseBatchCalls(data map[string]any) ([]batchCall, bool) {
 }
 
 // batchFollowup builds the user follow-up message after a parallel batch.
-func batchFollowup(results []batchResult) string {
+// dropped is the number of calls capBatch discarded for exceeding the batch
+// limit; the model is told so it can re-issue them instead of assuming they ran.
+func batchFollowup(results []batchResult, dropped int) string {
 	var names []string
 	for _, r := range results {
 		names = append(names, r.Call.Name)
@@ -1027,6 +1100,11 @@ func batchFollowup(results []batchResult) string {
 	sb.WriteString(".\n")
 	for _, r := range results {
 		sb.WriteString(fmt.Sprintf("- %s: %s\n", r.Call.Name, truncate(fmt.Sprint(r.Result), 200)))
+	}
+	if dropped > 0 {
+		sb.WriteString(fmt.Sprintf(
+			"NOTE: %d further call(s) in that batch were NOT executed (batch limit is %d). "+
+				"Request them in a following batch if you still need them.\n", dropped, len(results)))
 	}
 	sb.WriteString(`If you now have all the information needed, return type="final". Otherwise call another tool.`)
 	return sb.String()

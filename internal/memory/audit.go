@@ -192,13 +192,23 @@ func marshalAuditBlob(v any, maxBytes int) string {
 }
 
 // safeTruncateUTF8 returns at most maxBytes bytes of s, trimming back so the
-// result never ends in the middle of a multi-byte rune.
+// result never ends in the middle of a multi-byte rune. Only the trailing
+// partial rune is trimmed (at most UTFMax-1 bytes) — trimming until the whole
+// prefix validated would return "" for any payload that already contained an
+// invalid byte, discarding the preview entirely.
 func safeTruncateUTF8(s string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
 	if len(s) <= maxBytes {
 		return s
 	}
 	t := s[:maxBytes]
-	for len(t) > 0 && !utf8.ValidString(t) {
+	for i := 0; i < utf8.UTFMax-1 && len(t) > 0; i++ {
+		r, size := utf8.DecodeLastRuneInString(t)
+		if r != utf8.RuneError || size > 1 {
+			break
+		}
 		t = t[:len(t)-1]
 	}
 	return t

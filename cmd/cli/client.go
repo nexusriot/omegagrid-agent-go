@@ -105,21 +105,33 @@ func httpStream(path string, reqBody any, onEvent func(event, data string)) erro
 
 type localServices struct {
 	svc     *bootstrap.Services
+	cfg     config.Config
 	cleanup func()
 }
 
 var _local *localServices
 
 func getLocal() *bootstrap.Services {
+	initLocal()
+	return _local.svc
+}
+
+// localConfig returns the config local mode was wired with, so CLI commands
+// honour the same environment the gateway does instead of re-deriving defaults.
+func localConfig() config.Config {
+	initLocal()
+	return _local.cfg
+}
+
+func initLocal() {
 	if _local == nil {
 		cfg := config.Load()
 		svc, cleanup, err := bootstrap.New(cfg)
 		if err != nil {
 			fatalf("init: %v", err)
 		}
-		_local = &localServices{svc: svc, cleanup: cleanup}
+		_local = &localServices{svc: svc, cfg: cfg, cleanup: cleanup}
 	}
-	return _local.svc
 }
 
 func closeLocal() {

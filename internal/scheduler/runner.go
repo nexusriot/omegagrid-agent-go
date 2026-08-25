@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -142,7 +143,7 @@ func matchesAny(cronExpr string, minutes []time.Time) bool {
 func (r *Runner) runTask(t *Task) {
 	log.Printf("scheduler running task #%d %q: %s(%v)", t.ID, t.Name, t.Skill, t.Args)
 	var resultStr string
-	res, err := r.exec(t.Skill, t.Args)
+	res, err := r.safeExec(t)
 	if err != nil {
 		log.Printf("task #%d failed: %v", t.ID, err)
 		if b, merr := json.Marshal(map[string]string{"error": err.Error()}); merr == nil {
@@ -184,6 +185,21 @@ func (r *Runner) runTask(t *Task) {
 		}
 		sendTelegram(r.botToken, *t.NotifyTelegramChatID, msg)
 	}
+}
+
+// safeExec runs one task's skill, converting a panic into a task error. Only
+// the tick's own recover stood between a panicking skill and the process, and
+// it fired after unwinding runTask — so one bad task both lost its own
+// last_result and cancelled every task still queued behind it in that minute.
+func (r *Runner) safeExec(t *Task) (res any, err error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			log.Printf("scheduler task #%d %q: skill %q panicked: %v\n%s", t.ID, t.Name, t.Skill, rec, debug.Stack())
+			res = nil
+			err = fmt.Errorf("skill %q crashed: %v", t.Skill, rec)
+		}
+	}()
+	return r.exec(t.Skill, t.Args)
 }
 
 // reminderMessage returns the bare reminder text for successful runs of the

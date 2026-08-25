@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"runtime/debug"
 	"time"
 
 	"github.com/nexusriot/omegagrid-agent-go/internal/agent"
@@ -99,7 +100,19 @@ func (d *Deps) handleQueryStream(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 	events := make(chan agent.Event, 16)
-	go d.Agent.RunStream(ctx, req.toAgentReq(d.Cfg.AgentMaxSteps), events)
+	go func() {
+		// The agent loop runs on its own goroutine here, so chi's Recoverer
+		// middleware — which only wraps the handler goroutine — cannot catch a
+		// panic raised inside it, and the whole gateway would go down with it.
+		// RunStream closes the event channel through its own defer even while
+		// panicking, so the reader below still terminates cleanly.
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf("agent stream panic: %v\n%s", rec, debug.Stack())
+			}
+		}()
+		d.Agent.RunStream(ctx, req.toAgentReq(d.Cfg.AgentMaxSteps), events)
+	}()
 
 	for {
 		select {

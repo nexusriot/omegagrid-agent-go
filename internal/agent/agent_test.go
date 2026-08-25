@@ -262,9 +262,15 @@ func TestFinalAnswer_String(t *testing.T) {
 }
 
 func TestFinalAnswer_MissingAnswer(t *testing.T) {
+	// A final envelope with no answer at all falls back to the polite recovery
+	// message rather than handing the user an empty string.
 	data := map[string]any{"type": "final"}
-	if got := finalAnswer(data); got != "" {
-		t.Errorf("expected empty, got %q", got)
+	got := finalAnswer(data)
+	if got == "" {
+		t.Error("expected a fallback message, got empty string")
+	}
+	if got != bestAnswer(map[string]any{}) {
+		t.Errorf("expected the standard fallback message, got %q", got)
 	}
 }
 

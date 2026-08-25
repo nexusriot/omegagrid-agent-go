@@ -354,3 +354,24 @@ func TestColorHelpersPlainWhenPiped(t *testing.T) {
 		t.Fatal("isTTY() is true under go test")
 	}
 }
+
+func TestResolveMaxSteps(t *testing.T) {
+	cases := []struct {
+		name             string
+		flag, configured int
+		want             int
+	}{
+		{"flag wins", 7, 40, 7},
+		{"falls back to AGENT_MAX_STEPS", 0, 40, 40},
+		{"built-in default when neither is set", 0, 0, defaultMaxSteps},
+		{"negative flag ignored", -3, 40, 40},
+		{"negative config ignored", 0, -1, defaultMaxSteps},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolveMaxSteps(tc.flag, tc.configured); got != tc.want {
+				t.Fatalf("resolveMaxSteps(%d, %d) = %d, want %d", tc.flag, tc.configured, got, tc.want)
+			}
+		})
+	}
+}

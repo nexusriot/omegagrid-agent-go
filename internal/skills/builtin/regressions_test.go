@@ -321,3 +321,29 @@ func TestPadImagePreservesSymbolPixels(t *testing.T) {
 		}
 	}
 }
+
+// A negative or zero max_chars — a value an LLM can and does emit — used to
+// panic on the rune slice ("slice bounds out of range [:-1]"), killing the
+// process from inside a parallel tool batch. It must fall back to the default.
+func TestWebScrapeNonPositiveMaxCharsUsesDefault(t *testing.T) {
+	page := strings.Repeat("a", 50)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte(page))
+	}))
+	defer srv.Close()
+
+	for _, maxChars := range []any{-1, 0, -4000, "-1"} {
+		res, err := WebScrape(5)(map[string]any{"url": srv.URL, "max_chars": maxChars})
+		if err != nil {
+			t.Fatalf("WebScrape(max_chars=%v): %v", maxChars, err)
+		}
+		m := res.(map[string]any)
+		if text, _ := m["text"].(string); text != page {
+			t.Fatalf("max_chars=%v: text = %q, want the full page", maxChars, text)
+		}
+		if m["truncated"] != false {
+			t.Fatalf("max_chars=%v: truncated = %v, want false", maxChars, m["truncated"])
+		}
+	}
+}

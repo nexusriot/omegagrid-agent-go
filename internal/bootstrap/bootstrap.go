@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -71,6 +72,9 @@ type toolProvider struct {
 	exec   func(string, map[string]any) (any, error)
 }
 
+// Tools returns the MCP tool table in a stable, name-sorted order. Registry
+// skills already arrive sorted, but the native ones came straight off a map, so
+// tools/list handed connected MCP clients a different ordering on every call.
 func (p *toolProvider) Tools() []mcp.Tool {
 	var out []mcp.Tool
 	if list, err := p.skills.List(); err == nil {
@@ -81,6 +85,7 @@ func (p *toolProvider) Tools() []mcp.Tool {
 	for _, n := range p.native {
 		out = append(out, skillToMCPTool(n.Schema))
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
 

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log"
 	"regexp"
+	"runtime/debug"
 	"strings"
 
 	"github.com/nexusriot/omegagrid-agent-go/internal/llm"
@@ -49,7 +50,19 @@ func (s *Service) maybeExtractMemories(sid int, query, answer string) {
 	if len(strings.TrimSpace(answer)) < s.AutoMemoryMinAnswerLen {
 		return
 	}
-	go s.extractAndStoreMemories(sid, query, answer)
+	go func() {
+		// Nothing above this detached goroutine can recover it, so a panic in
+		// the LLM client or the vector store would take the gateway down long
+		// after the answer it belongs to was delivered — with no request left
+		// to blame. Auto-memory is best-effort by design; failing quietly is
+		// exactly the contract.
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("auto-memory: extraction panicked: %v\n%s", r, debug.Stack())
+			}
+		}()
+		s.extractAndStoreMemories(sid, query, answer)
+	}()
 }
 
 // extractAndStoreMemories runs one LLM call to distil the turn into facts and

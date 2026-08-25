@@ -621,6 +621,18 @@ Key implementation notes:
   frontmatter `name`, which is the key the registry actually uses and need not
   match the filename, before unregistering.
 
+  The frontmatter is hand-written rather than marshalled (insertion order stays
+  readable), so `yamlQuote` has to decide quoting on its own. It quotes on any
+  YAML indicator character, on the ones that only matter in first position
+  (`-`, `?`, `*`, `,`), on leading/trailing whitespace, on the empty string, and
+  on values that would come back as a bool/null/number. Missing the
+  first-position set is what made a description or argument as ordinary as
+  `*/5 * * * *` produce frontmatter yaml.v3 rejects: the file was written, the
+  reload failed, and a permanently unloadable skill stayed in `SKILLS_DIR`
+  (`LoadDir` skips unparseable files silently). Values that are neither strings
+  nor maps go through `yamlScalar`, which encodes them as JSON — a subset of
+  YAML — so a list stays a list instead of collapsing into `[a b c]`.
+
 - **Loose argument types** — `builtin/helpers.go` (`str`, `intOr`, `floatOr`,
   `boolOr`) coerces across JSON types on purpose. LLMs quote numbers
   (`"port": "443"`), unquote strings (`"ports": 443`) and spell booleans as words
@@ -1061,7 +1073,7 @@ internally branch on `isRemote()` to pick the right path.
 
 | Command | Purpose |
 |---|---|
-| `omega ask "..." [--stream] [--session N]` | Run an agent query.  With `--stream` and a TTY stdout, renders thinking / tool_call / tool_result events with ANSI color; falls back to plain text when stdout is piped. |
+| `omega ask "..." [--stream] [--session N] [--max-steps N]` | Run an agent query.  With `--stream` and a TTY stdout, renders thinking / tool_call / tool_result events with ANSI color; falls back to plain text when stdout is piped.  The step budget is `--max-steps`, else `AGENT_MAX_STEPS`, else 25 (`resolveMaxSteps`); local mode used to hardcode 25 and ignore the env var every other entry point honours. |
 | `omega skills list` | List all registered skills with signatures. |
 | `omega skills describe NAME` | Show one skill's full schema. |
 | `omega skills run NAME --arg k=v` | Invoke a skill directly (uses the same execution path as the playground endpoint). |
@@ -1435,8 +1447,10 @@ Every registered skill (built-in, dynamic markdown, native `schedule_task` /
 `web_search`, and any tools consumed from remote MCP servers) is advertised as
 an MCP tool; its parameter map is rendered as a JSON-Schema `inputSchema`. Skill
 execution errors are returned in-band as `isError:true` results (not JSON-RPC
-errors) so a calling model can read and react to them. The endpoint is gated by
-`MCP_SERVER_DISABLED`.
+errors) so a calling model can read and react to them. `tools/list` is sorted by
+name — the registry list already was, but the native tools came straight off a
+map, so connected clients saw the tail of the list reshuffle on every call. The
+endpoint is gated by `MCP_SERVER_DISABLED`.
 
 Client — `MCP_SERVERS` is a comma-separated list of `name=url` entries (append
 `|Header: Value` for a single auth header). At startup the gateway dials each
@@ -1532,10 +1546,13 @@ the only path that serves the UI in any deployment.
 | Skill execution fails | Executor returns `(nil, err)`; agent loop wraps it as `{error: "..."}` and appends as tool result; LLM can retry or answer. |
 | Embeddings unreachable | `addText` and `searchMemory` return errors surfaced in the agent loop; agent continues without memory injection. |
 | Model emits an unusable URL | Skills honour the `http.NewRequest` error (it returns a **nil** request alongside it) and report it as a skill error. Dereferencing that nil used to panic — fatal for the process when it happened on a parallel batch's goroutine. |
+| A skill panics | `safeExecute` recovers it inside `runOne` and hands the model `{"error": "tool \"x\" crashed: ..."}`, exactly like a returned error; the sibling calls in the same batch still finish. This is not optional politeness: `executeBatch` runs each call on its own goroutine and the gateway starts `RunStream` on one too, and chi's `Recoverer` only wraps the handler goroutine — a panic anywhere else killed the whole gateway. The streaming handler and the auto-memory goroutine carry their own recover as a second net. |
 | Oversized `tool_calls` batch | `capBatch` keeps the first `AGENT_MAX_PARALLEL` calls, executes only those, and tells the model how many it dropped. |
+| A scheduled skill panics | `Runner.safeExec` records it as that task's error in `last_result` and the tick continues. Only the tick's own recover stood behind this before, and it fired after unwinding `runTask` — losing the result *and* every task still queued for that minute. |
 | Scheduler task fails | Runner captures the error, stores it in `last_result`, optionally notifies via Telegram. |
 | Scheduler tick drifts or the host sleeps | The next tick sweeps every whole minute since the last one it evaluated (bounded to 60), so a cron minute skipped by ticker drift still fires — once, not once per missed minute. |
 | Non-UTF-8 tool output | Truncation helpers trim only a trailing partial rune (and, on the Telegram path, drop stray invalid bytes). Trimming until the whole prefix validated returned an empty string, silently discarding binary-ish results from debug logs, audit previews and `last_result`. |
+| `final` envelope with no answer | `finalAnswer` falls back to the same lenient extraction the malformed-envelope path uses (`answer` → `text` → `result` → the "please rephrase" message), so a missing or empty `answer` never reaches the user as a blank reply. |
 | Telegram stream breaks | Bot falls back to synchronous `/api/query` endpoint. |
 | MaxSteps exceeded | Agent returns "could not finish" with partial debug log. |
 | SQLite directory missing | `os.MkdirAll` creates it before opening the database. |

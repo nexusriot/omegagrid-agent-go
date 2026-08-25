@@ -39,10 +39,7 @@ func runAskLocal(query string, sessionID, maxSteps int, stream, jsonOut bool) {
 	defer closeLocal()
 	svc := getLocal()
 
-	steps := maxSteps
-	if steps == 0 {
-		steps = 25
-	}
+	steps := resolveMaxSteps(maxSteps, localConfig().AgentMaxSteps)
 
 	req := agent.RunRequest{
 		Query:     query,
@@ -66,6 +63,27 @@ func runAskLocal(query string, sessionID, maxSteps int, stream, jsonOut bool) {
 		return
 	}
 	fmt.Println(result.Answer)
+}
+
+// defaultMaxSteps matches the AGENT_MAX_STEPS default in internal/config.
+const defaultMaxSteps = 25
+
+// resolveMaxSteps picks the step budget for a local-mode run: an explicit
+// --max-steps wins, then AGENT_MAX_STEPS, then the built-in default.
+//
+// Local mode used to hardcode 25 and ignore AGENT_MAX_STEPS, which every other
+// entry point honours. Non-positive values are rejected at both levels because
+// the agent loop is `for step := 1; step <= MaxSteps`: a zero or negative
+// budget skips the loop entirely and answers "I could not finish within
+// max_steps" without ever calling the model.
+func resolveMaxSteps(flagVal, configured int) int {
+	if flagVal > 0 {
+		return flagVal
+	}
+	if configured > 0 {
+		return configured
+	}
+	return defaultMaxSteps
 }
 
 func runAskRemote(query string, sessionID, maxSteps int, stream, jsonOut bool) {

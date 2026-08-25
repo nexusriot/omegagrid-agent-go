@@ -4,9 +4,11 @@
 package skills
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/nexusriot/omegagrid-agent-go/internal/config"
@@ -477,7 +479,7 @@ func writeYAMLField(sb *strings.Builder, key string, val any) {
 			}
 		}
 	default:
-		sb.WriteString(fmt.Sprintf("%s: %v\n", key, v))
+		sb.WriteString(key + ": " + yamlScalar(v) + "\n")
 	}
 }
 
@@ -493,13 +495,74 @@ func writeYAMLField2(sb *strings.Builder, key string, val any, indent string) {
 			writeYAMLField2(sb, indent+"  "+k2, v2, indent+"  ")
 		}
 	default:
-		sb.WriteString(fmt.Sprintf("%s: %v\n", key, v))
+		sb.WriteString(key + ": " + yamlScalar(v) + "\n")
 	}
 }
 
+// yamlScalar renders a non-string, non-map value. JSON is a subset of YAML, so
+// encoding through it keeps lists and nested values readable back — "%v"
+// flattened a []any into "[a b c]", which YAML reads as one string, and a nil
+// into the literal text "<nil>".
+func yamlScalar(v any) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return yamlQuote(fmt.Sprintf("%v", v))
+	}
+	return string(b)
+}
+
+// yamlQuote renders s as a YAML scalar, single-quoting it whenever a plain
+// scalar would change the meaning — or fail to parse at all.
+//
+// The previous character set missed the indicators that only matter in first
+// position ('*', '-', '?', ','), so a description or step argument as ordinary
+// as "*/5 * * * *" or "- see docs" produced frontmatter that yaml.v3 rejects
+// ("did not find expected alphabetic or numeric character"). skill_creator then
+// wrote the file, failed to re-read it, and left a permanently broken skill in
+// SKILLS_DIR that LoadDir silently skips on every later start.
+//
+// Values that would parse as a bool, null or number are quoted too, so a
+// string parameter keeps its type on the way back in.
 func yamlQuote(s string) string {
-	if strings.ContainsAny(s, ":#{}[]|>&!'\"%@`") || strings.Contains(s, "\n") {
+	if needsYAMLQuote(s) {
 		return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 	}
 	return s
+}
+
+// yamlIndicators are the characters YAML treats specially anywhere in a plain
+// scalar; the ones only special in first position are handled separately.
+const yamlIndicators = ":#{}[]|>&!'\"%@`"
+
+// yamlLeadingIndicators additionally start a different node type when they are
+// the very first character of a value.
+const yamlLeadingIndicators = "-?*,\t "
+
+func needsYAMLQuote(s string) bool {
+	if s == "" {
+		return true // an unquoted empty value parses back as null, not ""
+	}
+	if strings.ContainsAny(s, yamlIndicators) || strings.ContainsAny(s, "\n\r") {
+		return true
+	}
+	if strings.ContainsAny(s[:1], yamlLeadingIndicators) {
+		return true
+	}
+	if strings.HasSuffix(s, " ") || strings.HasSuffix(s, "\t") {
+		return true
+	}
+	return isYAMLScalarLiteral(s)
+}
+
+// isYAMLScalarLiteral reports whether s would be read back as something other
+// than a string (a bool, null, or number).
+func isYAMLScalarLiteral(s string) bool {
+	switch strings.ToLower(s) {
+	case "true", "false", "yes", "no", "on", "off", "null", "~":
+		return true
+	}
+	if _, err := strconv.ParseFloat(s, 64); err == nil {
+		return true
+	}
+	return false
 }

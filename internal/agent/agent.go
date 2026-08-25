@@ -9,7 +9,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"regexp"
+	"runtime/debug"
 	"slices"
 	"sort"
 	"strings"
@@ -828,15 +830,23 @@ func normalizeToolCall(data map[string]any, knownTools map[string]bool) map[stri
 	return data
 }
 
+// finalAnswer extracts the user-facing text from a type="final" envelope.
+// A final answer that comes out empty — no "answer" key at all, or an empty
+// string — is never something to show the user: the web UI rendered a blank
+// bubble and Telegram an "(empty answer)" placeholder while the model had
+// usually put its reply under "text" or "result". Fall back to the same
+// lenient extraction the malformed-envelope path uses.
 func finalAnswer(data map[string]any) string {
-	if a, ok := data["answer"].(string); ok {
+	if a, ok := data["answer"].(string); ok && a != "" {
 		return a
 	}
 	if a, ok := data["answer"]; ok && a != nil {
-		b, _ := json.MarshalIndent(a, "", "  ")
-		return string(b)
+		if _, isStr := a.(string); !isStr {
+			b, _ := json.MarshalIndent(a, "", "  ")
+			return string(b)
+		}
 	}
-	return ""
+	return bestAnswer(data)
 }
 
 func bestAnswer(data map[string]any) string {
@@ -979,6 +989,26 @@ func (s *Service) executeBatch(state *runState, calls []batchCall) []batchResult
 	return out
 }
 
+// safeExecute runs one tool implementation and turns a panic into an ordinary
+// error. Tool bodies handle arbitrary LLM-supplied arguments, so a bad value
+// can reach an out-of-range slice or a nil dereference; that panic used to kill
+// the whole process. Neither of the two paths a tool runs on is covered by the
+// HTTP router's recover middleware: executeBatch spawns a goroutine per call,
+// and the gateway starts RunStream on its own goroutine as well — and a panic
+// on any goroutine other than the one the middleware wraps is fatal for the
+// entire gateway, not just the request. A failed tool must degrade to a tool
+// error the model can read, exactly like a returned error.
+func safeExecute(exec func(map[string]any) (any, error), name string, args map[string]any) (result any, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("agent: tool %q panicked: %v\n%s", name, r, debug.Stack())
+			result = nil
+			err = fmt.Errorf("tool %q crashed: %v", name, r)
+		}
+	}()
+	return exec(args)
+}
+
 // runOne executes a single tool/skill call, writes a best-effort audit
 // record (covering single, batch and parallel calls), and returns its result.
 func (s *Service) runOne(state *runState, c batchCall) batchResult {
@@ -997,7 +1027,7 @@ func (s *Service) runOne(state *runState, c batchCall) batchResult {
 	var dur time.Duration
 	if ok {
 		t0 := time.Now()
-		r, err := entry.Execute(c.Args)
+		r, err := safeExecute(entry.Execute, c.Name, c.Args)
 		dur = time.Since(t0)
 		if err != nil {
 			execErr = err

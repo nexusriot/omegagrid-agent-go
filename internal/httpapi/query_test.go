@@ -468,3 +468,47 @@ func TestSkillInvokeExtractsAttachments(t *testing.T) {
 		t.Fatalf("result carries no attachment marker: %v", result)
 	}
 }
+
+// The agent loop runs on a goroutine of its own for the streaming endpoint, so
+// chi's Recoverer — which wraps only the handler goroutine — cannot catch a
+// panic raised inside it and the whole gateway used to die. The tool crash must
+// come back as an ordinary tool result and the run must continue.
+func TestQueryStreamSurvivesToolPanic(t *testing.T) {
+	chat := &scriptedChat{replies: []string{
+		`{"type":"tool_call","tool":"boom","args":{},"why":"crash"}`,
+		`{"type":"final","answer":"still here"}`,
+	}}
+	d := withAgent(newTestDeps(t), chat)
+	d.Agent.NativeSkills = map[string]agent.Skill{
+		"boom": {Execute: func(map[string]any) (any, error) { panic("stream boom") }},
+	}
+	h := NewRouter(d)
+
+	r := httptest.NewRequest("POST", "/api/query/stream", strings.NewReader(`{"query":"q"}`))
+	r.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d", w.Code)
+	}
+	events := readSSE(t, w.Body.String())
+	var sawCrash bool
+	var final map[string]any
+	for _, e := range events {
+		var payload map[string]any
+		_ = json.Unmarshal([]byte(e[1]), &payload)
+		if e[0] == "tool_result" && strings.Contains(payload["result"].(string), "crashed") {
+			sawCrash = true
+		}
+		if e[0] == "final" {
+			final = payload
+		}
+	}
+	if !sawCrash {
+		t.Errorf("no tool_result reported the crash: %s", w.Body.String())
+	}
+	if final == nil || final["answer"] != "still here" {
+		t.Errorf("run did not reach a final answer: %v", final)
+	}
+}

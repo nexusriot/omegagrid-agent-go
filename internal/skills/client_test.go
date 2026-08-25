@@ -47,8 +47,15 @@ func TestYamlQuote(t *testing.T) {
 		name, in, want string
 	}{
 		{"plain unquoted", "hello", "hello"},
-		{"empty unquoted", "", ""},
-		{"space not special", "with space", "with space"},
+		{"empty quoted", "", "''"},
+		{"inner space not special", "with space", "with space"},
+		{"leading asterisk quoted", "*/5 * * * *", "'*/5 * * * *'"},
+		{"leading dash quoted", "- see docs", "'- see docs'"},
+		{"leading question quoted", "? maybe", "'? maybe'"},
+		{"leading comma quoted", ",oops", "',oops'"},
+		{"trailing space quoted", "trailing ", "'trailing '"},
+		{"boolish quoted", "yes", "'yes'"},
+		{"numeric quoted", "42", "'42'"},
 		{"colon quoted", "has:colon", "'has:colon'"},
 		{"hash quoted", "a#b", "'a#b'"},
 		{"percent quoted", "100%", "'100%'"},
@@ -57,8 +64,8 @@ func TestYamlQuote(t *testing.T) {
 		{"single quote doubled", "it's", "'it''s'"},
 		{"newline quoted", "a\nb", "'a\nb'"},
 	}
-	// NOTE: a plain space is NOT in yamlQuote's special-char set, so "with space"
-	// is returned unquoted.
+	// NOTE: an interior space is harmless in a plain scalar, so "with space" is
+	// returned unquoted; a leading or trailing one is not.
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := yamlQuote(tc.in); got != tc.want {

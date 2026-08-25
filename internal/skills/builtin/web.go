@@ -184,7 +184,14 @@ func WebScrape(timeoutSec float64) Executor {
 		if rawURL == "" {
 			return map[string]any{"error": "url is required"}, nil
 		}
+		// A non-positive max_chars is meaningless, and a negative one used to
+		// panic outright on the rune slice below ("slice bounds out of range
+		// [:-1]") — from a value an LLM can put in the args map, on a goroutine
+		// where nothing recovers it. Fall back to the documented default.
 		maxChars := intOr(args, "max_chars", 4000)
+		if maxChars <= 0 {
+			maxChars = 4000
+		}
 
 		resp, err := getWithRetry(cl, rawURL, http.Header{"User-Agent": {"OmegaGridAgent/1.0"}})
 		if err != nil {

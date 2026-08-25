@@ -408,3 +408,84 @@ func TestRegisterAddsRuntimeSkill(t *testing.T) {
 	}
 	t.Fatal("registered skill missing from List()")
 }
+
+// YAML indicator characters in a description or a step argument used to produce
+// frontmatter that yaml.v3 refuses to parse ("*" opens an alias, a leading "-"
+// a sequence). skill_creator wrote the file anyway, failed to register it, and
+// left a permanently unloadable skill behind in SKILLS_DIR.
+func TestCreatedSkillWithYAMLIndicatorsRoundTrips(t *testing.T) {
+	c, dir := newCreator(t)
+
+	cases := []struct {
+		name, description string
+	}{
+		{"cron_helper", "*/5 * * * * schedule explainer"},
+		{"dash_helper", "- see the docs for details"},
+		{"question_helper", "? unknown state handler"},
+		{"comma_helper", ",leading comma"},
+		{"trailing_helper", "trailing space "},
+		{"quote_helper", "it's a 'quoted' description"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			create(t, c, map[string]any{
+				"name":        tc.name,
+				"description": tc.description,
+				"endpoint":    "https://example.com/api",
+				"parameters_schema": map[string]any{
+					"cron": map[string]any{"type": "string", "description": "*/5 * * * *", "required": true},
+				},
+			})
+
+			loaded, err := markdown.Load(filepath.Join(dir, tc.name+".md"))
+			if err != nil {
+				raw, _ := os.ReadFile(filepath.Join(dir, tc.name+".md"))
+				t.Fatalf("generated frontmatter does not parse: %v\n%s", err, raw)
+			}
+			// scCreate trims the incoming description, so compare against that.
+			want := strings.TrimSpace(tc.description)
+			if loaded.Schema.Description != want {
+				t.Errorf("description = %q, want %q", loaded.Schema.Description, want)
+			}
+			if p, ok := loaded.Schema.Parameters["cron"]; !ok {
+				t.Errorf("cron parameter lost, got %v", loaded.Schema.Parameters)
+			} else if p.Description != "*/5 * * * *" || !p.Required {
+				t.Errorf("cron param = %+v, want the asterisk description and required=true", p)
+			}
+
+			// The skill must also be callable straight away.
+			if _, err := c.Execute(tc.name, map[string]any{}); err != nil {
+				t.Errorf("created skill is not registered: %v", err)
+			}
+		})
+	}
+}
+
+// A list-valued entry inside parameters_schema was flattened by "%v" into
+// "[a b]", which YAML reads back as the single string "a b".
+func TestCreatedSkillPreservesListValues(t *testing.T) {
+	c, dir := newCreator(t)
+	create(t, c, map[string]any{
+		"name":        "enum_helper",
+		"description": "picks a value",
+		"endpoint":    "https://example.com/api",
+		"parameters_schema": map[string]any{
+			"mode": map[string]any{
+				"type": "string",
+				"enum": []any{"fast", "slow"},
+			},
+		},
+	})
+
+	raw, err := os.ReadFile(filepath.Join(dir, "enum_helper.md"))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !strings.Contains(string(raw), `["fast","slow"]`) {
+		t.Errorf("enum list not preserved in frontmatter:\n%s", raw)
+	}
+	if _, err := markdown.Load(filepath.Join(dir, "enum_helper.md")); err != nil {
+		t.Fatalf("generated frontmatter does not parse: %v\n%s", err, raw)
+	}
+}

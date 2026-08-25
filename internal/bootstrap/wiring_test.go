@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
@@ -477,4 +478,44 @@ func TestNewFailsOnBadProviderConfig(t *testing.T) {
 	if !strings.Contains(err.Error(), "OPENAI_API_KEY") {
 		t.Fatalf("error does not name the missing setting: %v", err)
 	}
+}
+
+// tools/list is served straight to MCP clients, so its order must not depend on
+// Go's map iteration: the native tools used to land in a different position on
+// every call.
+func TestToolProviderOrderIsStable(t *testing.T) {
+	sk, err := skills.New(config.Config{SkillsDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("skills.New: %v", err)
+	}
+	native := map[string]agent.Skill{
+		"schedule_task": {Schema: skills.Skill{Name: "schedule_task"}},
+		"web_search":    {Schema: skills.Skill{Name: "web_search"}},
+		"aaa_native":    {Schema: skills.Skill{Name: "aaa_native"}},
+	}
+	p := &toolProvider{skills: sk, native: native}
+
+	first := p.Tools()
+	if !sort.SliceIsSorted(first, func(i, j int) bool { return first[i].Name < first[j].Name }) {
+		t.Fatalf("tool list is not name-sorted: %v", toolNames(first))
+	}
+	for i := 0; i < 20; i++ {
+		got := p.Tools()
+		if len(got) != len(first) {
+			t.Fatalf("tool count changed: %d != %d", len(got), len(first))
+		}
+		for j := range got {
+			if got[j].Name != first[j].Name {
+				t.Fatalf("tool order changed at %d: %q != %q", j, got[j].Name, first[j].Name)
+			}
+		}
+	}
+}
+
+func toolNames(tools []mcp.Tool) []string {
+	out := make([]string, 0, len(tools))
+	for _, t := range tools {
+		out = append(out, t.Name)
+	}
+	return out
 }

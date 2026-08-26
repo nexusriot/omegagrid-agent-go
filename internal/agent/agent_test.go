@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -596,3 +597,45 @@ func (f *funcLLM) CompleteJSON(msgs []llm.Message) (string, float64, error) {
 }
 func (f *funcLLM) Model() string   { return "func-mock" }
 func (f *funcLLM) BaseURL() string { return "" }
+
+// jwt_inspect's argument is a live bearer token and its result contains the
+// decoded claims. /api/invocations serves audit rows with no authentication, so
+// both must be redacted on the way into the log — the model still gets the real
+// result in-band.
+func TestJwtInspectIsRedactedInTheAuditLog(t *testing.T) {
+	if !sensitiveSkills["jwt_inspect"] {
+		t.Fatal("jwt_inspect must be listed in sensitiveSkills")
+	}
+	svc := newMinimalService(t, &mockLLM{responses: []string{
+		`{"type":"tool_call","tool":"jwt_inspect","args":{"token":"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzZWNyZXQifQ.sig"},"why":"decode"}`,
+		`{"type":"final","answer":"done"}`,
+	}})
+	svc.NativeSkills = map[string]Skill{
+		"jwt_inspect": {Execute: func(map[string]any) (any, error) {
+			return map[string]any{"sub": "secret-subject"}, nil
+		}},
+	}
+
+	res, err := svc.Run(RunRequest{Query: "decode this", MaxSteps: 3})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	recs, _, err := svc.Memory.ListInvocations(memory.AuditFilter{SessionID: res.SessionID})
+	if err != nil {
+		t.Fatalf("list invocations: %v", err)
+	}
+	if len(recs) != 1 {
+		t.Fatalf("got %d audit records, want 1", len(recs))
+	}
+	blob, _ := json.Marshal(recs[0])
+	if strings.Contains(string(blob), "eyJhbGciOiJIUzI1NiJ9") {
+		t.Errorf("the token leaked into the audit record: %s", blob)
+	}
+	if strings.Contains(string(blob), "secret-subject") {
+		t.Errorf("decoded claims leaked into the audit record: %s", blob)
+	}
+	if !strings.Contains(string(blob), "redacted") {
+		t.Errorf("audit record should be marked redacted: %s", blob)
+	}
+}

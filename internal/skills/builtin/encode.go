@@ -8,10 +8,13 @@ import (
 	"crypto/sha512"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"math/big"
 	"net/netip"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -239,6 +242,131 @@ func PasswordGen() Executor {
 			"exclude_ambiguous": noAmb,
 		}, nil
 	}
+}
+
+func JwtInspectSchema() Skill {
+	return Skill{Name: "jwt_inspect", Description: "Decode a JWT header and payload without verifying the signature. Flags alg=none and exp/nbf timing.",
+		Parameters: map[string]Param{
+			"token": {Type: "string", Description: "JWT string (header.payload.signature)", Required: true},
+		}}
+}
+
+func JwtInspect() Executor {
+	return func(args map[string]any) (any, error) {
+		token := strings.TrimSpace(str(args, "token"))
+		if token == "" {
+			return map[string]any{"error": "token is required"}, nil
+		}
+		// Strip optional "Bearer " prefix models often leave on.
+		if len(token) > 7 && strings.EqualFold(token[:7], "bearer ") {
+			token = strings.TrimSpace(token[7:])
+		}
+		parts := strings.Split(token, ".")
+		if len(parts) < 2 || len(parts) > 3 {
+			return map[string]any{"error": "token must have 2 or 3 dot-separated segments"}, nil
+		}
+
+		headerRaw, err := decodeBase64Any(parts[0])
+		if err != nil {
+			return map[string]any{"error": "header decode: " + err.Error()}, nil
+		}
+		payloadRaw, err := decodeBase64Any(parts[1])
+		if err != nil {
+			return map[string]any{"error": "payload decode: " + err.Error()}, nil
+		}
+
+		var header any
+		if err := json.Unmarshal(headerRaw, &header); err != nil {
+			return map[string]any{"error": "header is not JSON: " + err.Error(), "header_raw": string(headerRaw)}, nil
+		}
+		var payload any
+		if err := json.Unmarshal(payloadRaw, &payload); err != nil {
+			return map[string]any{"error": "payload is not JSON: " + err.Error(), "payload_raw": string(payloadRaw)}, nil
+		}
+
+		out := map[string]any{
+			"header":            header,
+			"payload":           payload,
+			"segments":          len(parts),
+			"signature_present": len(parts) == 3 && parts[2] != "",
+			"verified":          false, // intentionally never verifies
+		}
+		if len(parts) == 3 {
+			out["signature_b64"] = parts[2]
+			out["signature_length"] = len(parts[2])
+		}
+
+		// Structured flags from common claims — helps the model without it
+		// re-parsing JSON itself.
+		var warnings []string
+		if hm, ok := header.(map[string]any); ok {
+			// alg is reported whatever its value; "none" additionally raises a
+			// flag. Leaving it out for the "none" case hid the very field a
+			// reader looks for first.
+			if alg, _ := hm["alg"].(string); alg != "" {
+				out["alg"] = alg
+				if strings.EqualFold(alg, "none") {
+					out["alg_none"] = true
+					warnings = append(warnings, "alg is 'none' (unsigned token)")
+				}
+			}
+			if kid, ok := hm["kid"]; ok {
+				out["kid"] = kid
+			}
+		}
+		if pm, ok := payload.(map[string]any); ok {
+			now := time.Now().Unix()
+			if exp, ok := jwtNumericClaim(pm["exp"]); ok {
+				out["exp"] = exp
+				out["exp_rfc3339"] = time.Unix(exp, 0).UTC().Format(time.RFC3339)
+				out["expired"] = now >= exp
+				if now >= exp {
+					warnings = append(warnings, "token is expired")
+				}
+			}
+			if nbf, ok := jwtNumericClaim(pm["nbf"]); ok {
+				out["nbf"] = nbf
+				out["nbf_rfc3339"] = time.Unix(nbf, 0).UTC().Format(time.RFC3339)
+				out["not_yet_valid"] = now < nbf
+				if now < nbf {
+					warnings = append(warnings, "token not yet valid (nbf)")
+				}
+			}
+			if iat, ok := jwtNumericClaim(pm["iat"]); ok {
+				out["iat"] = iat
+				out["iat_rfc3339"] = time.Unix(iat, 0).UTC().Format(time.RFC3339)
+			}
+			for _, k := range []string{"iss", "sub", "aud", "jti"} {
+				if v, ok := pm[k]; ok {
+					out[k] = v
+				}
+			}
+		}
+		if len(warnings) > 0 {
+			out["warnings"] = warnings
+		}
+		return out, nil
+	}
+}
+
+// jwtNumericClaim accepts JSON numbers and numeric strings (LLMs sometimes
+// re-emit claims as strings after round-tripping).
+func jwtNumericClaim(v any) (int64, bool) {
+	switch x := v.(type) {
+	case float64:
+		return int64(x), true
+	case int:
+		return int64(x), true
+	case int64:
+		return x, true
+	case json.Number:
+		i, err := x.Int64()
+		return i, err == nil
+	case string:
+		i, err := strconv.ParseInt(strings.TrimSpace(x), 10, 64)
+		return i, err == nil
+	}
+	return 0, false
 }
 
 func CidrCalcSchema() Skill {

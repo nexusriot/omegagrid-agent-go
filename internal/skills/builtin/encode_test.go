@@ -5,6 +5,78 @@ import (
 	"testing"
 )
 
+func TestJwtInspect(t *testing.T) {
+	// header {"alg":"HS256","typ":"JWT"} payload {"sub":"42","exp":4102444800}
+	// exp = 2100-01-01T00:00:00Z — far future so the test is not time-sensitive.
+	token := "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0MiIsImV4cCI6NDEwMjQ0NDgwMH0.sig"
+
+	m := runExec(t, JwtInspect(), map[string]any{"token": token})
+	if m["error"] != nil {
+		t.Fatalf("jwt_inspect error: %v", m["error"])
+	}
+	if m["alg"] != "HS256" {
+		t.Fatalf("alg = %v", m["alg"])
+	}
+	if m["sub"] != "42" {
+		t.Fatalf("sub = %v", m["sub"])
+	}
+	if m["verified"] != false {
+		t.Fatal("verified must always be false")
+	}
+	if m["signature_present"] != true {
+		t.Fatal("signature_present want true")
+	}
+	if m["expired"] != false {
+		t.Fatalf("expired = %v", m["expired"])
+	}
+
+	t.Run("alg_none", func(t *testing.T) {
+		// {"alg":"none","typ":"JWT"}.{"sub":"x"}.
+		none := "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiJ4In0."
+		m := runExec(t, JwtInspect(), map[string]any{"token": none})
+		if m["alg_none"] != true {
+			t.Fatalf("alg_none = %v (%#v)", m["alg_none"], m)
+		}
+		warns, _ := m["warnings"].([]string)
+		if len(warns) == 0 {
+			t.Fatal("expected warnings for alg=none")
+		}
+	})
+
+	t.Run("bearer_prefix", func(t *testing.T) {
+		m := runExec(t, JwtInspect(), map[string]any{"token": "Bearer " + token})
+		if m["error"] != nil {
+			t.Fatalf("error: %v", m["error"])
+		}
+		if m["sub"] != "42" {
+			t.Fatalf("sub = %v", m["sub"])
+		}
+	})
+
+	t.Run("expired", func(t *testing.T) {
+		// exp = 1 (1970)
+		tok := "eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjF9.x"
+		m := runExec(t, JwtInspect(), map[string]any{"token": tok})
+		if m["expired"] != true {
+			t.Fatalf("expired = %v", m["expired"])
+		}
+	})
+
+	t.Run("missing", func(t *testing.T) {
+		m := runExec(t, JwtInspect(), map[string]any{})
+		if m["error"] == nil {
+			t.Fatal("missing token accepted")
+		}
+	})
+
+	t.Run("bad_segments", func(t *testing.T) {
+		m := runExec(t, JwtInspect(), map[string]any{"token": "onlyone"})
+		if m["error"] == nil {
+			t.Fatal("single segment accepted")
+		}
+	})
+}
+
 func TestBase64(t *testing.T) {
 	enc := runExec(t, Base64(), map[string]any{"action": "encode", "text": "hello"})
 	assertSubset(t, enc, map[string]any{"action": "encode", "input": "hello", "output": "aGVsbG8="})

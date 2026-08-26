@@ -23,7 +23,8 @@ func allSchemas() []Skill {
 	return []Skill{
 		WeatherSchema(), HttpRequestSchema(), WebScrapeSchema(), HttpHealthSchema(), IpInfoSchema(),
 		DnsLookupSchema(), PingCheckSchema(), PortScanSchema(), WhoisLookupSchema(),
-		Base64Schema(), HashSchema(), UuidGenSchema(), PasswordGenSchema(), CidrCalcSchema(),
+		TlsProbeSchema(), HttpHeadersSchema(), BannerGrabSchema(), PtrLookupSchema(), EmailAuthSchema(),
+		Base64Schema(), HashSchema(), UuidGenSchema(), PasswordGenSchema(), CidrCalcSchema(), JwtInspectSchema(),
 		DateTimeSchema(), MathEvalSchema(), CronScheduleSchema(), ReminderSchema(),
 		ShellCommandSchema(), SshCommandSchema(), QrGenerateSchema(),
 	}
@@ -65,7 +66,7 @@ func TestEverySchemaIsWellFormed(t *testing.T) {
 			}
 		}
 	}
-	if len(seen) != 21 {
+	if len(seen) != 27 {
 		t.Fatalf("allSchemas covers %d skills; keep it in sync with registerBuiltins", len(seen))
 	}
 }
@@ -76,6 +77,8 @@ func TestRequiredParametersAreDeclared(t *testing.T) {
 	want := map[string]string{
 		"weather": "city", "http_request": "url", "web_scrape": "url", "http_health": "url",
 		"dns_lookup": "domain", "ping_check": "host", "port_scan": "host", "whois_lookup": "domain",
+		"tls_probe": "host", "http_headers": "url", "banner_grab": "host", "ptr_lookup": "ip",
+		"email_auth": "domain", "jwt_inspect": "token",
 		"hash_skill": "text", "cidr_calc": "cidr", "math_eval": "expression",
 		"cron_schedule": "expression", "reminder": "message", "qr_generate": "data",
 		"shell_command": "command",

@@ -3,7 +3,7 @@
 ## 1. Overview
 
 OmegaGrid Agent Go is a pure Go rewrite of the omegagrid-agent platform.
-The gateway, agent loop, scheduler, Telegram bot, all 22 skills, vector memory,
+The gateway, agent loop, scheduler, Telegram bot, all 28 skills, vector memory,
 and conversation history are compiled into static Go binaries — no Python sidecar.
 A React web UI is served by a dedicated **frontend** nginx service.
 All source is self-contained in this repository, making
@@ -94,11 +94,12 @@ omegagrid-agent-go/
 │   ├── skills/
 │   │   ├── client.go            #   Public API — List() / Execute() / Register(); wires registry
 │   │   ├── registry.go          #   Thread-safe sync.RWMutex skill map
-│   │   ├── builtin/             #   Go implementations of all 22 built-in skills
+│   │   ├── builtin/             #   Go implementations of 27 of the 28 built-in skills
 │   │   │   ├── helpers.go       #     Local types (Skill/Param/Executor) + arg helpers
 │   │   │   ├── web.go           #     weather, http_request, web_scrape, http_health, ip_info
 │   │   │   ├── network.go       #     dns_lookup, ping_check, port_scan, whois_lookup
-│   │   │   ├── encode.go        #     base64, hash, uuid_gen, password_gen, cidr_calc
+│   │   │   ├── recon.go         #     tls_probe, http_headers, banner_grab, ptr_lookup, email_auth
+│   │   │   ├── encode.go        #     base64, hash, uuid_gen, password_gen, cidr_calc, jwt_inspect
 │   │   │   ├── eval.go          #     datetime, math_eval (safe AST parser), cron_schedule
 │   │   │   ├── reminder.go      #     reminder (echo message for one-shot scheduled tasks)
 │   │   │   ├── exec.go          #     shell_command, ssh_command
@@ -530,7 +531,7 @@ in a single pass.  `openAIEmbeddings` uses Bearer authentication and parses
 
 ### 3.5 Skills (`internal/skills`)
 
-All 22 skills run in-process inside the gateway binary via a thread-safe
+All 28 skills run in-process inside the gateway binary via a thread-safe
 `Registry`.  The `skills.Client` wraps the registry with the public `List()`
 and `Execute()` API consumed by the agent loop and HTTP handlers.
 
@@ -557,7 +558,7 @@ parameter list) for the same reason.
 
 #### Built-in skills (`builtin/`)
 
-22 skills compiled directly into the gateway binary: 21 in `builtin/`, plus
+28 skills compiled directly into the gateway binary: 27 in `builtin/`, plus
 `skill_creator` (defined in `client.go`).  Local `Skill`/`Param` types are
 defined in `builtin/helpers.go` to avoid import cycles; `client.go` converts
 them to the top-level `skills.Skill` type via `toSkill()`.
@@ -566,13 +567,51 @@ them to the top-level `skills.Skill` type via `toSkill()`.
 |---|---|
 | `web.go` | `weather`, `http_request`, `web_scrape`, `http_health`, `ip_info` |
 | `network.go` | `dns_lookup`, `ping_check`, `port_scan`, `whois_lookup` |
-| `encode.go` | `base64_skill`, `hash_skill`, `uuid_gen`, `password_gen`, `cidr_calc` |
+| `recon.go` | `tls_probe`, `http_headers`, `banner_grab`, `ptr_lookup`, `email_auth` |
+| `encode.go` | `base64_skill`, `hash_skill`, `uuid_gen`, `password_gen`, `cidr_calc`, `jwt_inspect` |
 | `eval.go` | `datetime_skill`, `math_eval`, `cron_schedule` |
 | `reminder.go` | `reminder` |
 | `exec.go` | `shell_command`, `ssh_command` |
 | `qr.go` | `qr_generate` |
 
 Key implementation notes:
+
+- **`tls_probe`** — `crypto/tls` dial with `InsecureSkipVerify` so the peer
+  chain is always returned; `verify_ok` / `verify_error` report what a normal
+  system-roots + SNI check would say, against the name in `verify_name`.  When
+  the target is an IP there is no SNI, and an empty `DNSName` makes `Verify`
+  skip name checking entirely — reporting `verify_ok: true` for a certificate
+  that does not cover the address; the IP is used as the verify name instead, so
+  IP SANs are actually checked.  Leaf SANs, expiry, protocol, cipher and ALPN
+  are surfaced as top-level fields for the agent.
+
+- **`http_headers`** — manual redirect loop (up to `max_redirects`) so every
+  hop's status and `Location` are recorded; flattens response headers, cookie
+  flags (`Secure`/`HttpOnly`/`SameSite`), and a security-header present/missing
+  set (HSTS, CSP, XFO, XCTO, Referrer-Policy, Permissions-Policy).
+
+- **`banner_grab`** — TCP connect + optional TLS wrap + optional probe bytes
+  (`\r\n` escapes expanded); returns printable banner + hex, capped at 8 KiB.
+
+- **`ptr_lookup`** — `net.LookupAddr` after strict IP parse.
+
+- **`email_auth`** — SPF (`v=spf1`) and DMARC (`_dmarc.`) TXT filters; optional
+  comma-separated DKIM selectors (`selector._domainkey.`), which may contain
+  dots (RFC 6376 allows a label sequence).  The whole call is bounded: at most
+  `maxDKIMSelectors` (10) selectors are probed and every lookup shares one
+  `context` deadline (`timeout`, default 10s).  `net.LookupTXT` takes no context
+  at all, and the selector list comes from the model — 60 selectors cost ~9s of
+  serial lookups even with no network reachable, and minutes against a slow
+  resolver, blocking the agent step for the duration.  Selectors that are
+  invalid or past the cap come back in `dkim_skipped` with a reason instead of
+  disappearing.  DNS goes through the package-level `lookupTXT` seam so tests
+  cover record filtering without a network.
+
+- **`jwt_inspect`** — base64url-decodes header/payload only (never verifies);
+  flags `alg=none`, `exp`/`nbf` timing, and common claims.  It is in
+  `sensitiveSkills`, so its args and result are redacted in the audit log: the
+  argument is a live bearer token and `/api/invocations` has no auth in front
+  of it.  The model still receives the full result in-band.
 
 - **`math_eval`** — recursive-descent AST parser (`parseAddSub → parseMulDiv →
   parsePow → parseUnary → parsePrimary`).  Supports `//` floor division, `**`
@@ -1480,7 +1519,7 @@ which could hand two in-flight requests the same JSON-RPC id.
 - **SQLite via pure Go** — `modernc.org/sqlite` needs no CGO, simplifying
   cross-compilation and distroless deployment.
 - **Fast startup** — sub-second cold start vs Python's multi-second import chain.
-- **Single deploy unit** — one binary contains the gateway, all 22 skills,
+- **Single deploy unit** — one binary contains the gateway, all 28 skills,
   vector memory, history, and embeddings.  No sidecar to keep in sync.
 
 ### Why chromem-go instead of ChromaDB?
@@ -1563,8 +1602,13 @@ the only path that serves the UI in any deployment.
 
 ## 10. Testing
 
-`./run_tests.sh` runs the suite locally with `-race`; `make test` runs it in the
-container from `Dockerfile.test` (no race detector — Alpine builds with CGO off).
+Two suites, answering different questions:
+
+| Suite | Command | What it proves |
+|---|---|---|
+| Unit / integration | `./run_tests.sh` (`-race`), `make test` (in `Dockerfile.test`) | Every package in isolation, with real SQLite and chromem stores in `t.TempDir()` |
+| End-to-end | `make e2e` (`scripts/e2e.sh`) | A **running gateway**, over HTTP, from outside the process |
+
 Coverage per package is listed in the README.
 
 **No test touches the network.** The seams that make that possible:
@@ -1578,6 +1622,40 @@ Coverage per package is listed in the README.
 | Telegram | `tgbotapi.NewBotAPIWithAPIEndpoint` pointed at an `httptest` server that answers `getMe` and records outgoing messages |
 | Remote MCP servers | an `httptest` JSON-RPC server; one test also serves the single-event SSE variant |
 | SQLite / chromem-go | real stores in `t.TempDir()` — they are pure Go and fast enough to use for real |
+
+### End-to-end suite (`test/e2e`, `docker-compose.e2e.yml`)
+
+`make e2e` builds the gateway from **`docker/gateway.Dockerfile` — the same
+image definition production uses** — and runs it next to a mock model and the
+compiled test binary on a compose network declared `internal: true`. The suite
+imports none of the project's own packages: it only sees what a client sees, so
+it covers the seams unit tests cannot reach.
+
+| Piece | Role |
+|---|---|
+| `test/e2e/mockllm` | Stands in for Ollama. `POST /api/chat` serves replies from a queue the tests load through `POST /__control/script`; `GET /__control/requests` returns every chat request the gateway made, so a test can assert what the agent actually put in the model's context. Embeddings are a hashed bag of words — deterministic (so dedup is reproducible) and similarity-bearing (so `vector_search` returns something worth asserting on). |
+| `gateway` | The real image, configured entirely through environment variables, writing to a throwaway volume. |
+| `gateway-locked` | The same image with `PLAYGROUND_DISABLED` and `MCP_SERVER_DISABLED` set, which is how the suite proves those flags reach the router rather than just the config struct. |
+| `runner` | `go test -tags e2e -c` compiled into a binary at image-build time, so the run phase needs neither the toolchain nor the module proxy. |
+
+What only this suite can check: process boot from environment variables;
+SQLite + chromem on a real filesystem, including surviving a restart
+(`scripts/e2e.sh` restarts the gateway and re-runs
+`TestPersistenceSurvivesRestart`); the scheduler goroutine actually firing a
+task; SSE framing over a socket; an image attachment surviving the whole path
+from `qr_generate` to the final event with the base64 kept *out* of the model's
+context; the MCP endpoint as a separate protocol surface; and audit redaction
+for a credential-handling skill.
+
+`TestNetworkIsolation` dials the public internet and requires it to fail — if
+the stack is ever given a route out, the suite says so instead of quietly
+becoming dependent on the outside world. The build phase is the only step that
+needs a network.
+
+`scripts/e2e.sh --host` runs the identical tests against locally built binaries
+in a few seconds, for iterating on a test. It is not network-isolated, so
+`TestNetworkIsolation` and the locked-gateway checks skip themselves; CI should
+run the Docker mode.
 
 **Verifying the web UI — use `npm run build` (or `make web`), not `tsc --noEmit`.**
 `web/tsconfig.json` is a solution-style file: `"files": []` plus references to

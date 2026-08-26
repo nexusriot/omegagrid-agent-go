@@ -121,12 +121,18 @@ func registerBuiltins(reg *Registry, cfg config.Config) {
 	reg.register(toSkill(builtin.PingCheckSchema()), builtin.PingCheck())
 	reg.register(toSkill(builtin.PortScanSchema()), builtin.PortScan())
 	reg.register(toSkill(builtin.WhoisLookupSchema()), builtin.WhoisLookup())
+	reg.register(toSkill(builtin.TlsProbeSchema()), builtin.TlsProbe())
+	reg.register(toSkill(builtin.HttpHeadersSchema()), builtin.HttpHeaders())
+	reg.register(toSkill(builtin.BannerGrabSchema()), builtin.BannerGrab())
+	reg.register(toSkill(builtin.PtrLookupSchema()), builtin.PtrLookup())
+	reg.register(toSkill(builtin.EmailAuthSchema()), builtin.EmailAuth())
 
 	reg.register(toSkill(builtin.Base64Schema()), builtin.Base64())
 	reg.register(toSkill(builtin.HashSchema()), builtin.Hash())
 	reg.register(toSkill(builtin.UuidGenSchema()), builtin.UuidGen())
 	reg.register(toSkill(builtin.PasswordGenSchema()), builtin.PasswordGen())
 	reg.register(toSkill(builtin.CidrCalcSchema()), builtin.CidrCalc())
+	reg.register(toSkill(builtin.JwtInspectSchema()), builtin.JwtInspect())
 
 	reg.register(toSkill(builtin.DateTimeSchema()), builtin.DateTime())
 	reg.register(toSkill(builtin.MathEvalSchema()), builtin.MathEval())

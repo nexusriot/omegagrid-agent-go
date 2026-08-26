@@ -3,7 +3,7 @@
 export UID := $(shell id -u)
 export GID := $(shell id -g)
 
-.PHONY: web build build-all cli dev-web migrate-vector vector-export vector-import vector-migrate vet test init
+.PHONY: web build build-all cli dev-web migrate-vector vector-export vector-import vector-migrate vet test e2e e2e-host init
 
 ## Create ./data with correct ownership (run once before first docker compose up)
 init:
@@ -36,6 +36,16 @@ vet:
 ## Needs only Docker on the host — no local Go toolchain required.
 test:
 	./run_tests.sh --docker
+
+## Run the hermetic end-to-end backend suite: the real gateway image plus a
+## mock LLM on an internal Docker network with no route off the host.
+e2e:
+	./scripts/e2e.sh
+
+## Same suite against locally built binaries — seconds per cycle, no Docker,
+## but NOT network-isolated. For iterating on a test; CI should run `make e2e`.
+e2e-host:
+	./scripts/e2e.sh --host
 
 ## Run the Vite dev server (proxies /api to localhost:8000)
 dev-web:

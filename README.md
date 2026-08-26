@@ -1,7 +1,7 @@
 # omegagrid-agent-go
 
 Pure Go rewrite of the [omegagrid-agent](https://github.com/nexusriot/omegagrid-agent) platform.
-The gateway, agent loop, scheduler, Telegram bot, all 22 skills, vector memory, and conversation
+The gateway, agent loop, scheduler, Telegram bot, all 28 skills, vector memory, and conversation
 history are compiled Go binaries — no Python sidecar.  A React web UI provides a browser
 interface for chat, memory, skills, and the scheduler.  All source is self-contained in this
 repository.
@@ -55,10 +55,11 @@ internal/
   skills/               In-process skill registry
     client.go           Public API — List() / Execute()
     registry.go         Thread-safe sync.RWMutex skill map
-    builtin/            Go implementations of all 22 built-in skills
+    builtin/            Go implementations of 27 of the 28 built-in skills
       web.go            weather, http_request, web_scrape, http_health, ip_info
       network.go        dns_lookup, ping_check, port_scan, whois_lookup
-      encode.go         base64, hash, uuid_gen, password_gen, cidr_calc
+      recon.go          tls_probe, http_headers, banner_grab, ptr_lookup, email_auth
+      encode.go         base64, hash, uuid_gen, password_gen, cidr_calc, jwt_inspect
       eval.go           datetime, math_eval (safe parser), cron_schedule
       reminder.go       reminder (echo message for one-shot scheduled tasks)
       exec.go           shell_command, ssh_command
@@ -199,15 +200,34 @@ make vector-migrate   # ChromaDB → chromem-go migration (see below)
 
 ### Tests
 
-`make test` needs only Docker. With a local Go toolchain, drive the same suite
-directly — this is the faster loop and the only way to get the race detector,
-which the Alpine container build cannot run:
+Two suites. `make test` (unit/integration) needs only Docker; with a local Go
+toolchain, drive the same suite directly — that is the faster loop and the only
+way to get the race detector, which the Alpine container build cannot run:
 
 ```bash
 ./run_tests.sh              # local, with -race (default)
 ./run_tests.sh --no-race    # local, faster
 ./run_tests.sh --docker     # what `make test` runs
 ```
+
+`make e2e` is the end-to-end suite: it builds the gateway from the production
+Dockerfile and drives the running service over HTTP, next to a mock model, on a
+Docker network with no route off the host. It covers what unit tests cannot —
+boot from environment variables, SQLite and chromem on disk (including across a
+restart), the scheduler goroutine firing a task, SSE framing over a socket,
+image attachments, the MCP endpoint, and audit redaction.
+
+```bash
+make e2e                          # hermetic: real gateway image + mock LLM in Docker
+./scripts/e2e.sh -r TestMemory    # just the tests matching a pattern
+./scripts/e2e.sh -k --logs        # keep the stack up and dump service logs
+./scripts/e2e.sh --host           # same tests against local binaries, seconds per cycle
+make e2e-host                     # the same thing
+```
+
+`TestNetworkIsolation` dials the internet and requires it to fail, so the suite
+tells you immediately if it ever stops being hermetic. Only the image build
+needs a network.
 
 Coverage, by package:
 
@@ -302,7 +322,7 @@ Everything is compiled into the gateway binary (pure Go, no CGO, distroless runt
 - `VectorStore` — chromem-go cosine-similarity memory with SHA256 + semantic dedup (0.08 threshold)
 - Embeddings clients — Ollama (3-endpoint fallback) + OpenAI
 
-**Built-in skills (22 total):**
+**Built-in skills (28 total):**
 
 | Skill | Description |
 |---|---|
@@ -316,11 +336,17 @@ Everything is compiled into the gateway binary (pure Go, no CGO, distroless runt
 | `ping_check` | TCP connect reachability check |
 | `port_scan` | Concurrent TCP port scanner (up to 1024 ports, each within 1–65535) |
 | `whois_lookup` | WHOIS via raw TCP (IANA → authoritative server) |
+| `tls_probe` | TLS handshake probe: cert chain, SANs, expiry, protocol, cipher, ALPN, verify status |
+| `http_headers` | Status, redirect chain, response headers, cookie flags, security-header posture |
+| `banner_grab` | TCP banner grab with optional probe bytes / TLS wrap |
+| `ptr_lookup` | Reverse DNS (PTR) for an IPv4/IPv6 address |
+| `email_auth` | SPF + DMARC TXT lookup; optional DKIM selector probes (max 10, shared `timeout`) |
 | `base64_skill` | Encode / decode Base64 (decoding accepts standard and URL-safe alphabets, padded or not) |
 | `hash_skill` | MD5 / SHA1 / SHA256 / SHA512 |
 | `uuid_gen` | UUID v1 / v3 / v4 / v5 |
 | `password_gen` | Cryptographically secure password generator |
 | `cidr_calc` | CIDR network details + IP membership check |
+| `jwt_inspect` | Decode JWT header/payload without verifying; flags `alg=none` and exp/nbf.  Args/result are redacted in the audit log |
 | `math_eval` | Safe expression evaluator (custom AST parser, no `eval`) |
 | `cron_schedule` | Parse cron expression, explain it, show next N run times. Out-of-range fields are rejected rather than yielding an empty run list |
 | `reminder` | Echo a message back; used by one-shot scheduled tasks to deliver reminders at a set time |

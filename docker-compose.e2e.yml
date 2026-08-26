@@ -1,0 +1,110 @@
+# Hermetic end-to-end stack. Drive it with ./scripts/e2e.sh — running the
+# services by hand is supported but the script handles readiness, the restart
+# phase, log capture and teardown.
+#
+#   mockllm         deterministic Ollama stand-in (chat + embeddings)
+#   gateway         the real gateway image, built from docker/gateway.Dockerfile
+#   gateway-locked  same image with the playground and MCP switched off, so the
+#                   config flags are proven to reach the router
+#   runner          the compiled e2e test binary
+#
+# The network is `internal: true`: containers can talk to each other and to
+# nothing else. TestNetworkIsolation asserts that from the inside, so the suite
+# fails loudly if this stack is ever given a route out.
+#
+# No ports are published. Nothing here touches ./data or the production
+# compose file's volumes — state lives in throwaway named volumes.
+
+name: omegagrid-e2e
+
+networks:
+  e2e:
+    internal: true
+
+volumes:
+  gateway-data:
+  gateway-locked-data:
+
+services:
+
+  mockllm:
+    build:
+      context: .
+      dockerfile: docker/e2e.Dockerfile
+      target: mockllm
+    networks: [e2e]
+    command: ["-addr", ":11434"]
+
+  gateway:
+    build:
+      context: .
+      dockerfile: docker/gateway.Dockerfile
+    depends_on: [mockllm]
+    networks: [e2e]
+    # The distroless image runs as nonroot, but a fresh named volume is owned by
+    # root, so the gateway could not create its databases. This is a throwaway
+    # test stack; production keeps the nonroot user and a host-owned bind mount.
+    user: "0:0"
+    environment:
+      BACKEND_PORT: "8000"
+      DATA_DIR: /app/data
+      LLM_PROVIDER: ollama
+      OLLAMA_URL: http://mockllm:11434
+      OLLAMA_MODEL: e2e-model
+      OLLAMA_EMBED_MODEL: e2e-embed
+      OLLAMA_TIMEOUT: "30"
+      # A tick per second keeps the scheduler test quick; cron still matches on
+      # whole minutes, so a "* * * * *" task fires on the first tick after it is
+      # created rather than up to a minute later.
+      SCHEDULER_TICK_SEC: "1"
+      AGENT_MAX_STEPS: "8"
+      AGENT_CONTEXT_TAIL: "10"
+      AGENT_MEMORY_HITS: "3"
+      AGENT_PARALLEL_TOOLS: "true"
+      AGENT_MAX_PARALLEL: "3"
+      # Off by default: the extraction pass would consume scripted replies out
+      # from under the test that queued them.
+      AUTO_MEMORY_EXTRACT: "false"
+      AUDIT_MAX_BLOB_BYTES: "65536"
+      SKILLS_DIR: /app/data/skills
+      SKILL_SHELL_ENABLED: "false"
+      SKILL_SSH_ENABLED: "false"
+      PLAYGROUND_DISABLED: "false"
+      MCP_SERVER_DISABLED: "false"
+    volumes:
+      - gateway-data:/app/data
+
+  gateway-locked:
+    build:
+      context: .
+      dockerfile: docker/gateway.Dockerfile
+    depends_on: [mockllm]
+    networks: [e2e]
+    user: "0:0"
+    environment:
+      BACKEND_PORT: "8000"
+      DATA_DIR: /app/data
+      LLM_PROVIDER: ollama
+      OLLAMA_URL: http://mockllm:11434
+      OLLAMA_MODEL: e2e-model
+      OLLAMA_EMBED_MODEL: e2e-embed
+      SKILLS_DIR: /app/data/skills
+      SCHEDULER_TICK_SEC: "60"
+      PLAYGROUND_DISABLED: "true"
+      MCP_SERVER_DISABLED: "true"
+    volumes:
+      - gateway-locked-data:/app/data
+
+  runner:
+    build:
+      context: .
+      dockerfile: docker/e2e.Dockerfile
+      target: runner
+    depends_on: [gateway, gateway-locked, mockllm]
+    networks: [e2e]
+    environment:
+      E2E_BASE_URL: http://gateway:8000
+      E2E_LOCKED_URL: http://gateway-locked:8000
+      E2E_MOCK_URL: http://mockllm:11434
+      E2E_EXPECT_ISOLATED: "1"
+      E2E_PHASE: "${E2E_PHASE:-main}"

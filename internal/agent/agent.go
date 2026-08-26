@@ -670,11 +670,15 @@ func (s *Service) buildMeta(st *runState, step int, fallback bool) map[string]an
 	return out
 }
 
-// sensitiveSkills have their args and result redacted in the audit log.
+// sensitiveSkills have their args and result redacted in the audit log. The
+// model still receives the real result — only the persisted record is redacted,
+// and /api/invocations serves that record with no authentication in front of
+// it. jwt_inspect belongs here because its argument *is* a live bearer token.
 var sensitiveSkills = map[string]bool{
 	"password_gen":  true,
 	"shell_command": true,
 	"ssh_command":   true,
+	"jwt_inspect":   true,
 }
 
 func (s *Service) buildSystemPrompt(tools map[string]Skill, skillNames map[string]bool) string {

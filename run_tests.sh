@@ -6,6 +6,10 @@
 #   ./run_tests.sh --docker     # build Docker test image and run inside container
 #   ./run_tests.sh --no-race    # local, without race detector (faster)
 #   ./run_tests.sh --help       # print this help
+#
+# This is the unit/integration suite. The end-to-end suite — a real gateway
+# image driven over HTTP on an isolated network — lives in scripts/e2e.sh
+# (`make e2e`); the `e2e` build tag keeps it out of this run.
 
 set -euo pipefail
 
@@ -21,7 +25,7 @@ for arg in "$@"; do
     --docker)   DOCKER=true ;;
     --no-race)  RACE_FLAG="" ;;
     --help|-h)
-      sed -n '2,10p' "$0"   # print the header comment
+      sed -n '2,12p' "$0"   # print the header comment
       exit 0
       ;;
     *)

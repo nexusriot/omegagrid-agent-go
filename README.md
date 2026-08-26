@@ -67,6 +67,9 @@ internal/
     markdown/           Markdown skill loader + pipeline executor
   search/               Native web_search skill (DuckDuckGo HTML scrape, no API key)
   telegram/             Bot poller, command handlers, SQLite auth allowlist
+test/e2e/               End-to-end suite — drives a running gateway over HTTP
+  e2e_test.go           Build tag `e2e`; imports no project packages
+  mockllm/              Deterministic Ollama stand-in (chat queue + embeddings)
 web/                    React frontend — built by frontend container, served by nginx
   src/
     api/                TypeScript REST client, SSE stream helper, API types
@@ -76,13 +79,18 @@ web/                    React frontend — built by frontend container, served b
   package.json          Vite + React 18 + TypeScript + Tailwind project
 docker/
   frontend.Dockerfile   node:20-alpine build → nginx:1.27-alpine serve
-  gateway.Dockerfile    golang:1.25-bookworm build → distroless runtime (~19 MB)
-  telegram.Dockerfile   golang:1.25-bookworm build → distroless runtime (~15 MB)
+  gateway.Dockerfile    golang:1.25-bookworm build → distroless runtime (~16 MB)
+  telegram.Dockerfile   golang:1.25-bookworm build → distroless runtime (~12 MB)
+  e2e.Dockerfile        mockllm + the compiled e2e test binary
   migrate.Dockerfile    Two-stage: Python exporter + Go importer (migration only)
   nginx.conf            SPA routing + /api proxy + SSE streaming support
 docker-compose.yml           3-service stack (frontend + gateway + telegram-bot)
+docker-compose.e2e.yml       e2e stack (mockllm + gateway + gateway-locked + runner)
 docker-compose.migrate.yml   One-shot migration containers
-Makefile               web / build / build-all / dev-web / vector-migrate targets
+scripts/e2e.sh         Runs the end-to-end suite (docker, or --host for a fast loop)
+run_tests.sh           Runs the unit suite (local -race, or --docker)
+Dockerfile.test        Image `make test` runs the unit suite in
+Makefile               init / web / build / build-all / cli / vet / test / e2e / e2e-host / dev-web / vector-* targets
 ```
 
 ## Running with Docker Compose
@@ -188,13 +196,16 @@ TELEGRAM_BOT_TOKEN=... GATEWAY_URL=http://127.0.0.1:8000 \
 ### Makefile shortcuts
 
 ```bash
+make init         # mkdir -p data/skills  (run once before the first compose up)
 make web          # cd web && npm run build  (populates web/dist/)
 make build        # web + go build -o bin/gateway
 make build-all    # web + build gateway + telegram-bot + migrate-vector + omega CLI
 make cli          # go build -o bin/omega ./cmd/cli
 make dev-web      # cd web && npm run dev  (Vite dev server, hot-reload)
 make vet          # go vet ./...
-make test         # run the Go test suite inside a Docker container (Dockerfile.test)
+make test         # unit suite inside a Docker container (Dockerfile.test)
+make e2e          # end-to-end suite: real gateway image + mock LLM, network-isolated
+make e2e-host     # the same tests against local binaries (fast, not isolated)
 make vector-migrate   # ChromaDB → chromem-go migration (see below)
 ```
 
@@ -237,18 +248,21 @@ Coverage, by package:
 | `internal/observability` | 100% | |
 | `internal/search` | 95% | DuckDuckGo HTML parsing driven through a fake `http.RoundTripper` |
 | `internal/llm` | 94% | both providers against `httptest`, including the retry schedule |
-| `internal/skills` | 93% | `skill_creator` YAML output is loaded back and compared |
+| `internal/skills` | 94% | `skill_creator` YAML output is loaded back and compared |
 | `internal/mcp` | 90% | JSON and single-event SSE transports, both directions |
 | `internal/bootstrap` | 89% | `New()` wires real stores against a temp dir |
 | `internal/skills/markdown` | 86% | |
 | `internal/telegram` | 85% | handlers run against a fake Telegram API (`NewBotAPIWithAPIEndpoint`) |
-| `internal/skills/builtin` | 83% | everything except the skills hardcoded to third-party URLs |
+| `internal/skills/builtin` | 82% | everything except the skills hardcoded to third-party URLs |
 | `internal/memory` | 82% | vector store uses a deterministic fake embeddings client |
-| `internal/scheduler` | 79% | |
-| `internal/agent` | 78% | the loop is driven end-to-end with a scripted model |
+| `internal/scheduler` | 81% | |
+| `internal/agent` | 81% | the loop is driven end-to-end with a scripted model |
 | `internal/httpapi` | 73% | router-level, real stores, scripted model |
-| `cmd/cli` | 19% | the HTTP/parsing helpers; the `flag`-parsing subcommands call `os.Exit` |
-| `cmd/gateway`, `cmd/telegram-bot`, `cmd/migrate-vector` | 0% | `main()` wrappers over `internal/` |
+| `cmd/cli` | 20% | the HTTP/parsing helpers; the `flag`-parsing subcommands call `os.Exit` |
+| `cmd/gateway`, `cmd/telegram-bot`, `cmd/migrate-vector` | 0% | `main()` wrappers over `internal/` — exercised by the e2e suite instead |
+
+`test/e2e` carries no coverage figure: it drives the gateway from outside the
+process, so nothing it exercises is attributed to the packages under test.
 
 No test reaches the network: outbound calls go to `httptest` servers, injected
 transports, or local listeners. `weather` and `ip_info` are the exception — their
@@ -378,7 +392,9 @@ transport (no SDK dependency).
 
 **As an MCP server** — every registered skill (built-in, dynamic, native, and
 any consumed remote tools) is exposed as an MCP tool at `POST /mcp`. Point any
-MCP client (Claude Desktop, Cursor, …) at `http://<gateway>/mcp`:
+MCP client (Claude Desktop, Cursor, …) at the **gateway** port — the frontend
+nginx proxies `/ui/`, `/health` and `/api/` but deliberately not `/mcp`, so use
+`http://<host>:${BACKEND_PORT:-8000}/mcp`, not the UI port:
 
 ```bash
 # initialize

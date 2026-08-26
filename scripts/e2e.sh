@@ -51,7 +51,7 @@ HOST_TMP=""
 GATEWAY_PID=""
 MOCK_PID=""
 
-usage() { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in

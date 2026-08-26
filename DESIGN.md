@@ -110,6 +110,9 @@ omegagrid-agent-go/
 │       ├── agent_client.go      #   Calls gateway /api/query[/stream]
 │       ├── auth.go              #   SQLite-backed Telegram user allowlist
 │       └── bot.go               #   Update poller + command handlers
+├── test/e2e/                    # End-to-end suite — drives a running gateway over HTTP
+│   ├── e2e_test.go              #   Build tag `e2e`; imports no project packages
+│   └── mockllm/main.go          #   Deterministic Ollama stand-in (chat queue + embeddings)
 ├── web/                         # React frontend (Vite + TypeScript + Tailwind)
 │   ├── package.json
 │   ├── vite.config.ts           #   base: '/ui/', dev proxy → :8000
@@ -138,13 +141,18 @@ omegagrid-agent-go/
 │           └── Health.tsx       #   Gateway status, auto-refresh
 ├── docker/
 │   ├── frontend.Dockerfile      # node:20-alpine build → nginx:1.27-alpine
-│   ├── gateway.Dockerfile       # golang:1.25-bookworm → distroless (~19 MB)
-│   ├── telegram.Dockerfile      # golang:1.25-bookworm → distroless (~15 MB)
+│   ├── gateway.Dockerfile       # golang:1.25-bookworm → distroless (~16 MB)
+│   ├── telegram.Dockerfile      # golang:1.25-bookworm → distroless (~12 MB)
 │   ├── migrate.Dockerfile       # Two-stage: Python exporter + Go importer
+│   ├── e2e.Dockerfile           # mockllm + the compiled e2e test binary
 │   └── nginx.conf               # SPA fallback + /api proxy + SSE tuning
+├── scripts/e2e.sh               # Runs the e2e suite (docker or --host mode)
+├── run_tests.sh                 # Runs the unit suite (local -race, or --docker)
+├── Dockerfile.test              # Image `make test` runs the unit suite in
 ├── docker-compose.yml           # 3-service stack (frontend, gateway, telegram-bot)
+├── docker-compose.e2e.yml       # e2e stack (mockllm, gateway, gateway-locked, runner)
 ├── docker-compose.migrate.yml   # One-shot migration containers
-├── Makefile                     # web / build / build-all / dev-web / vector-migrate / vet
+├── Makefile                     # init / web / build / build-all / cli / vet / test / e2e / e2e-host / dev-web / vector-*
 ├── .dockerignore
 ├── .env.example
 └── go.mod
@@ -314,9 +322,11 @@ for step = 1..MaxSteps:
   │
   └─ if type == "tool_call":
         runOne(state, batchCall{name, args, why, step})
-          ├─ execute skill or built-in tool
+          ├─ safeExecute() the skill or built-in tool — a panic becomes an
+          │    ordinary tool error instead of killing the process
           ├─ extract binary attachments (QR images, etc.)
-          ├─ write AuditRecord to skill_invocations (best-effort)
+          ├─ write AuditRecord to skill_invocations (best-effort, redacted
+          │    for sensitive skills)
           └─ return batchResult{result, elapsed, attachments}
         update timings + debug log
         append tool result to messages
@@ -476,7 +486,8 @@ INDEX ON skill_invocations(session_id, ts)
 INDEX ON skill_invocations(skill, ts)
 ```
 
-**Sensitive skills** (`password_gen`, `shell_command`, `ssh_command`) always
+**Sensitive skills** (`password_gen`, `shell_command`, `ssh_command`,
+`jwt_inspect`) always
 store `{"redacted": true}` for both args and result — raw values are never
 written to the database.
 
@@ -983,10 +994,12 @@ invocation is recorded exactly once regardless of how it was dispatched:
 ```
 runOne(state, batchCall{name, args, why, step})
   1. classify kind: skill / tool / unknown
-  2. execute entry.Execute(args) — or build an error result for unknown tools
+  2. safeExecute(entry.Execute, args) — a panic becomes a tool error; unknown
+     tool names get an error result listing what does exist
   3. measure elapsed time (the caller updates state.timings + state.debug)
   4. extract binary attachments (qr_generate images, etc.)
-  5. redact args + result for sensitive skills (password_gen, shell_command, ssh_command)
+  5. redact args + result for sensitive skills (password_gen, shell_command,
+     ssh_command, jwt_inspect)
   6. _ = s.Memory.AddInvocation(rec)   // best-effort — never aborts the agent loop
   7. return batchResult{result, elapsed, attachments}
 ```
@@ -1243,8 +1256,8 @@ volume.  The frontend service is stateless and needs no volume.
 | Image | Base | Approx. size | Build stages |
 |---|---|---|---|
 | `frontend` | `nginx:1.27-alpine` | ~50 MB | `node:20-alpine` → nginx |
-| `gateway` | `gcr.io/distroless/static-debian12` | ~19 MB | `golang:1.25-bookworm` → distroless |
-| `telegram-bot` | `gcr.io/distroless/static-debian12` | ~15 MB | `golang:1.25-bookworm` → distroless |
+| `gateway` | `gcr.io/distroless/static-debian12` | ~16 MB | `golang:1.25-bookworm` → distroless |
+| `telegram-bot` | `gcr.io/distroless/static-debian12` | ~12 MB | `golang:1.25-bookworm` → distroless |
 | `migrate` (exporter stage) | `python:3.11-slim` | ~500 MB | migration only |
 | `migrate` (importer stage) | `gcr.io/distroless/static-debian12` | ~10 MB | migration only |
 
@@ -1293,8 +1306,14 @@ For Ollama on the host machine,
 ### 6.4 nginx configuration (`docker/nginx.conf`)
 
 ```nginx
+location = / { return 302 /ui/; }    # bare root → the SPA
+
 location /ui/ {
     try_files $uri /ui/index.html;   # SPA fallback for client-side routing
+}
+
+location /health {                   # the Health page fetches this by origin
+    proxy_pass         http://gateway:8000;
 }
 
 location /api/ {
@@ -1307,6 +1326,11 @@ location /api/ {
 
 `proxy_buffering off` is critical for SSE: without it nginx buffers the
 response body and the browser receives no events until the connection closes.
+
+**`/mcp` is deliberately not proxied.** The frontend serves the browser UI;
+MCP clients connect to the gateway directly (`BACKEND_PORT`, published on
+`127.0.0.1:8000` by the compose file), which keeps the tool-calling surface off
+the port the UI is exposed on.
 
 ### 6.5 Local dev vs Docker difference
 
@@ -1341,9 +1365,13 @@ POST /api/query
   "answer": "It's 15°C and cloudy in London.",
   "meta": {"step_count": 1, "model": "llama3:latest", "timings": {...}},
   "memories": [...],
-  "debug_log": "..."
+  "debug_log": "...",
+  "attachments": [...]      // omitted unless a skill produced one (qr_generate)
 }
 ```
+
+`meta` also carries `fallback: true` when the answer is a recovery rather than
+a real model answer, and `max_steps_hit: true` when the loop ran out of steps.
 
 ```
 POST /api/query/stream
@@ -1513,7 +1541,7 @@ which could hand two in-flight requests the same JSON-RPC id.
 
 ### Why Go for everything?
 
-- **Compiled binaries** — single ~19 MB static binary, no runtime deps.
+- **Compiled binaries** — single ~14 MB static binary (`-trimpath -ldflags="-s -w"`), no runtime deps.
 - **Goroutine-based concurrency** — scheduler runner, SSE streaming, and
   request handling are natural goroutine workloads.
 - **SQLite via pure Go** — `modernc.org/sqlite` needs no CGO, simplifying
@@ -1621,6 +1649,7 @@ Coverage per package is listed in the README.
 | DuckDuckGo | an injected `http.RoundTripper` on `WebSearchSkill.client` (the URL is hardcoded, so the transport is the seam) |
 | Telegram | `tgbotapi.NewBotAPIWithAPIEndpoint` pointed at an `httptest` server that answers `getMe` and records outgoing messages |
 | Remote MCP servers | an `httptest` JSON-RPC server; one test also serves the single-event SSE variant |
+| DNS, for `email_auth` | the package-level `lookupTXT` seam is swapped for a table of canned TXT records, which also covers the SPF/DMARC/DKIM filtering |
 | SQLite / chromem-go | real stores in `t.TempDir()` — they are pure Go and fast enough to use for real |
 
 ### End-to-end suite (`test/e2e`, `docker-compose.e2e.yml`)
@@ -1665,10 +1694,14 @@ compiles *nothing* and exits 0 no matter what is broken. Only build mode
 `tsconfig.app.json`, where `noUnusedLocals` / `noUnusedParameters` live — so an
 unused import fails the Docker frontend image but passes `tsc --noEmit`.
 
-Two deliberate exceptions: `weather` and `ip_info` build hardcoded third-party
-URLs with no injection point, so only their argument handling is covered.
-`dns_lookup` and `ping_check` are exercised against `localhost` and a local
-listener respectively.
+Deliberate exceptions: `weather` and `ip_info` build hardcoded third-party URLs
+with no injection point, so only their argument handling is covered, and
+`ptr_lookup` calls `net.LookupAddr` directly (it takes an IP, so there is no URL
+to redirect — the test uses `127.0.0.1` and accepts either an answer or a
+resolver error). The rest of the network skills run against local listeners:
+`dns_lookup` and `ping_check` against `localhost`, `tls_probe` against a
+self-signed TLS listener, `banner_grab` against a raw TCP listener, and
+`http_headers` / `http_health` / `web_scrape` against `httptest`.
 
 Things worth testing that are easy to get wrong here, and are covered:
 ordering guarantees (the skill list and system prompt must be byte-stable
@@ -1693,6 +1726,16 @@ compared), and concurrent access to the MCP client and the bot's session map
    pass whatever slice of `cfg` the executor needs (timeouts, enable flags).
 3. Return `map[string]any{"error": "..."}, nil` for user-facing failures rather
    than a Go error, so the agent sees the reason and can react to it.
+4. Add the schema to `allSchemas()` in `internal/skills/builtin/skills_test.go`
+   and bump the count in `TestEverySchemaIsWellFormed`; add the required
+   parameter to the `want` map in `TestRequiredParametersAreDeclared`. The
+   suite fails without this on purpose — it is what keeps the inventory honest.
+5. If the skill handles credentials, add it to `sensitiveSkills` in
+   `internal/agent/agent.go` so its args and result are redacted in the audit
+   log (`/api/invocations` has no authentication in front of it).
+6. Update the counts and tables that name skills: the README skill table and
+   its "(N total)" heading, and in this document §2's `builtin/` line, §3.5's
+   file table, and the three "all N skills" mentions.
 
 ### Adding a new markdown skill at runtime
 

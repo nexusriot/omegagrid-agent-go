@@ -29,6 +29,11 @@ services:
     user: "${UID:-1000}:${GID:-1000}"
     env_file:
       - .env
+    # Everything in .env reaches the container through env_file above, so the
+    # list below does not have to name every setting — and must not pin one
+    # with a literal value, because `environment` overrides `env_file` and the
+    # variable would silently stop being configurable. Entries here are either
+    # container-fixed paths or `${VAR:-default}` passthroughs.
     environment:
       - BACKEND_PORT=8000
       - DATA_DIR=/app/data
@@ -62,7 +67,7 @@ services:
       - SKILL_SSH_PRIVATE_KEY=${SKILL_SSH_PRIVATE_KEY:-}
       # Scheduler
       - SCHEDULER_DB=/app/data/scheduler.sqlite3
-      - SCHEDULER_TICK_SEC=60
+      - SCHEDULER_TICK_SEC=${SCHEDULER_TICK_SEC:-60}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
     volumes:
       - ./data:/app/data

@@ -39,8 +39,15 @@ func New(cfg config.Config) (*Client, error) {
 	return &Client{hist: hist, vec: vec, auditMaxBlob: cfg.AuditMaxBlobBytes}, nil
 }
 
+// buildEmbeddings picks the embeddings backend. It keys off EmbedProvider
+// (EMBED_PROVIDER), which defaults to the chat provider — the split matters
+// for chat providers that serve no embeddings of their own.
 func buildEmbeddings(cfg config.Config) (embeddingsClient, error) {
-	switch strings.ToLower(cfg.Provider) {
+	provider := strings.ToLower(cfg.EmbedProvider)
+	if provider == "" {
+		provider = strings.ToLower(cfg.Provider)
+	}
+	switch provider {
 	case "openai", "openai-codex", "codex":
 		if cfg.OpenAIAPIKey == "" {
 			return nil, fmt.Errorf("OPENAI_API_KEY required for openai embeddings")
@@ -51,6 +58,11 @@ func buildEmbeddings(cfg config.Config) (embeddingsClient, error) {
 			return nil, fmt.Errorf("DIGITALOCEAN_API_KEY required for digitalocean embeddings")
 		}
 		return newOpenAIEmbeddings(cfg.DigitalOceanBaseURL, cfg.DigitalOceanAPIKey, cfg.DigitalOceanEmbedModel, cfg.DigitalOceanTimeoutSec), nil
+	case "opencode", "opencode-go", "opencode-zen", "zen":
+		// The relay has no /embeddings endpoint (it answers the marketing page),
+		// so vector memory falls back to Ollama. Set EMBED_PROVIDER=openai (or
+		// digitalocean) with that provider's key to embed in the cloud instead.
+		return newOllamaEmbeddings(cfg.OllamaURL, cfg.OllamaEmbedModel, cfg.OllamaTimeoutSec), nil
 	default:
 		return newOllamaEmbeddings(cfg.OllamaURL, cfg.OllamaEmbedModel, cfg.OllamaTimeoutSec), nil
 	}

@@ -220,6 +220,16 @@ func BuildChat(cfg config.Config) (llm.ChatClient, error) {
 			cfg.DigitalOceanAPIKey, cfg.DigitalOceanBaseURL, cfg.DigitalOceanChatModel,
 			"chat_completions", "", cfg.OpenAITemperature, cfg.DigitalOceanTimeoutSec,
 		), nil
+	case "opencode", "opencode-go", "opencode-zen", "zen":
+		if cfg.OpenCodeAPIKey == "" {
+			return nil, errors.New("OPENCODE_API_KEY is required for opencode providers")
+		}
+		// The opencode Zen relay is OpenAI-compatible apart from a mandatory
+		// x-opencode-session routing header, which NewOpenCodeChat supplies.
+		return llm.NewOpenCodeChat(
+			cfg.OpenCodeAPIKey, cfg.OpenCodeBaseURL, cfg.OpenCodeChatModel,
+			cfg.OpenCodeSessionID, cfg.OpenAITemperature, cfg.OpenCodeTimeoutSec,
+		), nil
 	default:
 		return llm.NewOllamaChat(cfg.OllamaURL, cfg.OllamaModel, cfg.OllamaTimeoutSec), nil
 	}

@@ -21,18 +21,35 @@ type OpenAIChat struct {
 	mode        string // "chat_completions" or "responses"
 	reasoning   string
 	temperature *float64 // nil omits temperature from chat_completions requests
-	client      *http.Client
+	// extraHeaders are sent on every request, for relays that demand headers
+	// beyond bearer auth (opencode's x-opencode-session).
+	extraHeaders map[string]string
+	client       *http.Client
 
 	// sleep is the retry backoff, injectable so tests can assert the schedule
 	// without actually waiting seconds for it.
 	sleep func(time.Duration)
 }
 
-func NewOpenAIChat(apiKey, baseURL, model, mode, reasoning string, temperature *float64, timeoutSec float64) *OpenAIChat {
+// Option customises an OpenAIChat at construction time.
+type Option func(*OpenAIChat)
+
+// WithHeader adds one header to every request the client sends. Applied after
+// the standard Authorization / Content-Type headers, so it can override them.
+func WithHeader(key, value string) Option {
+	return func(o *OpenAIChat) {
+		if o.extraHeaders == nil {
+			o.extraHeaders = map[string]string{}
+		}
+		o.extraHeaders[key] = value
+	}
+}
+
+func NewOpenAIChat(apiKey, baseURL, model, mode, reasoning string, temperature *float64, timeoutSec float64, opts ...Option) *OpenAIChat {
 	if mode == "" {
 		mode = "chat_completions"
 	}
-	return &OpenAIChat{
+	c := &OpenAIChat{
 		apiKey:      apiKey,
 		baseURL:     strings.TrimRight(baseURL, "/"),
 		model:       model,
@@ -42,6 +59,10 @@ func NewOpenAIChat(apiKey, baseURL, model, mode, reasoning string, temperature *
 		client:      &http.Client{Timeout: time.Duration(timeoutSec * float64(time.Second))},
 		sleep:       time.Sleep,
 	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
 }
 
 func (o *OpenAIChat) Model() string   { return o.model }
@@ -83,6 +104,9 @@ func (o *OpenAIChat) sleepFor(d time.Duration) {
 func (o *OpenAIChat) authHeaders(req *http.Request) {
 	req.Header.Set("Authorization", "Bearer "+o.apiKey)
 	req.Header.Set("Content-Type", "application/json")
+	for k, v := range o.extraHeaders {
+		req.Header.Set(k, v)
+	}
 }
 
 // postWithRetry POSTs body to url, retrying transient failures up to 3

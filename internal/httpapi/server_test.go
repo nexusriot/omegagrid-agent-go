@@ -410,10 +410,51 @@ func TestHealthReportsEmbedFailure(t *testing.T) {
 	if msg, _ := body["embed_error"].(string); msg == "" {
 		t.Fatal("no embed_error reported")
 	}
-	for _, field := range []string{"provider", "chat_base", "chat_model", "skills_dir", "scheduler_db", "embed_model"} {
+	for _, field := range []string{"provider", "chat_base", "chat_model", "skills_dir", "scheduler_db", "embed_model", "embed_provider"} {
 		if _, ok := body[field]; !ok {
 			t.Fatalf("/health is missing the %q field: %v", field, body)
 		}
+	}
+}
+
+// /health reports the backend embeddings actually run on, which is not always
+// the chat provider: opencode serves none, so it falls back to Ollama.
+func TestHealthReportsEffectiveEmbedProvider(t *testing.T) {
+	tests := []struct {
+		provider      string
+		embedProvider string
+		wantProvider  string
+		wantModel     string
+	}{
+		{provider: "ollama", wantProvider: "ollama", wantModel: "nomic-embed-text"},
+		{provider: "opencode", wantProvider: "ollama", wantModel: "nomic-embed-text"},
+		{provider: "openai", wantProvider: "openai", wantModel: "text-embedding-3-small"},
+		{provider: "digitalocean", wantProvider: "digitalocean", wantModel: "do-embed"},
+		{provider: "opencode", embedProvider: "openai", wantProvider: "openai", wantModel: "text-embedding-3-small"},
+		{provider: "opencode", embedProvider: "digitalocean", wantProvider: "digitalocean", wantModel: "do-embed"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.provider+"/"+tt.embedProvider, func(t *testing.T) {
+			d := newTestDeps(t)
+			d.Chat = stubChat{}
+			d.Cfg.Provider = tt.provider
+			d.Cfg.EmbedProvider = tt.embedProvider
+			d.Cfg.OllamaEmbedModel = "nomic-embed-text"
+			d.Cfg.OpenAIEmbedModel = "text-embedding-3-small"
+			d.Cfg.DigitalOceanEmbedModel = "do-embed"
+
+			_, body := doJSON(t, NewRouter(d), "GET", "/health", "")
+			if body["embed_provider"] != tt.wantProvider {
+				t.Errorf("embed_provider = %v, want %q", body["embed_provider"], tt.wantProvider)
+			}
+			if body["embed_model"] != tt.wantModel {
+				t.Errorf("embed_model = %v, want %q", body["embed_model"], tt.wantModel)
+			}
+			// The chat provider is still reported verbatim.
+			if body["provider"] != tt.provider {
+				t.Errorf("provider = %v, want %q", body["provider"], tt.provider)
+			}
+		})
 	}
 }
 

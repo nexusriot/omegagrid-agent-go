@@ -29,6 +29,11 @@ services:
     user: "${UID:-1000}:${GID:-1000}"
     env_file:
       - .env
+    # Docker Desktop resolves host.docker.internal on its own; plain Docker
+    # Engine on Linux does NOT, so a host-run Ollama at
+    # OLLAMA_URL=http://host.docker.internal:11434 is unreachable without this.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     # Everything in .env reaches the container through env_file above, so the
     # list below does not have to name every setting — and must not pin one
     # with a literal value, because `environment` overrides `env_file` and the

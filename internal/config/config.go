@@ -15,7 +15,7 @@ type Config struct {
 	DataDir     string
 
 	// LLM provider
-	Provider         string // ollama, openai, openai-codex, digitalocean
+	Provider         string // ollama, openai, openai-codex, digitalocean, opencode
 	OllamaURL        string
 	OllamaModel      string
 	OllamaTimeoutSec float64
@@ -38,6 +38,16 @@ type Config struct {
 	DigitalOceanEmbedModel string
 	DigitalOceanTimeoutSec float64
 
+	// opencode Zen relay (OpenAI-compatible).
+	// https://opencode.ai/docs/zen/ — the "go" tier is the $10/mo subscription,
+	// the "zen" tier is pay-as-you-go credits. One key works on both; the base
+	// URL selects the tier.
+	OpenCodeAPIKey     string
+	OpenCodeBaseURL    string
+	OpenCodeChatModel  string
+	OpenCodeSessionID  string
+	OpenCodeTimeoutSec float64
+
 	// Memory / vector store
 	AgentDB          string
 	VectorDir        string
@@ -45,6 +55,10 @@ type Config struct {
 	DedupDistance    float64
 	OllamaEmbedModel string
 	OpenAIEmbedModel string
+	// EmbedProvider selects the embeddings backend independently of Provider.
+	// Defaults to Provider; set EMBED_PROVIDER when the chat provider has no
+	// embeddings endpoint of its own (opencode) or you want a cheaper one.
+	EmbedProvider string
 
 	// Skills
 	SkillsDir           string
@@ -107,6 +121,11 @@ func Load() Config {
 		DigitalOceanChatModel:  getOr(os.Getenv("DIGITALOCEAN_CHAT_MODEL"), "meta-llama/Llama-3.3-70B-Instruct"),
 		DigitalOceanEmbedModel: getOr(os.Getenv("DIGITALOCEAN_EMBED_MODEL"), "qwen3-embedding-0.6b"),
 		DigitalOceanTimeoutSec: atofOr(os.Getenv("DIGITALOCEAN_TIMEOUT"), 120),
+		OpenCodeAPIKey:         firstOf(os.Getenv("OPENCODE_API_KEY"), os.Getenv("OPENCODE_GO_API_KEY"), os.Getenv("OPENCODE_ZEN_API_KEY")),
+		OpenCodeChatModel:      os.Getenv("OPENCODE_CHAT_MODEL"),
+		OpenCodeSessionID:      strings.TrimSpace(os.Getenv("OPENCODE_SESSION_ID")),
+		OpenCodeTimeoutSec:     atofOr(os.Getenv("OPENCODE_TIMEOUT"), 120),
+		EmbedProvider:          strings.ToLower(strings.TrimSpace(os.Getenv("EMBED_PROVIDER"))),
 		SkillHTTPTimeout:       atofOr(os.Getenv("SKILL_HTTP_TIMEOUT"), 30),
 		SkillShellEnabled:      isTruthy(os.Getenv("SKILL_SHELL_ENABLED")),
 		SkillSSHEnabled:        isTruthy(os.Getenv("SKILL_SSH_ENABLED")),
@@ -144,6 +163,25 @@ func Load() Config {
 		if c.OpenAIChatModel == "" {
 			c.OpenAIChatModel = "gpt-5.3-codex"
 		}
+	case "opencode-zen", "zen":
+		if c.OpenCodeChatModel == "" {
+			c.OpenCodeChatModel = "claude-sonnet-5"
+		}
+	case "opencode", "opencode-go":
+		if c.OpenCodeChatModel == "" {
+			c.OpenCodeChatModel = "kimi-k2.6"
+		}
+	}
+	// One opencode key serves two tiers hosted on different paths of the same
+	// relay, so the provider alias — not a separate variable — picks which.
+	openCodeBase := "https://opencode.ai/zen/go/v1"
+	if c.Provider == "opencode-zen" || c.Provider == "zen" {
+		openCodeBase = "https://opencode.ai/zen/v1"
+	}
+	c.OpenCodeBaseURL = strings.TrimRight(getOr(os.Getenv("OPENCODE_BASE_URL"), openCodeBase), "/")
+
+	if c.EmbedProvider == "" {
+		c.EmbedProvider = c.Provider
 	}
 	if c.OpenAIAPIMode == "" {
 		if strings.Contains(strings.ToLower(c.OpenAIChatModel), "codex") {
@@ -188,6 +226,17 @@ func parseTemperature(v string) *float64 {
 	}
 	def := 0.2
 	return &def
+}
+
+// firstOf returns the first non-empty value, for settings that accept more
+// than one env name.
+func firstOf(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func isTruthy(v string) bool {

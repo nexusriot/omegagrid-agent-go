@@ -763,36 +763,130 @@ func formatMemoryHits(hits []memory.MemoryHit) string {
 	return sb.String()
 }
 
-var jsonObjectRE = regexp.MustCompile(`(?s)\{.*\}`)
+// reasoningBlockRE matches a complete reasoning preamble such as
+// "<think>...</think>", which narrating models emit before the JSON envelope
+// despite response_format.  Braces inside such a block are not JSON.
+var reasoningBlockRE = regexp.MustCompile(
+	`(?is)<(?:thinking|think|reasoning|scratchpad)\b[^>]*>.*?</\s*(?:thinking|think|reasoning|scratchpad)\s*>`)
 
-// parseJSONSafely accepts either a clean JSON object or one embedded in noise.
-// It also unwraps the legacy "raw_model_json" envelope so old history rows
-// don't trip up the agent.
-func parseJSONSafely(text string) (map[string]any, error) {
-	t := strings.TrimSpace(text)
-	var data map[string]any
-	if strings.HasPrefix(t, "{") && strings.HasSuffix(t, "}") {
-		if err := json.Unmarshal([]byte(t), &data); err != nil {
-			return nil, fmt.Errorf("parse json: %w", err)
-		}
-	} else {
-		m := jsonObjectRE.FindString(t)
-		if m == "" {
-			return nil, fmt.Errorf("model did not return JSON. Got: %s", truncate(t, 300))
-		}
-		if err := json.Unmarshal([]byte(m), &data); err != nil {
-			return nil, fmt.Errorf("parse json: %w", err)
-		}
+// danglingReasoningRE matches everything up to a closing reasoning tag that has
+// no opener — some providers strip the opening tag but leave the close behind.
+var danglingReasoningRE = regexp.MustCompile(`(?is)^.*?</\s*(?:thinking|think|reasoning|scratchpad)\s*>`)
+
+// stripReasoningPreamble removes reasoning blocks so their contents cannot be
+// mistaken for the model's JSON envelope.
+func stripReasoningPreamble(text string) string {
+	out := reasoningBlockRE.ReplaceAllString(text, " ")
+	if danglingReasoningRE.MatchString(out) {
+		out = danglingReasoningRE.ReplaceAllString(out, " ")
 	}
-	if len(data) == 1 {
-		if inner, ok := data["raw_model_json"].(string); ok {
-			var nested map[string]any
-			if err := json.Unmarshal([]byte(inner), &nested); err == nil {
-				data = nested
+	return strings.TrimSpace(out)
+}
+
+// jsonObjectCandidates returns every balanced top-level {...} span in text, in
+// the order they appear.  Braces inside string literals are ignored, so a value
+// like {"answer":"}"} scans correctly.  Unlike a greedy `\{.*\}` match this
+// never welds a stray brace in surrounding prose onto the real envelope.
+func jsonObjectCandidates(text string) []string {
+	var out []string
+	depth, start := 0, -1
+	inString, escaped := false, false
+	for i := 0; i < len(text); i++ {
+		c := text[i]
+		if inString {
+			switch {
+			case escaped:
+				escaped = false
+			case c == '\\':
+				escaped = true
+			case c == '"':
+				inString = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			if depth > 0 {
+				inString = true
+			}
+		case '{':
+			if depth == 0 {
+				start = i
+			}
+			depth++
+		case '}':
+			if depth == 0 {
+				continue
+			}
+			depth--
+			if depth == 0 && start >= 0 {
+				out = append(out, text[start:i+1])
+				start = -1
 			}
 		}
 	}
-	return data, nil
+	return out
+}
+
+// unwrapRawModelJSON unwraps the legacy "raw_model_json" envelope so old
+// history rows don't trip up the agent.
+func unwrapRawModelJSON(data map[string]any) map[string]any {
+	if len(data) != 1 {
+		return data
+	}
+	inner, ok := data["raw_model_json"].(string)
+	if !ok {
+		return data
+	}
+	var nested map[string]any
+	if err := json.Unmarshal([]byte(inner), &nested); err != nil {
+		return data
+	}
+	return nested
+}
+
+// parseJSONSafely accepts either a clean JSON object or one embedded in noise —
+// a "<think>" preamble, prose, or a ```json fence.  Reasoning preambles are
+// stripped first, then the text is scanned for balanced top-level objects and
+// the first one that both parses and carries a "type" field wins.
+func parseJSONSafely(text string) (map[string]any, error) {
+	t := strings.TrimSpace(text)
+	cleaned := stripReasoningPreamble(t)
+
+	var parseErr error
+	if strings.HasPrefix(cleaned, "{") && strings.HasSuffix(cleaned, "}") {
+		var data map[string]any
+		err := json.Unmarshal([]byte(cleaned), &data)
+		if err == nil {
+			return unwrapRawModelJSON(data), nil
+		}
+		parseErr = err
+	}
+
+	var fallback map[string]any
+	for _, candidate := range jsonObjectCandidates(cleaned) {
+		var data map[string]any
+		if err := json.Unmarshal([]byte(candidate), &data); err != nil {
+			if parseErr == nil {
+				parseErr = err
+			}
+			continue
+		}
+		data = unwrapRawModelJSON(data)
+		if _, ok := data["type"]; ok {
+			return data, nil
+		}
+		if fallback == nil {
+			fallback = data
+		}
+	}
+	if fallback != nil {
+		return fallback, nil
+	}
+	if parseErr != nil {
+		return nil, fmt.Errorf("parse json: %w", parseErr)
+	}
+	return nil, fmt.Errorf("model did not return JSON. Got: %s", truncate(t, 300))
 }
 
 // normalizeToolCall fixes malformed envelopes where the LLM uses the tool name

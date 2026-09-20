@@ -22,6 +22,9 @@ func clearEnv(t *testing.T) {
 		"DIGITALOCEAN_API_KEY", "DIGITALOCEAN_BASE_URL",
 		"DIGITALOCEAN_CHAT_MODEL", "DIGITALOCEAN_EMBED_MODEL",
 		"DIGITALOCEAN_TIMEOUT",
+		"OPENCODE_API_KEY", "OPENCODE_GO_API_KEY", "OPENCODE_ZEN_API_KEY",
+		"OPENCODE_BASE_URL", "OPENCODE_CHAT_MODEL", "OPENCODE_SESSION_ID",
+		"OPENCODE_TIMEOUT", "EMBED_PROVIDER",
 		"SKILL_HTTP_TIMEOUT", "SKILL_SHELL_ENABLED", "SKILL_SSH_ENABLED",
 		"SKILL_SSH_PRIVATE_KEY", "SKILL_SSH_DEFAULT_USER", "SKILL_SSH_IDENTITY_FILE",
 		"AGENT_CONTEXT_TAIL", "AGENT_MEMORY_HITS", "AGENT_MAX_STEPS",
@@ -111,6 +114,16 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if c.OpenAIEmbedModel != "text-embedding-3-small" {
 		t.Errorf("OpenAIEmbedModel = %q, want %q", c.OpenAIEmbedModel, "text-embedding-3-small")
+	}
+	if c.OpenCodeBaseURL != "https://opencode.ai/zen/go/v1" {
+		t.Errorf("OpenCodeBaseURL = %q, want %q", c.OpenCodeBaseURL, "https://opencode.ai/zen/go/v1")
+	}
+	if c.OpenCodeTimeoutSec != 120 {
+		t.Errorf("OpenCodeTimeoutSec = %v, want 120", c.OpenCodeTimeoutSec)
+	}
+	// EmbedProvider mirrors Provider unless EMBED_PROVIDER overrides it.
+	if c.EmbedProvider != "ollama" {
+		t.Errorf("EmbedProvider = %q, want %q", c.EmbedProvider, "ollama")
 	}
 	if c.DigitalOceanBaseURL != "https://inference.do-ai.run/v1" {
 		t.Errorf("DigitalOceanBaseURL = %q, want %q", c.DigitalOceanBaseURL, "https://inference.do-ai.run/v1")
@@ -497,6 +510,115 @@ func TestProviderModelAPIModeResolution(t *testing.T) {
 				t.Errorf("OpenAIAPIMode = %q, want %q", c.OpenAIAPIMode, tt.wantMode)
 			}
 		})
+	}
+}
+
+// One key serves both opencode tiers, so the provider alias picks the default
+// base URL and model; an explicit OPENCODE_BASE_URL/MODEL always wins.
+func TestOpenCodeTierDefaults(t *testing.T) {
+	tests := []struct {
+		provider  string
+		envBase   string
+		envModel  string
+		wantBase  string
+		wantModel string
+	}{
+		{provider: "opencode", wantBase: "https://opencode.ai/zen/go/v1", wantModel: "kimi-k2.6"},
+		{provider: "opencode-go", wantBase: "https://opencode.ai/zen/go/v1", wantModel: "kimi-k2.6"},
+		{provider: "opencode-zen", wantBase: "https://opencode.ai/zen/v1", wantModel: "claude-sonnet-5"},
+		{provider: "zen", wantBase: "https://opencode.ai/zen/v1", wantModel: "claude-sonnet-5"},
+		{
+			provider: "opencode", envBase: "https://relay.local/v1/", envModel: "glm-5.3",
+			wantBase: "https://relay.local/v1", wantModel: "glm-5.3",
+		},
+		{
+			provider: "zen", envBase: "https://relay.local/v1", envModel: "gpt-5.4-mini",
+			wantBase: "https://relay.local/v1", wantModel: "gpt-5.4-mini",
+		},
+		// A non-opencode provider still gets a usable default, since the
+		// fields are read unconditionally by BuildChat.
+		{provider: "ollama", wantBase: "https://opencode.ai/zen/go/v1", wantModel: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.provider+"/"+tt.envBase, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv("LLM_PROVIDER", tt.provider)
+			t.Setenv("OPENCODE_BASE_URL", tt.envBase)
+			t.Setenv("OPENCODE_CHAT_MODEL", tt.envModel)
+			c := Load()
+			if c.OpenCodeBaseURL != tt.wantBase {
+				t.Errorf("OpenCodeBaseURL = %q, want %q", c.OpenCodeBaseURL, tt.wantBase)
+			}
+			if c.OpenCodeChatModel != tt.wantModel {
+				t.Errorf("OpenCodeChatModel = %q, want %q", c.OpenCodeChatModel, tt.wantModel)
+			}
+		})
+	}
+}
+
+// The key is accepted under three names so one .env can feed both this agent
+// and other opencode-aware tools; the most specific name wins.
+func TestOpenCodeAPIKeyFallbacks(t *testing.T) {
+	tests := []struct {
+		name string
+		env  map[string]string
+		want string
+	}{
+		{"primary", map[string]string{"OPENCODE_API_KEY": "sk-primary", "OPENCODE_GO_API_KEY": "sk-go"}, "sk-primary"},
+		{"go fallback", map[string]string{"OPENCODE_GO_API_KEY": "sk-go", "OPENCODE_ZEN_API_KEY": "sk-zen"}, "sk-go"},
+		{"zen fallback", map[string]string{"OPENCODE_ZEN_API_KEY": "sk-zen"}, "sk-zen"},
+		{"unset", nil, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clearEnv(t)
+			for k, v := range tt.env {
+				t.Setenv(k, v)
+			}
+			if got := Load().OpenCodeAPIKey; got != tt.want {
+				t.Errorf("OpenCodeAPIKey = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestOpenCodeSessionAndTimeoutOverrides(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("LLM_PROVIDER", "opencode")
+	t.Setenv("OPENCODE_SESSION_ID", "  ses_fixed  ")
+	t.Setenv("OPENCODE_TIMEOUT", "300")
+	c := Load()
+	if c.OpenCodeSessionID != "ses_fixed" {
+		t.Errorf("OpenCodeSessionID = %q, want it trimmed", c.OpenCodeSessionID)
+	}
+	if c.OpenCodeTimeoutSec != 300 {
+		t.Errorf("OpenCodeTimeoutSec = %v, want 300", c.OpenCodeTimeoutSec)
+	}
+}
+
+func TestEmbedProviderOverride(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("LLM_PROVIDER", "opencode")
+	t.Setenv("EMBED_PROVIDER", " OpenAI ")
+	if got := Load().EmbedProvider; got != "openai" {
+		t.Errorf("EmbedProvider = %q, want %q", got, "openai")
+	}
+}
+
+func TestFirstOf(t *testing.T) {
+	cases := []struct {
+		in   []string
+		want string
+	}{
+		{nil, ""},
+		{[]string{"", "", ""}, ""},
+		{[]string{"a", "b"}, "a"},
+		{[]string{"", "b", "c"}, "b"},
+	}
+	for _, c := range cases {
+		if got := firstOf(c.in...); got != c.want {
+			t.Errorf("firstOf(%v) = %q, want %q", c.in, got, c.want)
+		}
 	}
 }
 

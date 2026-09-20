@@ -283,6 +283,11 @@ func TestBuildEmbeddingsProviderSelection(t *testing.T) {
 		{config.Config{Provider: "codex", OpenAIAPIKey: "k"}, &openAIEmbeddings{}},
 		{config.Config{Provider: "do", DigitalOceanAPIKey: "k"}, &openAIEmbeddings{}},
 		{config.Config{Provider: "digitalocean", DigitalOceanAPIKey: "k"}, &openAIEmbeddings{}},
+		// The opencode relay serves no /embeddings, so vector memory falls
+		// back to Ollama instead of failing to boot.
+		{config.Config{Provider: "opencode", OllamaURL: "http://x"}, &ollamaEmbeddings{}},
+		{config.Config{Provider: "opencode-go", OllamaURL: "http://x"}, &ollamaEmbeddings{}},
+		{config.Config{Provider: "zen", OllamaURL: "http://x"}, &ollamaEmbeddings{}},
 	}
 	for _, c := range cases {
 		got, err := buildEmbeddings(c.cfg)
@@ -327,6 +332,81 @@ func TestBuildEmbeddingsDigitalOceanUsesOwnSettings(t *testing.T) {
 	}
 	if oa.baseURL != "https://inference.do-ai.run/v1" {
 		t.Fatalf("baseURL = %q", oa.baseURL)
+	}
+}
+
+// EMBED_PROVIDER decouples embeddings from chat, which is what makes the
+// opencode provider usable without a local Ollama.
+func TestBuildEmbeddingsHonoursEmbedProvider(t *testing.T) {
+	got, err := buildEmbeddings(config.Config{
+		Provider:         "opencode",
+		EmbedProvider:    "openai",
+		OpenAIAPIKey:     "sk-embed",
+		OpenAIBaseURL:    "https://api.openai.com/v1",
+		OpenAIEmbedModel: "text-embedding-3-small",
+		OllamaURL:        "http://should-not-be-used",
+	})
+	if err != nil {
+		t.Fatalf("buildEmbeddings: %v", err)
+	}
+	oa, ok := got.(*openAIEmbeddings)
+	if !ok {
+		t.Fatalf("got %T, want *openAIEmbeddings", got)
+	}
+	if oa.apiKey != "sk-embed" || oa.model != "text-embedding-3-small" {
+		t.Fatalf("apiKey = %q, model = %q", oa.apiKey, oa.model)
+	}
+
+	// A keyless override must fail at boot, exactly like a keyless provider.
+	if _, err := buildEmbeddings(config.Config{Provider: "opencode", EmbedProvider: "openai"}); err == nil {
+		t.Fatal("expected an error for EMBED_PROVIDER=openai without a key")
+	}
+
+	// Empty EmbedProvider keeps the chat provider's backend.
+	got, err = buildEmbeddings(config.Config{Provider: "openai", OpenAIAPIKey: "k"})
+	if err != nil {
+		t.Fatalf("buildEmbeddings: %v", err)
+	}
+	if _, ok := got.(*openAIEmbeddings); !ok {
+		t.Fatalf("got %T, want *openAIEmbeddings", got)
+	}
+}
+
+// opencode chat + DigitalOcean embeddings: the deployed combination. The chat
+// key must not leak into the embeddings client and vice versa.
+func TestBuildEmbeddingsOpenCodeChatWithDigitalOceanEmbeddings(t *testing.T) {
+	cfg := config.Config{
+		Provider:               "opencode",
+		OpenCodeAPIKey:         "sk-opencode",
+		OpenCodeChatModel:      "kimi-k2.6",
+		EmbedProvider:          "digitalocean",
+		DigitalOceanAPIKey:     "do-key",
+		DigitalOceanBaseURL:    "https://inference.do-ai.run/v1",
+		DigitalOceanEmbedModel: "qwen3-embedding-0.6b",
+		OllamaURL:              "http://should-not-be-used",
+	}
+	got, err := buildEmbeddings(cfg)
+	if err != nil {
+		t.Fatalf("buildEmbeddings: %v", err)
+	}
+	oa, ok := got.(*openAIEmbeddings)
+	if !ok {
+		t.Fatalf("got %T, want *openAIEmbeddings", got)
+	}
+	if oa.apiKey != "do-key" {
+		t.Errorf("apiKey = %q, want the DigitalOcean key (never the opencode one)", oa.apiKey)
+	}
+	if oa.model != "qwen3-embedding-0.6b" {
+		t.Errorf("model = %q", oa.model)
+	}
+	if oa.baseURL != "https://inference.do-ai.run/v1" {
+		t.Errorf("baseURL = %q", oa.baseURL)
+	}
+
+	// Without the DO key this combination must fail at boot, not on first embed.
+	cfg.DigitalOceanAPIKey = ""
+	if _, err := buildEmbeddings(cfg); err == nil {
+		t.Fatal("expected a boot error when EMBED_PROVIDER=digitalocean has no key")
 	}
 }
 

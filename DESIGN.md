@@ -21,7 +21,7 @@ All source is self-contained in this repository, making
                                           └──────────────┬─────────────────────┘
 ┌─────────────────────┐       HTTP                       │ HTTP
 │  telegram-bot       │  ───────────────►                ▼
-│  (Go binary)        │  /api/query[/str]    Ollama / OpenAI / OpenAI Codex / DigitalOcean
+│  (Go binary)        │  /api/query[/str]    Ollama / OpenAI / OpenAI Codex / DigitalOcean / opencode
 └─────────────────────┘
 ```
 
@@ -77,7 +77,8 @@ omegagrid-agent-go/
 │   ├── llm/
 │   │   ├── llm.go               #   ChatClient interface + Message type
 │   │   ├── ollama.go            #   Ollama /api/chat client
-│   │   └── openai.go            #   OpenAI chat_completions + responses client
+│   │   ├── openai.go            #   OpenAI chat_completions + responses client
+│   │   └── opencode.go          #   opencode Zen relay — OpenAIChat + session header
 │   ├── memory/
 │   │   ├── client.go            #   Public API — CreateSession / AddMemory / SearchMemory / ListMemories / GetMemory / DeleteMemory / AddInvocation / …
 │   │   ├── history.go           #   SQLite sessions + messages (modernc.org/sqlite, no CGO)
@@ -172,12 +173,13 @@ All configuration is environment-driven, matching the original `.env` pattern.
 | Frontend | `FRONTEND_PORT` | 80 (Docker Compose only) |
 | LLM | `LLM_PROVIDER`, `OLLAMA_URL`, `OLLAMA_MODEL`, `OLLAMA_TIMEOUT`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_CHAT_MODEL`, `OPENAI_TIMEOUT`, `OPENAI_API_MODE`, `OPENAI_REASONING_EFFORT`, `OPENAI_TEMPERATURE` | ollama, `http://127.0.0.1:11434`, `llama3:latest`, 120s, auto, —, 0.2 |
 | LLM (DigitalOcean) | `DIGITALOCEAN_API_KEY`, `DIGITALOCEAN_BASE_URL`, `DIGITALOCEAN_CHAT_MODEL`, `DIGITALOCEAN_EMBED_MODEL`, `DIGITALOCEAN_TIMEOUT` | —, `https://inference.do-ai.run/v1`, `meta-llama/Llama-3.3-70B-Instruct`, `qwen3-embedding-0.6b`, 120s |
+| LLM (opencode) | `OPENCODE_API_KEY`, `OPENCODE_BASE_URL`, `OPENCODE_CHAT_MODEL`, `OPENCODE_SESSION_ID`, `OPENCODE_TIMEOUT` | —, tier-dependent, tier-dependent, random per process, 120s |
 | Agent | `AGENT_DB`, `AGENT_CONTEXT_TAIL`, `AGENT_MEMORY_HITS`, `AGENT_MAX_STEPS`, `AGENT_PARALLEL_TOOLS`, `AGENT_MAX_PARALLEL` | `{DATA_DIR}/agent_memory.sqlite3`, 30, 5, 25, false, 4 |
 | Auto-memory | `AUTO_MEMORY_EXTRACT`, `AUTO_MEMORY_MAX_FACTS`, `AUTO_MEMORY_MIN_ANSWER_LEN` | false, 5, 80 |
 | Playground | `PLAYGROUND_DISABLED` | false (playground enabled) |
 | CLI | `OMEGA_REMOTE` | unset (local mode); set to gateway URL for remote mode |
 | Vector memory | `AGENT_VECTOR_DIR`, `AGENT_VECTOR_COLLECTION`, `AGENT_DEDUP_DISTANCE` | `{DATA_DIR}/chromem`, `memories`, 0.08 |
-| Embeddings | `OLLAMA_EMBED_MODEL`, `OPENAI_EMBED_MODEL` | `nomic-embed-text`, `text-embedding-3-small` |
+| Embeddings | `EMBED_PROVIDER`, `OLLAMA_EMBED_MODEL`, `OPENAI_EMBED_MODEL` | `{LLM_PROVIDER}`, `nomic-embed-text`, `text-embedding-3-small` |
 | Scheduler | `SCHEDULER_DB`, `SCHEDULER_TICK_SEC` | `{DATA_DIR}/scheduler.sqlite3`, 60 |
 | Telegram | `TELEGRAM_BOT_TOKEN`, `BOT_AUTH_ENABLED`, `BOT_ADMIN_ID` | — |
 | Skills | `SKILLS_DIR`, `SKILL_HTTP_TIMEOUT`, `SKILL_SHELL_ENABLED`, `SKILL_SSH_ENABLED`, `SKILL_SSH_IDENTITY_FILE`, `SKILL_SSH_DEFAULT_USER`, `SKILL_SSH_PRIVATE_KEY` | `{DATA_DIR}/skills`, 30, false, false |
@@ -189,7 +191,14 @@ When set to `openai-codex` or when the model name contains `codex`, the
 OpenAI client automatically switches to the `/responses` API endpoint (the
 default codex chat model is `gpt-5.3-codex`).  `digitalocean` (alias `do`) is
 served through the same OpenAI-compatible client in `chat_completions` mode,
-pointed at `DIGITALOCEAN_BASE_URL`.
+pointed at `DIGITALOCEAN_BASE_URL`.  `opencode` (aliases `opencode-go`,
+`opencode-zen`, `zen`) likewise, plus one extra request header — see §3.2.
+
+`LLM_PROVIDER` also picks the embeddings backend, unless `EMBED_PROVIDER`
+overrides it.  The split exists because a chat provider need not serve
+embeddings at all: the opencode relay does not, so `EMBED_PROVIDER=openai`
+(or `digitalocean`, or the default `ollama`) is how vector memory gets filled
+while chat runs on opencode.
 
 `OPENAI_TEMPERATURE` is parsed into a `*float64` so that "unset" and "omit"
 stay distinguishable: an empty value means the 0.2 default, an unparseable one
@@ -243,6 +252,45 @@ client type: `bootstrap.BuildChat` constructs an `OpenAIChat` in
 `DIGITALOCEAN_CHAT_MODEL`. Embeddings likewise reuse `openAIEmbeddings` against
 the DigitalOcean base URL (`DIGITALOCEAN_EMBED_MODEL`).
 
+#### opencode
+
+The opencode Zen relay (<https://opencode.ai/docs/zen/>) is OpenAI-compatible
+with one deviation: every request must carry an **`x-opencode-session`** header
+or the relay answers `400 MissingSessionID` — *"Request is missing
+x-opencode-session and cannot be routed efficiently"*.  A stock OpenAI client
+therefore cannot talk to it.  `OpenAIChat` grew a generic `WithHeader` option
+for this, and `llm.NewOpenCodeChat` applies it:
+
+```go
+llm.NewOpenCodeChat(apiKey, baseURL, model, sessionID, temperature, timeoutSec)
+```
+
+An empty `sessionID` mints a random `ses_<32 hex>` value that lives as long as
+the client, which keeps a long-running gateway on one prompt-cache lane.  Pin
+it with `OPENCODE_SESSION_ID` when several processes should share that lane.
+
+One key serves two tiers on two paths, so the provider alias picks the default
+base URL and model:
+
+| `LLM_PROVIDER` | Default `OPENCODE_BASE_URL` | Default `OPENCODE_CHAT_MODEL` | Billing |
+|---|---|---|---|
+| `opencode`, `opencode-go` | `https://opencode.ai/zen/go/v1` | `kimi-k2.6` | opencode Go subscription |
+| `opencode-zen`, `zen` | `https://opencode.ai/zen/v1` | `claude-sonnet-5` | pay-as-you-go credits |
+
+Only `chat_completions` is supported — the relay exposes no `/responses`
+endpoint — and it serves no `/embeddings` either, hence `EMBED_PROVIDER`.
+
+Two relay behaviours worth knowing:
+
+- A Go-tier key hitting the zen tier without credits gets `401 CreditsError`,
+  not a permissions error — the tier is a billing boundary, not an auth one.
+- Models differ in how they wrap the envelope.  `kimi-k2.6`, `kimi-k3` and
+  `glm-5.3` return a clean JSON body (kimi puts its reasoning in a separate
+  `reasoning` field, which the client ignores), while `minimax-m3` prepends a
+  literal `<think>` block to the content despite `response_format`.
+  `parseJSONSafely` handles both — see §3.3 — so model choice is a cost
+  question here, not a correctness one.
+
 ### 3.3 Agent loop (`internal/agent`)
 
 The agent loop implements a strict JSON tool-calling protocol.  On each
@@ -278,6 +326,30 @@ addendum is appended to the system prompt:
   ]
 }
 ```
+
+#### Envelope recovery (`parseJSONSafely`)
+
+Not every model returns the bare object the prompt asks for, so the parser is
+deliberately tolerant:
+
+1. Reasoning preambles — `<think>`, `<thinking>`, `<reasoning>`, `<scratchpad>`,
+   in any case, with or without attributes — are stripped first, along with a
+   stray closing tag whose opener the provider swallowed.
+2. The remaining text is scanned for *balanced* top-level `{...}` spans, with
+   braces inside string literals ignored.  Markdown ```json fences need no
+   special handling: they contribute no braces, so the scan finds the object
+   inside them.
+3. Each span is unmarshalled in order; the first that parses **and** carries a
+   `type` field wins, with the first otherwise-valid object as a fallback.
+4. A single-key `{"raw_model_json": "..."}` wrapper (legacy history rows) is
+   unwrapped at whichever step produced the object.
+
+The earlier implementation used a greedy `\{.*\}` match, which spans from the
+first `{` anywhere in the text to the last `}`.  That worked only while a
+narrated preamble contained no braces — a `<think>` block quoting JSON welded
+the preamble onto the real envelope and failed the whole turn.  The balancing
+scan removes that failure mode; `internal/agent/agent_test.go` covers the
+reproducers.
 
 `AGENT_MAX_PARALLEL` (default 4) is both the concurrency limit and the batch
 size limit: `Service.capBatch` truncates an oversized `calls` array to that many
@@ -1295,7 +1367,7 @@ Frontend is stateless (no volume).  Build context for all three services is `.`
 
 | Service | Listens on | Connects to |
 |---|---|---|
-| gateway | `:8000` | Ollama / OpenAI (for chat + embeddings) |
+| gateway | `:8000` | The chat provider (Ollama / OpenAI / DigitalOcean / opencode) and the embeddings provider, which `EMBED_PROVIDER` may point somewhere else |
 | frontend | `:80` | gateway `:8000` (nginx proxy for `/api/*`, `/health`) |
 | telegram-bot | — | gateway `:8000`, Telegram Bot API |
 
@@ -1487,7 +1559,8 @@ POST /api/invocations/{id}/replay   → {"replayed_from":42,"skill":"weather","r
 GET /health → {"ok": true, "provider": "ollama",
                "chat_base": "http://127.0.0.1:11434", "chat_model": "llama3:latest",
                "skills_dir": "/app/data/skills", "scheduler_db": "...",
-               "embed_model": "nomic-embed-text", "embed_ok": true, "embed_error": ""}
+               "embed_model": "nomic-embed-text", "embed_provider": "ollama",
+               "embed_ok": true, "embed_error": ""}
 ```
 
 `ok` mirrors `embed_ok`: it is `false` when the embeddings backend (vector
@@ -1643,7 +1716,7 @@ Coverage per package is listed in the README.
 
 | Dependency | How tests replace it |
 |---|---|
-| LLM providers | `httptest` servers; `OpenAIChat.sleep` is injected so the retry backoff is asserted, not waited out |
+| LLM providers | `httptest` servers; `OpenAIChat.sleep` is injected so the retry backoff is asserted, not waited out, and `OPENCODE_SESSION_ID` pins the relay's session header so tests can assert it rides every attempt |
 | Embeddings | `mockEmbeddings` derives a deterministic vector from the text, so dedup distances are reproducible; `errEmbeddings` covers the backend-down paths |
 | The model, in agent/gateway tests | a scripted `ChatClient` that replays canned envelopes and records the message list it was handed |
 | DuckDuckGo | an injected `http.RoundTripper` on `WebSearchSkill.client` (the URL is hardcoded, so the transport is the seam) |
@@ -1755,8 +1828,15 @@ Or write the `.md` file manually and restart the gateway (it loads all files in
 2. Add a case in `bootstrap.BuildChat()` to construct it when
    `LLM_PROVIDER=my_backend`.  Both `cmd/gateway` and `cmd/cli` (local mode)
    pick it up automatically.
-3. If the backend needs a different embeddings client, add it in
-   `internal/memory/embeddings.go` and wire it in `memory.New()`.
+3. If the backend speaks a dialect of an existing one, reuse that client
+   instead of writing a new type — `digitalocean` and `opencode` are both
+   `OpenAIChat`.  A relay that needs extra request headers takes them as
+   `llm.WithHeader(...)` options rather than a new field.
+4. If the backend needs a different embeddings client, add it in
+   `internal/memory/embeddings.go` and a case in `memory.buildEmbeddings()`.
+   Add a case there too if the backend serves **no** embeddings, so operators
+   see which backend the fallback picks; `/health` reports it as
+   `embed_provider`, and `EMBED_PROVIDER` overrides it.
 
 ### Adding a new native Go skill
 

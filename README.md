@@ -24,7 +24,7 @@ repository.
          ▲                        └─────────────────┬────────────────────────┘
          │ Telegram Bot API                         │ HTTP
          │                                          ▼
-         └──────────── telegram-bot (Go) ──► Ollama / OpenAI / OpenAI Codex / DigitalOcean
+         └──────────── telegram-bot (Go) ──► Ollama / OpenAI / OpenAI Codex / DigitalOcean / opencode
 ```
 
 ## Repository layout
@@ -44,6 +44,7 @@ internal/
   httpapi/              chi router + all REST handlers
     audit.go            GET /api/invocations, GET /api/invocations/{id}, POST …/replay
   llm/                  Ollama + OpenAI chat clients (chat_completions & responses)
+                        opencode.go reuses OpenAIChat for the opencode Zen relay
   memory/               In-process history (SQLite) + vector store (chromem-go)
     client.go           Public API — CreateSession / AddMemory / SearchMemory / …
     history.go          SQLite sessions + messages (modernc.org/sqlite, no CGO)
@@ -257,7 +258,7 @@ Coverage, by package:
 | `internal/memory` | 82% | vector store uses a deterministic fake embeddings client |
 | `internal/scheduler` | 81% | |
 | `internal/agent` | 81% | the loop is driven end-to-end with a scripted model |
-| `internal/httpapi` | 73% | router-level, real stores, scripted model |
+| `internal/httpapi` | 74% | router-level, real stores, scripted model |
 | `cmd/cli` | 20% | the HTTP/parsing helpers; the `flag`-parsing subcommands call `os.Exit` |
 | `cmd/gateway`, `cmd/telegram-bot`, `cmd/migrate-vector` | 0% | `main()` wrappers over `internal/` — exercised by the e2e suite instead |
 
@@ -492,6 +493,78 @@ rm data/vector_db.jsonl
 not the legacy ChromaDB `data/vector_db/` path used by the Python sidecar.  If
 you customised `AGENT_VECTOR_DIR` in `.env`, point it at `data/chromem`.
 
+## LLM provider: opencode Zen
+
+[opencode Zen](https://opencode.ai/docs/zen/) is an OpenAI-compatible relay in
+front of a curated model set. One key from <https://opencode.ai/auth> covers
+both tiers — `go` (the flat-rate subscription) and `zen` (pay-as-you-go
+credits) — and the provider alias picks which one you hit:
+
+| `LLM_PROVIDER` | Base URL | Default model |
+|---|---|---|
+| `opencode`, `opencode-go` | `https://opencode.ai/zen/go/v1` | `kimi-k2.6` |
+| `opencode-zen`, `zen` | `https://opencode.ai/zen/v1` | `claude-sonnet-5` |
+
+Minimal `.env` for the Go tier:
+
+```dotenv
+LLM_PROVIDER=opencode
+OPENCODE_API_KEY=sk-...
+
+# The relay has no /embeddings endpoint, so vector memory needs its own
+# backend. This one keeps everything remote:
+EMBED_PROVIDER=openai
+OPENAI_API_KEY=sk-...
+OPENAI_EMBED_MODEL=text-embedding-3-small
+```
+
+Or embed locally instead, with no second cloud key:
+
+```dotenv
+LLM_PROVIDER=opencode
+OPENCODE_API_KEY=sk-...
+OLLAMA_URL=http://host.docker.internal:11434
+OLLAMA_EMBED_MODEL=nomic-embed-text   # ollama pull nomic-embed-text
+```
+
+`EMBED_PROVIDER` is optional: left unset it falls back to Ollama, which is
+what the second example relies on.
+
+Run it locally without Docker:
+
+```bash
+LLM_PROVIDER=opencode OPENCODE_API_KEY=sk-... go run ./cmd/gateway
+curl -s localhost:8000/health | jq
+# → {"provider":"opencode","chat_base":"https://opencode.ai/zen/go/v1",
+#    "chat_model":"kimi-k2.6","embed_provider":"ollama", ...}
+```
+
+`embed_provider` reports the backend embeddings actually run on, so it reads
+`ollama` here even though `LLM_PROVIDER` is `opencode`:
+
+```bash
+# with no Ollama running and EMBED_PROVIDER unset
+# → "embed_ok": false, "embed_error": "... 127.0.0.1:11434: connection refused"
+```
+
+Pick another model with `OPENCODE_CHAT_MODEL` (list them with
+`curl -H "Authorization: Bearer $OPENCODE_API_KEY" https://opencode.ai/zen/go/v1/models`).
+The agent loop is a strict JSON protocol, but narration is tolerated: the
+parser strips `<think>` / `<reasoning>` preambles and ```json fences before
+scanning for the envelope, so models that talk before they answer
+(`minimax-m3`, for one) work even when the preamble itself quotes JSON.
+`kimi-k2.6`, `kimi-k3` and `glm-5.3` return a bare object with no preamble at
+all, which is still marginally cheaper.
+
+### Troubleshooting
+
+| Symptom | Cause |
+|---|---|
+| `400 MissingSessionID` | Something stripped the `x-opencode-session` header the client sends on every request |
+| `401 Invalid API key` | Key is wrong, or `OPENCODE_API_KEY` never reached the process |
+| `401 CreditsError` | Go-tier key against the `zen` tier — that tier bills credits separately |
+| `embed_ok: false` in `/health` | No Ollama reachable and no `EMBED_PROVIDER` set — opencode cannot serve embeddings |
+
 ## Environment variables
 
 | Variable | Default | Description |
@@ -500,7 +573,7 @@ you customised `AGENT_VECTOR_DIR` in `.env`, point it at `data/chromem`.
 | `FRONTEND_PORT` | `80` | nginx listen port (Docker Compose only) |
 | `DOCKER_NETWORK_MTU` | `1500` | Compose network MTU (Docker Compose only). Set to your VPN tunnel MTU (e.g. `1420` for WireGuard) when the host routes through a VPN |
 | `DATA_DIR` | `/app/data` | Root directory for all persistent data |
-| `LLM_PROVIDER` | `ollama` | `ollama` \| `openai` \| `openai-codex` \| `digitalocean` |
+| `LLM_PROVIDER` | `ollama` | `ollama` \| `openai` \| `openai-codex` \| `digitalocean` \| `opencode` (aliases: `do`, `codex`, `opencode-go`, `opencode-zen`, `zen`) |
 | `OLLAMA_URL` | `http://127.0.0.1:11434` | Ollama server URL |
 | `OLLAMA_MODEL` | `llama3:latest` | Ollama chat model |
 | `OLLAMA_EMBED_MODEL` | `nomic-embed-text` | Ollama embeddings model (for vector memory) |
@@ -518,6 +591,12 @@ you customised `AGENT_VECTOR_DIR` in `.env`, point it at `data/chromem`.
 | `DIGITALOCEAN_CHAT_MODEL` | `meta-llama/Llama-3.3-70B-Instruct` | DigitalOcean chat model |
 | `DIGITALOCEAN_EMBED_MODEL` | `qwen3-embedding-0.6b` | DigitalOcean embeddings model (for vector memory) |
 | `DIGITALOCEAN_TIMEOUT` | `120` | DigitalOcean request timeout (seconds) |
+| `OPENCODE_API_KEY` | — | Required for `opencode` providers. Also read from `OPENCODE_GO_API_KEY` / `OPENCODE_ZEN_API_KEY`, in that order |
+| `OPENCODE_BASE_URL` | `https://opencode.ai/zen/go/v1` | opencode relay base URL. Defaults to `https://opencode.ai/zen/v1` for `LLM_PROVIDER=opencode-zen` / `zen` |
+| `OPENCODE_CHAT_MODEL` | `kimi-k2.6` | opencode chat model (`claude-sonnet-5` on the `zen` tier) |
+| `OPENCODE_SESSION_ID` | random per process | Value for the mandatory `x-opencode-session` header. Pin it to share one prompt-cache lane across processes |
+| `OPENCODE_TIMEOUT` | `120` | opencode request timeout (seconds) |
+| `EMBED_PROVIDER` | `{LLM_PROVIDER}` | Embeddings backend, when it should differ from the chat provider. Required in practice for `opencode`, which serves no embeddings |
 | `AGENT_DB` | `{DATA_DIR}/agent_memory.sqlite3` | Conversation history database |
 | `AGENT_VECTOR_DIR` | `{DATA_DIR}/chromem` | chromem-go vector database directory |
 | `AGENT_VECTOR_COLLECTION` | `memories` | Collection name inside the vector database |

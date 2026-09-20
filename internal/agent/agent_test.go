@@ -135,6 +135,133 @@ func TestParseJSONSafely_UnwrapsRawModelJSON(t *testing.T) {
 	}
 }
 
+// Narrating models (minimax-m3 on the opencode relay, and reasoning models on
+// any provider including Ollama) prepend a <think> block to the envelope.  A
+// greedy {.*} match spans from a brace inside that preamble to the end of the
+// real envelope, so the whole agent turn used to error out.
+func TestParseJSONSafely_ThinkPreamble(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+	}{
+		{
+			name: "preamble without braces",
+			raw:  "<think>The user is asking me to return a specific JSON object. I should comply.</think>\n\n{\"type\":\"final\",\"answer\":\"hi\"}",
+		},
+		{
+			name: "preamble quoting JSON",
+			raw:  "<think>The user is asking me to return a JSON object with {\"ok\":true}. This is simple.</think>\n\n{\"type\":\"final\",\"answer\":\"hi\"}",
+		},
+		{
+			name: "uppercase tag with attributes",
+			raw:  "<Thinking depth=\"2\">maybe {\"type\":\"tool_call\"} fits?</Thinking>{\"type\":\"final\",\"answer\":\"hi\"}",
+		},
+		{
+			name: "dangling closing tag",
+			raw:  "I need to emit {\"a\":1} eventually.</think>{\"type\":\"final\",\"answer\":\"hi\"}",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			data, err := parseJSONSafely(tc.raw)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if data["type"] != "final" {
+				t.Errorf("type mismatch: %v", data["type"])
+			}
+			if data["answer"] != "hi" {
+				t.Errorf("answer mismatch: %v", data["answer"])
+			}
+		})
+	}
+}
+
+func TestParseJSONSafely_FencedCodeBlock(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+	}{
+		{
+			name: "bare fence",
+			raw:  "```json\n{\"type\":\"final\",\"answer\":\"hi\"}\n```",
+		},
+		{
+			name: "fence with prose around it",
+			raw:  "Here you go:\n\n```json\n{\"type\":\"final\",\"answer\":\"hi\"}\n```\n\nLet me know if that works.",
+		},
+		{
+			name: "think preamble then fence",
+			raw:  "<think>They want {\"ok\":true}-ish output.</think>\n```json\n{\"type\":\"final\",\"answer\":\"hi\"}\n```",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			data, err := parseJSONSafely(tc.raw)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if data["type"] != "final" || data["answer"] != "hi" {
+				t.Errorf("unexpected envelope: %v", data)
+			}
+		})
+	}
+}
+
+// The scanner must respect string literals: a brace inside a value is not a
+// structural brace.
+func TestParseJSONSafely_BracesInsideStrings(t *testing.T) {
+	data, err := parseJSONSafely(`prose {"type":"final","answer":"use {\"a\":1} like this \\"}  trailing`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if data["type"] != "final" {
+		t.Fatalf("type mismatch: %v", data["type"])
+	}
+	if want := `use {"a":1} like this \`; data["answer"] != want {
+		t.Errorf("answer mismatch: got %q want %q", data["answer"], want)
+	}
+}
+
+// Nested objects must not terminate the scan early.
+func TestParseJSONSafely_NestedObjectWithNoise(t *testing.T) {
+	raw := "<think>hmm {</think>Result: {\"type\":\"tool_call\",\"tool\":\"weather\",\"args\":{\"city\":\"London\"}} done"
+	data, err := parseJSONSafely(raw)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	args, ok := data["args"].(map[string]any)
+	if !ok {
+		t.Fatalf("args not an object: %v", data["args"])
+	}
+	if args["city"] != "London" {
+		t.Errorf("args mismatch: %v", args)
+	}
+}
+
+// An unbalanced brace in the preamble must not swallow the envelope, and an
+// envelope that is itself truncated must still be reported as an error.
+func TestParseJSONSafely_TruncatedEnvelope(t *testing.T) {
+	if _, err := parseJSONSafely(`{"type":"final","answer":`); err == nil {
+		t.Error("expected error for truncated JSON")
+	}
+	if _, err := parseJSONSafely("<think>no envelope here at all</think>"); err == nil {
+		t.Error("expected error when the preamble is all there is")
+	}
+}
+
+func TestParseJSONSafely_UnwrapsRawModelJSONAfterPreamble(t *testing.T) {
+	inner := `{"type":"final","answer":"unwrapped"}`
+	outer, _ := json.Marshal(map[string]any{"raw_model_json": inner})
+	data, err := parseJSONSafely("<think>wrapping it {like so}</think>" + string(outer))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if data["type"] != "final" || data["answer"] != "unwrapped" {
+		t.Errorf("raw_model_json not unwrapped: %v", data)
+	}
+}
+
 func TestNormalizeToolCall_AlreadyNormalized(t *testing.T) {
 	in := map[string]any{"type": "tool_call", "tool": "weather", "args": map[string]any{}}
 	out := normalizeToolCall(in, map[string]bool{"weather": true})

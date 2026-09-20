@@ -100,6 +100,70 @@ func TestBuildChatDigitalOcean(t *testing.T) {
 	}
 }
 
+// opencode reuses the OpenAI client through NewOpenCodeChat, which adds the
+// mandatory session header and pins chat_completions mode.
+func TestBuildChatOpenCode(t *testing.T) {
+	for _, provider := range []string{"opencode", "opencode-go", "opencode-zen", "zen"} {
+		t.Run(provider, func(t *testing.T) {
+			if _, err := BuildChat(config.Config{Provider: provider}); err == nil {
+				t.Fatal("expected an error without OPENCODE_API_KEY")
+			}
+
+			c, err := BuildChat(config.Config{
+				Provider:          provider,
+				OpenCodeAPIKey:    "sk-oc",
+				OpenCodeBaseURL:   "https://opencode.ai/zen/go/v1",
+				OpenCodeChatModel: "kimi-k2.6",
+				OpenCodeSessionID: "ses_pinned",
+				// Must be ignored: the relay has no /responses endpoint and
+				// the OpenAI key belongs to a different provider.
+				OpenAIAPIMode: "responses",
+				OpenAIAPIKey:  "sk-should-not-be-used",
+			})
+			if err != nil {
+				t.Fatalf("BuildChat: %v", err)
+			}
+			if _, ok := c.(*llm.OpenAIChat); !ok {
+				t.Fatalf("got %T, want *llm.OpenAIChat", c)
+			}
+			if c.Model() != "kimi-k2.6" {
+				t.Fatalf("Model = %q", c.Model())
+			}
+			if c.BaseURL() != "https://opencode.ai/zen/go/v1" {
+				t.Fatalf("BaseURL = %q", c.BaseURL())
+			}
+		})
+	}
+}
+
+// The session header must survive the wiring — without it every call comes
+// back 400 MissingSessionID — so drive one real request through a stub relay.
+func TestBuildChatOpenCodeSendsSessionHeader(t *testing.T) {
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Get(llm.SessionHeader)
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{}"}}]}`))
+	}))
+	defer srv.Close()
+
+	c, err := BuildChat(config.Config{
+		Provider:          "opencode",
+		OpenCodeAPIKey:    "sk-oc",
+		OpenCodeBaseURL:   srv.URL,
+		OpenCodeChatModel: "kimi-k2.6",
+		OpenCodeSessionID: "ses_pinned",
+	})
+	if err != nil {
+		t.Fatalf("BuildChat: %v", err)
+	}
+	if _, _, err := c.CompleteJSON([]llm.Message{{Role: "user", Content: "hi"}}); err != nil {
+		t.Fatalf("CompleteJSON: %v", err)
+	}
+	if got != "ses_pinned" {
+		t.Fatalf("%s = %q, want %q", llm.SessionHeader, got, "ses_pinned")
+	}
+}
+
 func TestEnsureDataDirs(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "nested", "data")
 	cfg := config.Config{

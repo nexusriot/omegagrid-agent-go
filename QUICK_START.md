@@ -12,7 +12,8 @@ This guide walks you through a clean, end-to-end deployment of
 - One of the supported LLM backends reachable from the host:
   - A local/remote **Ollama** server, OR
   - An **OpenAI** API key, OR
-  - A **DigitalOcean Serverless Inference** model access key
+  - A **DigitalOcean Serverless Inference** model access key, OR
+  - An **opencode Zen** API key (<https://opencode.ai/auth>)
 
 ---
 
@@ -51,6 +52,17 @@ OLLAMA_EMBED_MODEL=nomic-embed-text
 # DIGITALOCEAN_API_KEY=do_inference_...
 # DIGITALOCEAN_CHAT_MODEL=meta-llama/Llama-3.3-70B-Instruct
 # DIGITALOCEAN_EMBED_MODEL=qwen3-embedding-0.6b
+
+# Option D: opencode Zen (Go subscription tier)
+# The relay serves chat only, so embeddings need their own backend: either
+# leave EMBED_PROVIDER unset and keep the Ollama values above, or point it at
+# a cloud provider as shown here.
+# LLM_PROVIDER=opencode
+# OPENCODE_API_KEY=sk-...
+# OPENCODE_CHAT_MODEL=kimi-k2.6
+# EMBED_PROVIDER=openai
+# OPENAI_API_KEY=sk-...
+# OPENAI_EMBED_MODEL=text-embedding-3-small
 
 # --- UID/GID (avoids the data/ permission problem) ---
 UID=1000

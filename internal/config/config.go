@@ -6,6 +6,18 @@ import (
 	"strings"
 )
 
+// Per-provider default chat models. Relays retire model names on their own
+// schedule — a deprecated one answers 410 ModelDeprecated — so these are kept
+// together here, and CHAT_MODEL (or the provider's own *_CHAT_MODEL variable)
+// overrides any of them without a rebuild.
+const (
+	defaultOpenAIModel       = "gpt-4o-mini"
+	defaultCodexModel        = "gpt-5.3-codex"
+	defaultDigitalOceanModel = "meta-llama/Llama-3.3-70B-Instruct"
+	defaultOpenCodeZenModel  = "claude-sonnet-5"
+	defaultOpenCodeGoModel   = "kimi-k2.7-code"
+)
+
 // Config holds runtime configuration loaded from environment variables.
 // Mirrors the Python project's settings so docker-compose .env files
 // can be reused with minimal changes.
@@ -118,7 +130,7 @@ func Load() Config {
 		OpenAIEmbedModel:       getOr(os.Getenv("OPENAI_EMBED_MODEL"), "text-embedding-3-small"),
 		DigitalOceanAPIKey:     os.Getenv("DIGITALOCEAN_API_KEY"),
 		DigitalOceanBaseURL:    strings.TrimRight(getOr(os.Getenv("DIGITALOCEAN_BASE_URL"), "https://inference.do-ai.run/v1"), "/"),
-		DigitalOceanChatModel:  getOr(os.Getenv("DIGITALOCEAN_CHAT_MODEL"), "meta-llama/Llama-3.3-70B-Instruct"),
+		DigitalOceanChatModel:  getOr(os.Getenv("DIGITALOCEAN_CHAT_MODEL"), defaultDigitalOceanModel),
 		DigitalOceanEmbedModel: getOr(os.Getenv("DIGITALOCEAN_EMBED_MODEL"), "qwen3-embedding-0.6b"),
 		DigitalOceanTimeoutSec: atofOr(os.Getenv("DIGITALOCEAN_TIMEOUT"), 120),
 		OpenCodeAPIKey:         firstOf(os.Getenv("OPENCODE_API_KEY"), os.Getenv("OPENCODE_GO_API_KEY"), os.Getenv("OPENCODE_ZEN_API_KEY")),
@@ -157,19 +169,35 @@ func Load() Config {
 	switch c.Provider {
 	case "openai":
 		if c.OpenAIChatModel == "" {
-			c.OpenAIChatModel = "gpt-4o-mini"
+			c.OpenAIChatModel = defaultOpenAIModel
 		}
 	case "openai-codex", "codex":
 		if c.OpenAIChatModel == "" {
-			c.OpenAIChatModel = "gpt-5.3-codex"
+			c.OpenAIChatModel = defaultCodexModel
 		}
 	case "opencode-zen", "zen":
 		if c.OpenCodeChatModel == "" {
-			c.OpenCodeChatModel = "claude-sonnet-5"
+			c.OpenCodeChatModel = defaultOpenCodeZenModel
 		}
 	case "opencode", "opencode-go":
 		if c.OpenCodeChatModel == "" {
-			c.OpenCodeChatModel = "kimi-k2.6"
+			c.OpenCodeChatModel = defaultOpenCodeGoModel
+		}
+	}
+	// CHAT_MODEL is a provider-agnostic override: it saves callers from having
+	// to know which of the per-provider variables the active provider reads,
+	// and it wins over the defaults resolved just above (but not over the
+	// provider's own variable, which is the more specific setting).
+	if m := strings.TrimSpace(os.Getenv("CHAT_MODEL")); m != "" {
+		switch c.Provider {
+		case "openai", "openai-codex", "codex":
+			c.OpenAIChatModel = getOr(os.Getenv("OPENAI_CHAT_MODEL"), m)
+		case "digitalocean", "do":
+			c.DigitalOceanChatModel = getOr(os.Getenv("DIGITALOCEAN_CHAT_MODEL"), m)
+		case "opencode", "opencode-go", "opencode-zen", "zen":
+			c.OpenCodeChatModel = getOr(os.Getenv("OPENCODE_CHAT_MODEL"), m)
+		default:
+			c.OllamaModel = getOr(os.Getenv("OLLAMA_MODEL"), m)
 		}
 	}
 	// One opencode key serves two tiers hosted on different paths of the same

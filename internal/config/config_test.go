@@ -523,8 +523,8 @@ func TestOpenCodeTierDefaults(t *testing.T) {
 		wantBase  string
 		wantModel string
 	}{
-		{provider: "opencode", wantBase: "https://opencode.ai/zen/go/v1", wantModel: "kimi-k2.6"},
-		{provider: "opencode-go", wantBase: "https://opencode.ai/zen/go/v1", wantModel: "kimi-k2.6"},
+		{provider: "opencode", wantBase: "https://opencode.ai/zen/go/v1", wantModel: "kimi-k2.7-code"},
+		{provider: "opencode-go", wantBase: "https://opencode.ai/zen/go/v1", wantModel: "kimi-k2.7-code"},
 		{provider: "opencode-zen", wantBase: "https://opencode.ai/zen/v1", wantModel: "claude-sonnet-5"},
 		{provider: "zen", wantBase: "https://opencode.ai/zen/v1", wantModel: "claude-sonnet-5"},
 		{
@@ -831,6 +831,60 @@ func TestAtofOr(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := atofOr(tt.in, tt.def); got != tt.want {
 				t.Errorf("atofOr(%q, %v) = %v, want %v", tt.in, tt.def, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestChatModelOverride(t *testing.T) {
+	tests := []struct {
+		name     string
+		provider string
+		env      map[string]string
+		want     func(Config) string
+		wantVal  string
+	}{
+		{
+			name: "CHAT_MODEL beats the provider default", provider: "opencode",
+			env:  map[string]string{"CHAT_MODEL": "kimi-k3"},
+			want: func(c Config) string { return c.OpenCodeChatModel }, wantVal: "kimi-k3",
+		},
+		{
+			name: "the provider variable beats CHAT_MODEL", provider: "opencode",
+			env:  map[string]string{"CHAT_MODEL": "kimi-k3", "OPENCODE_CHAT_MODEL": "glm-5.3"},
+			want: func(c Config) string { return c.OpenCodeChatModel }, wantVal: "glm-5.3",
+		},
+		{
+			name: "applies to openai", provider: "openai",
+			env:  map[string]string{"CHAT_MODEL": "gpt-4.1"},
+			want: func(c Config) string { return c.OpenAIChatModel }, wantVal: "gpt-4.1",
+		},
+		{
+			name: "applies to digitalocean", provider: "digitalocean",
+			env:  map[string]string{"CHAT_MODEL": "openai-gpt-oss-120b"},
+			want: func(c Config) string { return c.DigitalOceanChatModel }, wantVal: "openai-gpt-oss-120b",
+		},
+		{
+			name: "falls through to ollama", provider: "ollama",
+			env:  map[string]string{"CHAT_MODEL": "qwen3:8b"},
+			want: func(c Config) string { return c.OllamaModel }, wantVal: "qwen3:8b",
+		},
+		{
+			// A codex-named override must still select the /responses API.
+			name: "override drives api mode", provider: "openai",
+			env:  map[string]string{"CHAT_MODEL": "gpt-5.3-codex"},
+			want: func(c Config) string { return c.OpenAIAPIMode }, wantVal: "responses",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("LLM_PROVIDER", tc.provider)
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			c := Load()
+			if got := tc.want(c); got != tc.wantVal {
+				t.Fatalf("got %q, want %q", got, tc.wantVal)
 			}
 		})
 	}

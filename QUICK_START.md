@@ -59,7 +59,7 @@ OLLAMA_EMBED_MODEL=nomic-embed-text
 # a cloud provider as shown here.
 # LLM_PROVIDER=opencode
 # OPENCODE_API_KEY=sk-...
-# OPENCODE_CHAT_MODEL=kimi-k2.6
+# OPENCODE_CHAT_MODEL=kimi-k2.7-code   # or CHAT_MODEL=..., which works for any provider
 # EMBED_PROVIDER=openai
 # OPENAI_API_KEY=sk-...
 # OPENAI_EMBED_MODEL=text-embedding-3-small

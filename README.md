@@ -502,8 +502,27 @@ credits) — and the provider alias picks which one you hit:
 
 | `LLM_PROVIDER` | Base URL | Default model |
 |---|---|---|
-| `opencode`, `opencode-go` | `https://opencode.ai/zen/go/v1` | `kimi-k2.6` |
+| `opencode`, `opencode-go` | `https://opencode.ai/zen/go/v1` | `kimi-k2.7-code` |
 | `opencode-zen`, `zen` | `https://opencode.ai/zen/v1` | `claude-sonnet-5` |
+
+The relay describes two of its rejections precisely enough to act on, so the
+client fixes the request and replays it instead of failing the turn. Each fix
+sticks for the life of the process, so only the first call pays for it:
+
+| Response | What the client does | Pin it with |
+|---|---|---|
+| `410 ModelDeprecated` — names its successor in `metadata.replacement` | Switches to the successor and retries | `CHAT_MODEL` / `OPENCODE_CHAT_MODEL` |
+| `400 invalid temperature: only 1 is allowed for this model` | Stops sending `temperature`, leaving the model on its own default | `OPENAI_TEMPERATURE=none` |
+
+Each shows up as one log line:
+
+```
+llm: model "kimi-k2.6" is deprecated, retrying with "kimi-k2.7-code" (set the chat-model option to silence this)
+llm: model "kimi-k2.7-code" rejected temperature 0.2, retrying without it (set OPENAI_TEMPERATURE=none to silence this)
+```
+
+At most two such fixes are applied per call, and neither is ever repeated, so
+a relay that keeps rejecting a request surfaces its error rather than looping.
 
 Minimal `.env` for the Go tier:
 
@@ -536,7 +555,7 @@ Run it locally without Docker:
 LLM_PROVIDER=opencode OPENCODE_API_KEY=sk-... go run ./cmd/gateway
 curl -s localhost:8000/health | jq
 # → {"provider":"opencode","chat_base":"https://opencode.ai/zen/go/v1",
-#    "chat_model":"kimi-k2.6","embed_provider":"ollama", ...}
+#    "chat_model":"kimi-k2.7-code","embed_provider":"ollama", ...}
 ```
 
 `embed_provider` reports the backend embeddings actually run on, so it reads
@@ -553,7 +572,7 @@ The agent loop is a strict JSON protocol, but narration is tolerated: the
 parser strips `<think>` / `<reasoning>` preambles and ```json fences before
 scanning for the envelope, so models that talk before they answer
 (`minimax-m3`, for one) work even when the preamble itself quotes JSON.
-`kimi-k2.6`, `kimi-k3` and `glm-5.3` return a bare object with no preamble at
+`kimi-k2.7-code`, `kimi-k3` and `glm-5.3` return a bare object with no preamble at
 all, which is still marginally cheaper.
 
 ### Troubleshooting
@@ -574,6 +593,7 @@ all, which is still marginally cheaper.
 | `DOCKER_NETWORK_MTU` | `1500` | Compose network MTU (Docker Compose only). Set to your VPN tunnel MTU (e.g. `1420` for WireGuard) when the host routes through a VPN |
 | `DATA_DIR` | `/app/data` | Root directory for all persistent data |
 | `LLM_PROVIDER` | `ollama` | `ollama` \| `openai` \| `openai-codex` \| `digitalocean` \| `opencode` (aliases: `do`, `codex`, `opencode-go`, `opencode-zen`, `zen`) |
+| `CHAT_MODEL` | — | Chat model for whichever provider is active. Overrides the built-in default; the provider's own `*_CHAT_MODEL` variable, if set, wins over it |
 | `OLLAMA_URL` | `http://127.0.0.1:11434` | Ollama server URL |
 | `OLLAMA_MODEL` | `llama3:latest` | Ollama chat model |
 | `OLLAMA_EMBED_MODEL` | `nomic-embed-text` | Ollama embeddings model (for vector memory) |
@@ -584,7 +604,7 @@ all, which is still marginally cheaper.
 | `OPENAI_EMBED_MODEL` | `text-embedding-3-small` | OpenAI embeddings model (for vector memory) |
 | `OPENAI_API_MODE` | auto | `chat_completions` \| `responses` (auto-selected for codex models) |
 | `OPENAI_REASONING_EFFORT` | — | Reasoning effort for the `responses` API (omitted from requests when unset) |
-| `OPENAI_TEMPERATURE` | `0.2` | Sampling temperature for the `chat_completions` path (also used by the `digitalocean` provider). Set to `none` (or `omit` / `off`) to leave temperature out of the request entirely — reasoning models such as the o-series and gpt-5 family reject any non-default value |
+| `OPENAI_TEMPERATURE` | `0.2` | Sampling temperature for the `chat_completions` path (also used by the `digitalocean` provider). Set to `none` (or `omit` / `off`) to leave temperature out of the request entirely — reasoning models such as the o-series and gpt-5 family reject any non-default value. The client also drops it on its own after a model rejects it |
 | `OPENAI_TIMEOUT` | `120` | OpenAI request timeout (seconds) |
 | `DIGITALOCEAN_API_KEY` | — | Required for `digitalocean` provider (model access key or DO personal access token) |
 | `DIGITALOCEAN_BASE_URL` | `https://inference.do-ai.run/v1` | DigitalOcean Serverless Inference base URL |
@@ -593,7 +613,7 @@ all, which is still marginally cheaper.
 | `DIGITALOCEAN_TIMEOUT` | `120` | DigitalOcean request timeout (seconds) |
 | `OPENCODE_API_KEY` | — | Required for `opencode` providers. Also read from `OPENCODE_GO_API_KEY` / `OPENCODE_ZEN_API_KEY`, in that order |
 | `OPENCODE_BASE_URL` | `https://opencode.ai/zen/go/v1` | opencode relay base URL. Defaults to `https://opencode.ai/zen/v1` for `LLM_PROVIDER=opencode-zen` / `zen` |
-| `OPENCODE_CHAT_MODEL` | `kimi-k2.6` | opencode chat model (`claude-sonnet-5` on the `zen` tier) |
+| `OPENCODE_CHAT_MODEL` | `kimi-k2.7-code` | opencode chat model (`claude-sonnet-5` on the `zen` tier) |
 | `OPENCODE_SESSION_ID` | random per process | Value for the mandatory `x-opencode-session` header. Pin it to share one prompt-cache lane across processes |
 | `OPENCODE_TIMEOUT` | `120` | opencode request timeout (seconds) |
 | `EMBED_PROVIDER` | `{LLM_PROVIDER}` | Embeddings backend, when it should differ from the chat provider. Required in practice for `opencode`, which serves no embeddings |

@@ -487,3 +487,268 @@ func TestZeroValueClientSleepFallback(t *testing.T) {
 		t.Fatal("sleepFor hung on a zero-value client")
 	}
 }
+
+// deprecationBody is the 410 the opencode relay returns for a retired model.
+const deprecationBody = `{"type":"error","error":{"type":"ModelDeprecated",` +
+	`"message":"Model kimi-k2.6 has been deprecated. Use kimi-k2.7-code instead."},` +
+	`"metadata":{"model":"kimi-k2.6","replacement":"kimi-k2.7-code"}}`
+
+func TestChatCompletionsRetriesWithReplacementModel(t *testing.T) {
+	cap := &capture{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cap.record(r)
+		if cap.count() == 1 {
+			w.WriteHeader(http.StatusGone)
+			_, _ = w.Write([]byte(deprecationBody))
+			return
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"ok\":true}"}}]}`))
+	}))
+	defer srv.Close()
+
+	c := NewOpenAIChat("sk-test", srv.URL, "kimi-k2.6", "chat_completions", "", nil, 5)
+	c.sleep = func(time.Duration) {}
+	out, _, err := c.CompleteJSON([]Message{{Role: "user", Content: "hi"}})
+	if err != nil {
+		t.Fatalf("CompleteJSON: %v", err)
+	}
+	if out != `{"ok":true}` {
+		t.Fatalf("content = %q", out)
+	}
+	if cap.count() != 2 {
+		t.Fatalf("requests = %d, want 2", cap.count())
+	}
+	if got := cap.payloads[1]["model"]; got != "kimi-k2.7-code" {
+		t.Fatalf("retry model = %v, want kimi-k2.7-code", got)
+	}
+	// The switch sticks, so later calls never pay the 410 round trip again.
+	if c.Model() != "kimi-k2.7-code" {
+		t.Fatalf("Model() = %q, want kimi-k2.7-code", c.Model())
+	}
+}
+
+func TestResponsesRetriesWithReplacementModel(t *testing.T) {
+	cap := &capture{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cap.record(r)
+		if cap.count() == 1 {
+			w.WriteHeader(http.StatusGone)
+			_, _ = w.Write([]byte(deprecationBody))
+			return
+		}
+		_, _ = w.Write([]byte(`{"output_text":"{}"}`))
+	}))
+	defer srv.Close()
+
+	c := NewOpenAIChat("sk-test", srv.URL, "kimi-k2.6", "responses", "", nil, 5)
+	c.sleep = func(time.Duration) {}
+	if _, _, err := c.CompleteJSON([]Message{{Role: "user", Content: "hi"}}); err != nil {
+		t.Fatalf("CompleteJSON: %v", err)
+	}
+	if cap.count() != 2 {
+		t.Fatalf("requests = %d, want 2", cap.count())
+	}
+	if got := cap.payloads[1]["model"]; got != "kimi-k2.7-code" {
+		t.Fatalf("retry model = %v, want kimi-k2.7-code", got)
+	}
+}
+
+func TestDeprecationRetriedOnlyOnce(t *testing.T) {
+	cap := &capture{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cap.record(r)
+		w.WriteHeader(http.StatusGone)
+		_, _ = w.Write([]byte(deprecationBody))
+	}))
+	defer srv.Close()
+
+	c := NewOpenAIChat("sk-test", srv.URL, "kimi-k2.6", "chat_completions", "", nil, 5)
+	c.sleep = func(time.Duration) {}
+	_, _, err := c.CompleteJSON([]Message{{Role: "user", Content: "hi"}})
+	if err == nil {
+		t.Fatal("want error when the replacement is deprecated too")
+	}
+	if !strings.Contains(err.Error(), "410") {
+		t.Fatalf("err = %v, want the 410 body surfaced", err)
+	}
+	if cap.count() != 2 {
+		t.Fatalf("requests = %d, want 2 (one retry, no loop)", cap.count())
+	}
+}
+
+func TestReplacementModel(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		body   string
+		want   string
+	}{
+		{"metadata", http.StatusGone, deprecationBody, "kimi-k2.7-code"},
+		{"message only", http.StatusGone,
+			`{"error":{"message":"Model x has been deprecated. Use kimi-k3 instead."}}`, "kimi-k3"},
+		{"no replacement", http.StatusGone, `{"error":{"message":"gone"}}`, ""},
+		{"other status", http.StatusBadRequest, deprecationBody, ""},
+		{"not json", http.StatusGone, `not json`, ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := replacementModel(tc.status, []byte(tc.body)); got != tc.want {
+				t.Fatalf("replacementModel = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// A 410 naming the model we already send must not retry, or a relay that
+// always answers 410 would make every call cost two round trips.
+func TestSameModelReplacementNotAdopted(t *testing.T) {
+	c := NewOpenAIChat("sk-test", "http://x", "kimi-k2.7-code", "chat_completions", "", nil, 5)
+	if c.adoptReplacementModel(http.StatusGone, []byte(deprecationBody)) {
+		t.Fatal("adopted a replacement identical to the current model")
+	}
+}
+
+// temperatureBody is the 400 a model that accepts only its own default
+// temperature returns.
+const temperatureBody = `{"error":{"type":"invalid_request_error",` +
+	`"message":"Upstream request failed: [invalid_request_error] ` +
+	`invalid temperature: only 1 is allowed for this model"}}`
+
+func TestRetriesWithoutRejectedTemperature(t *testing.T) {
+	cap := &capture{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cap.record(r)
+		if cap.count() == 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(temperatureBody))
+			return
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"ok\":true}"}}]}`))
+	}))
+	defer srv.Close()
+
+	temp := 0.2
+	c := NewOpenAIChat("sk-test", srv.URL, "kimi-k2.7-code", "chat_completions", "", &temp, 5)
+	c.sleep = func(time.Duration) {}
+	out, _, err := c.CompleteJSON([]Message{{Role: "user", Content: "hi"}})
+	if err != nil {
+		t.Fatalf("CompleteJSON: %v", err)
+	}
+	if out != `{"ok":true}` {
+		t.Fatalf("content = %q", out)
+	}
+	if cap.count() != 2 {
+		t.Fatalf("requests = %d, want 2", cap.count())
+	}
+	if _, sent := cap.payloads[0]["temperature"]; !sent {
+		t.Fatal("first attempt should have carried the configured temperature")
+	}
+	if _, sent := cap.payloads[1]["temperature"]; sent {
+		t.Fatal("retry still carried temperature")
+	}
+	// The drop sticks, so later calls skip the rejected round trip.
+	if c.temp() != nil {
+		t.Fatalf("temp() = %v, want nil", *c.temp())
+	}
+}
+
+// The two faults can arrive back to back: a deprecated model is replaced, and
+// the successor then refuses the temperature. Both must heal in one call.
+func TestHealsDeprecationThenTemperature(t *testing.T) {
+	cap := &capture{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cap.record(r)
+		switch cap.count() {
+		case 1:
+			w.WriteHeader(http.StatusGone)
+			_, _ = w.Write([]byte(deprecationBody))
+		case 2:
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(temperatureBody))
+		default:
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{}"}}]}`))
+		}
+	}))
+	defer srv.Close()
+
+	temp := 0.2
+	c := NewOpenAIChat("sk-test", srv.URL, "kimi-k2.6", "chat_completions", "", &temp, 5)
+	c.sleep = func(time.Duration) {}
+	if _, _, err := c.CompleteJSON([]Message{{Role: "user", Content: "hi"}}); err != nil {
+		t.Fatalf("CompleteJSON: %v", err)
+	}
+	if cap.count() != 3 {
+		t.Fatalf("requests = %d, want 3", cap.count())
+	}
+	if got := cap.payloads[2]["model"]; got != "kimi-k2.7-code" {
+		t.Fatalf("final model = %v", got)
+	}
+	if _, sent := cap.payloads[2]["temperature"]; sent {
+		t.Fatal("final attempt still carried temperature")
+	}
+}
+
+// A persistent 400 must not loop: two heals are the ceiling, and once
+// temperature is already omitted the heal declines to replay at all.
+func TestSelfHealIsBounded(t *testing.T) {
+	cap := &capture{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cap.record(r)
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(temperatureBody))
+	}))
+	defer srv.Close()
+
+	temp := 0.2
+	c := NewOpenAIChat("sk-test", srv.URL, "m", "chat_completions", "", &temp, 5)
+	c.sleep = func(time.Duration) {}
+	_, _, err := c.CompleteJSON([]Message{{Role: "user", Content: "hi"}})
+	if err == nil {
+		t.Fatal("want the 400 to surface once it cannot be healed")
+	}
+	if cap.count() != 2 {
+		t.Fatalf("requests = %d, want 2 (one heal, then give up)", cap.count())
+	}
+}
+
+func TestDropTemperatureIgnoresUnrelatedErrors(t *testing.T) {
+	temp := 0.2
+	tests := []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"not a 400", http.StatusUnauthorized, temperatureBody},
+		{"400 about something else", http.StatusBadRequest,
+			`{"error":{"message":"missing required field: messages"}}`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := NewOpenAIChat("sk-test", "http://x", "m", "chat_completions", "", &temp, 5)
+			if c.dropTemperature(tc.status, []byte(tc.body)) {
+				t.Fatal("dropped temperature for an unrelated failure")
+			}
+			if c.temp() == nil {
+				t.Fatal("temperature was cleared anyway")
+			}
+		})
+	}
+}
+
+// A client already configured to omit temperature has nothing to drop.
+func TestDropTemperatureNoopWhenAlreadyOmitted(t *testing.T) {
+	c := NewOpenAIChat("sk-test", "http://x", "m", "chat_completions", "", nil, 5)
+	if c.dropTemperature(http.StatusBadRequest, []byte(temperatureBody)) {
+		t.Fatal("reported a heal with no temperature to drop")
+	}
+}
+
+// The /responses payload carries no temperature, so a 400 mentioning it there
+// is about something else and must not cost a replay.
+func TestDropTemperatureSkippedOnResponsesMode(t *testing.T) {
+	temp := 0.2
+	c := NewOpenAIChat("sk-test", "http://x", "m", "responses", "", &temp, 5)
+	if c.dropTemperature(http.StatusBadRequest, []byte(temperatureBody)) {
+		t.Fatal("healed temperature on the responses path, which never sends it")
+	}
+}

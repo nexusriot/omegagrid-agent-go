@@ -6,21 +6,30 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
+	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
 // OpenAIChat speaks to either /chat/completions (regular OpenAI/Azure/etc.)
 // or /responses (Codex-style models). Mode is selected at construction time.
 type OpenAIChat struct {
-	apiKey      string
-	baseURL     string
-	model       string
-	mode        string // "chat_completions" or "responses"
-	reasoning   string
-	temperature *float64 // nil omits temperature from chat_completions requests
+	apiKey  string
+	baseURL string
+	// mu guards model, which a 410 ModelDeprecated reply rewrites in place
+	// while other goroutines of a long-lived gateway share this client.
+	mu        sync.RWMutex
+	model     string
+	mode      string // "chat_completions" or "responses"
+	reasoning string
+	// temperature is nil when the request should omit the field entirely,
+	// which is what reasoning models that accept only their own default
+	// demand. A 400 naming temperature rewrites this to nil in place.
+	temperature *float64
 	// extraHeaders are sent on every request, for relays that demand headers
 	// beyond bearer auth (opencode's x-opencode-session).
 	extraHeaders map[string]string
@@ -65,8 +74,20 @@ func NewOpenAIChat(apiKey, baseURL, model, mode, reasoning string, temperature *
 	return c
 }
 
-func (o *OpenAIChat) Model() string   { return o.model }
+func (o *OpenAIChat) Model() string {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.model
+}
+
 func (o *OpenAIChat) BaseURL() string { return o.baseURL }
+
+// temp returns the temperature to send, or nil to omit the field.
+func (o *OpenAIChat) temp() *float64 {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.temperature
+}
 
 func (o *OpenAIChat) CompleteJSON(messages []Message) (string, float64, error) {
 	if o.mode == "responses" {
@@ -147,25 +168,33 @@ func (o *OpenAIChat) postWithRetry(url string, body []byte) (*http.Response, err
 
 func (o *OpenAIChat) completeChatCompletions(messages []Message) (string, float64, error) {
 	t0 := time.Now()
-	payload := map[string]any{
-		"model":           o.model,
-		"messages":        o.mapMessages(messages),
-		"response_format": map[string]string{"type": "json_object"},
-	}
-	if o.temperature != nil {
-		payload["temperature"] = *o.temperature
-	}
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return "", 0, fmt.Errorf("marshal request: %w", err)
-	}
-	resp, err := o.postWithRetry(o.baseURL+"/chat/completions", body)
-	if err != nil {
-		return "", time.Since(t0).Seconds(), fmt.Errorf("openai post: %w", err)
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 400 {
+	mapped := o.mapMessages(messages)
+	var raw []byte
+	for attempt := 0; ; attempt++ {
+		payload := map[string]any{
+			"model":           o.Model(),
+			"messages":        mapped,
+			"response_format": map[string]string{"type": "json_object"},
+		}
+		if t := o.temp(); t != nil {
+			payload["temperature"] = *t
+		}
+		body, err := json.Marshal(payload)
+		if err != nil {
+			return "", 0, fmt.Errorf("marshal request: %w", err)
+		}
+		resp, err := o.postWithRetry(o.baseURL+"/chat/completions", body)
+		if err != nil {
+			return "", time.Since(t0).Seconds(), fmt.Errorf("openai post: %w", err)
+		}
+		raw, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode < 400 {
+			break
+		}
+		if attempt < maxSelfHeal && o.healAfterError(resp.StatusCode, raw) {
+			continue
+		}
 		return "", time.Since(t0).Seconds(), fmt.Errorf("openai status %d: %s", resp.StatusCode, truncate(string(raw), 400))
 	}
 	var out struct {
@@ -186,28 +215,36 @@ func (o *OpenAIChat) completeChatCompletions(messages []Message) (string, float6
 
 func (o *OpenAIChat) completeResponses(messages []Message) (string, float64, error) {
 	t0 := time.Now()
-	payload := map[string]any{
-		"model": o.model,
-		"input": o.mapMessages(messages),
-		"store": false,
-		"text": map[string]any{
-			"format": map[string]string{"type": "json_object"},
-		},
-	}
-	if o.reasoning != "" {
-		payload["reasoning"] = map[string]string{"effort": o.reasoning}
-	}
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return "", 0, fmt.Errorf("marshal request: %w", err)
-	}
-	resp, err := o.postWithRetry(o.baseURL+"/responses", body)
-	if err != nil {
-		return "", time.Since(t0).Seconds(), fmt.Errorf("openai responses post: %w", err)
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 400 {
+	mapped := o.mapMessages(messages)
+	var raw []byte
+	for attempt := 0; ; attempt++ {
+		payload := map[string]any{
+			"model": o.Model(),
+			"input": mapped,
+			"store": false,
+			"text": map[string]any{
+				"format": map[string]string{"type": "json_object"},
+			},
+		}
+		if o.reasoning != "" {
+			payload["reasoning"] = map[string]string{"effort": o.reasoning}
+		}
+		body, err := json.Marshal(payload)
+		if err != nil {
+			return "", 0, fmt.Errorf("marshal request: %w", err)
+		}
+		resp, err := o.postWithRetry(o.baseURL+"/responses", body)
+		if err != nil {
+			return "", time.Since(t0).Seconds(), fmt.Errorf("openai responses post: %w", err)
+		}
+		raw, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode < 400 {
+			break
+		}
+		if attempt < maxSelfHeal && o.healAfterError(resp.StatusCode, raw) {
+			continue
+		}
 		return "", time.Since(t0).Seconds(), fmt.Errorf("openai responses status %d: %s", resp.StatusCode, truncate(string(raw), 400))
 	}
 	// The /responses endpoint returns either "output_text" directly or a
@@ -237,4 +274,107 @@ func (o *OpenAIChat) completeResponses(messages []Message) (string, float64, err
 		return "{}", time.Since(t0).Seconds(), nil
 	}
 	return sb.String(), time.Since(t0).Seconds(), nil
+}
+
+// deprecatedModelHint matches the replacement named in a ModelDeprecated
+// message ("Model kimi-k2.6 has been deprecated. Use kimi-k2.7-code
+// instead."), for relays that word the error but omit the metadata block.
+var deprecatedModelHint = regexp.MustCompile(`[Uu]se ` + "`?" + `([A-Za-z0-9._:/-]+)` + "`?" + ` instead`)
+
+// maxSelfHeal bounds how many times one call may rewrite its own request and
+// replay it. Every heal below refuses to repeat itself, so this is a backstop
+// against a relay that rejects a request for a reason we keep misreading —
+// not a retry budget to be spent.
+const maxSelfHeal = 2
+
+// healAfterError inspects a rejected request for a fault the relay described
+// precisely enough to fix, applies one such fix, and reports whether the call
+// is worth replaying. Anything it does not recognise returns false and lets
+// the original error reach the caller unchanged.
+func (o *OpenAIChat) healAfterError(status int, raw []byte) bool {
+	return o.adoptReplacementModel(status, raw) || o.dropTemperature(status, raw)
+}
+
+// dropTemperature stops sending temperature after a model rejects the value.
+// Omitting the field leaves the model on its own default, which is by
+// definition the one value such a model allows, so this needs no guess at
+// what that default is.
+//
+// Returns false once temperature is already omitted, which keeps a 400 that
+// merely happens to mention the word from costing a second round trip.
+func (o *OpenAIChat) dropTemperature(status int, raw []byte) bool {
+	if status != http.StatusBadRequest && status != http.StatusUnprocessableEntity {
+		return false
+	}
+	// Only the chat_completions payload carries temperature, so a /responses
+	// rejection that happens to mention the word is about something else.
+	if o.mode == "responses" {
+		return false
+	}
+	// Relays word this refusal in at least two ways — "invalid temperature:
+	// only 1 is allowed for this model" and OpenAI's "'temperature' does not
+	// support 0.2 with this model" — so we key off the field name rather than
+	// the phrasing, and fix it by omitting the field rather than by parsing
+	// out the one value they would have accepted.
+	if !strings.Contains(strings.ToLower(string(raw)), "temperature") {
+		return false
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.temperature == nil {
+		return false
+	}
+	log.Printf("llm: model %q rejected temperature %v, retrying without it (set OPENAI_TEMPERATURE=none to silence this)", o.model, *o.temperature)
+	o.temperature = nil
+	return true
+}
+
+// adoptReplacementModel inspects a failed response for a model-deprecation
+// notice and, when the relay names a successor, switches this client over to
+// it so the caller's request can simply be sent again. Anything else — a
+// different 4xx, a 410 with no replacement, or a replacement equal to what we
+// already send — returns false and lets the original error surface.
+//
+// The switch lasts for the lifetime of the client only; set the provider's
+// chat-model option (e.g. OPENCODE_CHAT_MODEL) to make it permanent.
+func (o *OpenAIChat) adoptReplacementModel(status int, raw []byte) bool {
+	replacement := replacementModel(status, raw)
+	if replacement == "" {
+		return false
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if replacement == o.model {
+		return false
+	}
+	log.Printf("llm: model %q is deprecated, retrying with %q (set the chat-model option to silence this)", o.model, replacement)
+	o.model = replacement
+	return true
+}
+
+// replacementModel extracts the successor model from a 410 Gone body, first
+// from the structured metadata.replacement field and then from the prose of
+// the error message.
+func replacementModel(status int, raw []byte) string {
+	if status != http.StatusGone {
+		return ""
+	}
+	var body struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+		Metadata struct {
+			Replacement string `json:"replacement"`
+		} `json:"metadata"`
+	}
+	if err := json.Unmarshal(raw, &body); err != nil {
+		return ""
+	}
+	if r := strings.TrimSpace(body.Metadata.Replacement); r != "" {
+		return r
+	}
+	if m := deprecatedModelHint.FindStringSubmatch(body.Error.Message); len(m) == 2 {
+		return strings.Trim(m[1], ".")
+	}
+	return ""
 }

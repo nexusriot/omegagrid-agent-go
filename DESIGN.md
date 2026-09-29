@@ -274,7 +274,7 @@ base URL and model:
 
 | `LLM_PROVIDER` | Default `OPENCODE_BASE_URL` | Default `OPENCODE_CHAT_MODEL` | Billing |
 |---|---|---|---|
-| `opencode`, `opencode-go` | `https://opencode.ai/zen/go/v1` | `kimi-k2.6` | opencode Go subscription |
+| `opencode`, `opencode-go` | `https://opencode.ai/zen/go/v1` | `kimi-k2.7-code` | opencode Go subscription |
 | `opencode-zen`, `zen` | `https://opencode.ai/zen/v1` | `claude-sonnet-5` | pay-as-you-go credits |
 
 Only `chat_completions` is supported — the relay exposes no `/responses`
@@ -284,7 +284,21 @@ Two relay behaviours worth knowing:
 
 - A Go-tier key hitting the zen tier without credits gets `401 CreditsError`,
   not a permissions error — the tier is a billing boundary, not an auth one.
-- Models differ in how they wrap the envelope.  `kimi-k2.6`, `kimi-k3` and
+- A retired model answers `410 ModelDeprecated`, naming its successor in
+  `metadata.replacement` (and in the message prose).  `OpenAIChat` adopts that
+  successor and replays the request, so the deprecation surfaces as a log
+  line rather than a failed turn; the adoption lasts for the life of the
+  client, and `CHAT_MODEL` / `OPENCODE_CHAT_MODEL` pins a model outright.
+- Some models accept only their own default temperature and answer `400
+  invalid temperature: only 1 is allowed for this model`.  `OpenAIChat` stops
+  sending the field and replays; omitting it lands on the model's default,
+  which is by definition the value such a model allows, so nothing has to
+  guess at what that value is.  `OPENAI_TEMPERATURE=none` sets it up front.
+
+Both live in `healAfterError`, which applies at most `maxSelfHeal` fixes per
+call and refuses to repeat a fix, so a relay rejecting a request for a reason
+we keep misreading surfaces its error instead of looping.
+- Models differ in how they wrap the envelope.  `kimi-k2.7-code`, `kimi-k3` and
   `glm-5.3` return a clean JSON body (kimi puts its reasoning in a separate
   `reasoning` field, which the client ignores), while `minimax-m3` prepends a
   literal `<think>` block to the content despite `response_format`.

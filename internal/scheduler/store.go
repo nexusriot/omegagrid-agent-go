@@ -135,6 +135,41 @@ func (s *Store) UpdateLastRun(id int64, result string) error {
 	return err
 }
 
+// ClaimRun atomically marks task id as run for the given scheduled minute and
+// reports whether this caller won it. The UPDATE only matches while
+// last_run_at is older than minute, so when two processes share the database
+// (gateway plus a CLI, or two gateway replicas) exactly one of them executes a
+// given minute; everyone else sees RowsAffected == 0 and skips. last_run_at is
+// set to the scheduled minute rather than the completion time so a task that
+// runs longer than a minute is not mistaken for having covered the next one.
+func (s *Store) ClaimRun(id int64, minute time.Time) (bool, error) {
+	at := float64(minute.UnixNano()) / 1e9
+	res, err := s.db.Exec(
+		`UPDATE scheduled_tasks SET last_run_at = ?
+		 WHERE id = ? AND enabled = 1 AND (last_run_at IS NULL OR last_run_at < ?)`,
+		at, id, at,
+	)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// RecordResult stores a finished run's result and bumps run_count. It leaves
+// last_run_at alone — ClaimRun already set it to the scheduled minute.
+func (s *Store) RecordResult(id int64, result string) error {
+	result = truncateUTF8(result, 4000)
+	_, err := s.db.Exec(
+		`UPDATE scheduled_tasks SET last_result = ?, run_count = run_count + 1 WHERE id = ?`,
+		result, id,
+	)
+	return err
+}
+
 func (s *Store) SetEnabled(id int64, enabled bool) (bool, error) {
 	v := 0
 	if enabled {

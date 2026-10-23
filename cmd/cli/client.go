@@ -27,6 +27,14 @@ func remoteBase() string {
 // isRemote reports whether a remote URL is configured.
 func isRemote() bool { return remoteBase() != "" }
 
+// setAuth attaches the gateway bearer token from GATEWAY_API_TOKEN, which the
+// gateway requires on /api/* once it is configured there.
+func setAuth(req *http.Request) {
+	if tok := strings.TrimSpace(os.Getenv("GATEWAY_API_TOKEN")); tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+}
+
 // The remote branches below deliberately call httpJSON on its own line before
 // returning the decoded value. `return out.X, httpJSON(..., &out)` reads out.X
 // and calls httpJSON in the same statement, and the spec does not order a plain
@@ -52,6 +60,7 @@ func httpJSON(method, path string, reqBody, out any) error {
 	if reqBody != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	setAuth(req)
 	c := &http.Client{Timeout: 120 * time.Second}
 	resp, err := c.Do(req)
 	if err != nil {
@@ -81,15 +90,23 @@ func httpStream(path string, reqBody any, onEvent func(event, data string)) erro
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
+	setAuth(req)
 	c := &http.Client{Timeout: 300 * time.Second}
 	resp, err := c.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(b))
+	}
 
 	var eventName string
 	scanner := bufio.NewScanner(resp.Body)
+	// The final event inlines base64 attachments; the 64 KiB default line
+	// cap rejected those as "token too long".
+	scanner.Buffer(make([]byte, 64*1024), 32<<20)
 	for scanner.Scan() {
 		line := scanner.Text()
 		if strings.HasPrefix(line, "event: ") {

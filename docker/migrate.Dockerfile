@@ -14,6 +14,10 @@ WORKDIR /app
 # Only chromadb is needed; pull exact version used by the sidecar.
 RUN pip install --no-cache-dir "chromadb==0.5.5"
 COPY cmd/migrate-vector/export.py /app/export.py
+# docker-compose.migrate.yml runs this as the host UID so nothing it touches in
+# ./data ends up root-owned; give that (passwd-less) user a writable HOME for
+# chromadb's caches.
+ENV HOME=/tmp
 ENTRYPOINT ["python3", "/app/export.py"]
 
 # ── Stage 2: Go builder ──────────────────────────────────────────────────────
@@ -28,4 +32,8 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" \
 # ── Stage 3: Go importer ─────────────────────────────────────────────────────
 FROM gcr.io/distroless/static-debian12 AS importer
 COPY --from=go-builder /out/migrate-vector /migrate-vector
+# Never write the chromem DB as root: the gateway runs as the host UID and
+# could not open root-owned files. Compose overrides this with the host
+# UID:GID; plain `docker run` still falls back to distroless's nonroot user.
+USER nonroot:nonroot
 ENTRYPOINT ["/migrate-vector"]

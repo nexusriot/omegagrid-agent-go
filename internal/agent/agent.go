@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"maps"
 	"regexp"
 	"runtime/debug"
 	"slices"
@@ -164,14 +165,24 @@ type Event struct {
 
 // Run executes the agent loop end-to-end and returns one final result.
 func (s *Service) Run(req RunRequest) (*RunResult, error) {
+	return s.RunContext(context.Background(), req)
+}
+
+// RunContext is Run bound to ctx: once ctx is cancelled (the HTTP client
+// disconnected, the gateway is shutting down) the in-flight LLM call is
+// aborted and no further steps or tool calls are started.
+func (s *Service) RunContext(ctx context.Context, req RunRequest) (*RunResult, error) {
 	state, err := s.startSession(req)
 	if err != nil {
 		return nil, err
 	}
 
 	for step := 1; step <= req.MaxSteps; step++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		state.debug = append(state.debug, fmt.Sprintf("[agent] step=%d", step))
-		raw, llmS, err := s.Chat.CompleteJSON(state.messages)
+		raw, llmS, err := llm.Complete(ctx, s.Chat, state.messages)
 		if err != nil {
 			return nil, fmt.Errorf("llm complete: %w", err)
 		}
@@ -220,17 +231,20 @@ func (s *Service) Run(req RunRequest) (*RunResult, error) {
 				} else {
 					state.timings["tool_s_total"] += r.Elapsed
 				}
-				state.debug = append(state.debug, fmt.Sprintf("[batch] %s (%.3fs): %s", r.Call.Name, r.Elapsed, truncate(fmt.Sprint(r.Result), 200)))
+				state.debug = append(state.debug, fmt.Sprintf("[batch] %s (%.3fs): %s", r.Call.Name, r.Elapsed, debugResult(r.Call.Name, r.Result, 200)))
 			}
 			batchJSON, _ := json.Marshal(data)
 			var allResults []any
 			for _, r := range results {
 				allResults = append(allResults, r.Result)
 			}
-			allJSON, _ := json.Marshal(allResults)
+			allJSON, err := json.Marshal(allResults)
+			if err != nil {
+				allJSON = []byte(`{"error":"marshal failed"}`)
+			}
 			state.messages = append(state.messages,
 				llm.Message{Role: "assistant", Content: string(batchJSON)},
-				llm.Message{Role: "tool", Content: string(allJSON)},
+				llm.Message{Role: "tool", Content: capToolContent(string(allJSON))},
 				llm.Message{Role: "user", Content: batchFollowup(results, dropped)},
 			)
 			continue
@@ -257,7 +271,7 @@ func (s *Service) Run(req RunRequest) (*RunResult, error) {
 			kind = "skill"
 		}
 		state.debug = append(state.debug,
-			fmt.Sprintf("[%s] >>> CALL %s(%s) reason=%s", kind, toolName, truncateJSON(args, 200), nonempty(why, "-")),
+			fmt.Sprintf("[%s] >>> CALL %s(%s) reason=%s", kind, toolName, truncateJSON(eventArgs(toolName, args), 200), nonempty(why, "-")),
 		)
 
 		br := s.runOne(state, batchCall{Name: toolName, Args: args, Why: why, Step: step})
@@ -270,7 +284,7 @@ func (s *Service) Run(req RunRequest) (*RunResult, error) {
 			key = "skill_s_total"
 		}
 		state.timings[key] += elapsed
-		state.debug = append(state.debug, fmt.Sprintf("[%s] <<< RESULT (%.3fs): %s", kind, elapsed, truncate(fmt.Sprint(result), 300)))
+		state.debug = append(state.debug, fmt.Sprintf("[%s] <<< RESULT (%.3fs): %s", kind, elapsed, debugResult(toolName, result, 300)))
 
 		_ = s.Memory.AddMessage(state.sid, "tool", result)
 		var assistantJSON, toolJSON []byte
@@ -284,7 +298,7 @@ func (s *Service) Run(req RunRequest) (*RunResult, error) {
 		}
 		state.messages = append(state.messages,
 			llm.Message{Role: "assistant", Content: string(assistantJSON)},
-			llm.Message{Role: "tool", Content: string(toolJSON)},
+			llm.Message{Role: "tool", Content: capToolContent(string(toolJSON))},
 			llm.Message{Role: "user", Content: toolFollowup(toolName, result)},
 		)
 	}
@@ -333,7 +347,7 @@ func (s *Service) RunStream(ctx context.Context, req RunRequest, out chan<- Even
 			return
 		}
 
-		raw, llmS, err := s.Chat.CompleteJSON(state.messages)
+		raw, llmS, err := llm.Complete(ctx, s.Chat, state.messages)
 		if err != nil {
 			send(Event{Event: "error", Error: err.Error()})
 			return
@@ -392,7 +406,7 @@ func (s *Service) RunStream(ctx context.Context, req RunRequest, out chan<- Even
 				calls[i].Step = step
 			}
 			for _, c := range calls {
-				if !send(Event{Event: "tool_call", Step: step, Tool: c.Name, Args: c.Args, Why: c.Why}) {
+				if !send(Event{Event: "tool_call", Step: step, Tool: c.Name, Args: eventArgs(c.Name, c.Args), Why: c.Why}) {
 					return
 				}
 			}
@@ -414,10 +428,13 @@ func (s *Service) RunStream(ctx context.Context, req RunRequest, out chan<- Even
 			for _, r := range results {
 				allResults = append(allResults, r.Result)
 			}
-			allJSON, _ := json.Marshal(allResults)
+			allJSON, err := json.Marshal(allResults)
+			if err != nil {
+				allJSON = []byte(`{"error":"marshal failed"}`)
+			}
 			state.messages = append(state.messages,
 				llm.Message{Role: "assistant", Content: string(batchJSON)},
-				llm.Message{Role: "tool", Content: string(allJSON)},
+				llm.Message{Role: "tool", Content: capToolContent(string(allJSON))},
 				llm.Message{Role: "user", Content: batchFollowup(results, dropped)},
 			)
 			continue
@@ -445,7 +462,7 @@ func (s *Service) RunStream(ctx context.Context, req RunRequest, out chan<- Even
 			args = map[string]any{}
 		}
 		why, _ := data["why"].(string)
-		if !send(Event{Event: "tool_call", Step: step, Tool: toolName, Args: args, Why: why}) {
+		if !send(Event{Event: "tool_call", Step: step, Tool: toolName, Args: eventArgs(toolName, args), Why: why}) {
 			return
 		}
 
@@ -474,7 +491,7 @@ func (s *Service) RunStream(ctx context.Context, req RunRequest, out chan<- Even
 		}
 		state.messages = append(state.messages,
 			llm.Message{Role: "assistant", Content: string(assistantJSON)},
-			llm.Message{Role: "tool", Content: string(toolJSON)},
+			llm.Message{Role: "tool", Content: capToolContent(string(toolJSON))},
 			llm.Message{Role: "user", Content: toolFollowup(toolName, result)},
 		)
 	}
@@ -555,10 +572,11 @@ func (s *Service) startSession(req RunRequest) (*runState, error) {
 		Schema: skills.Skill{Name: "vector_add", Description: "Store a durable fact / decision / preference"},
 		Execute: func(args map[string]any) (any, error) {
 			text, _ := args["text"].(string)
-			meta, _ := args["meta"].(map[string]any)
-			if meta == nil {
-				meta = map[string]any{}
-			}
+			// Copy rather than mutate: args is the model's envelope, which the
+			// stream handler may be JSON-encoding concurrently (tool_call event).
+			in, _ := args["meta"].(map[string]any)
+			meta := make(map[string]any, len(in)+1)
+			maps.Copy(meta, in)
 			if _, ok := meta["session_id"]; !ok {
 				meta["session_id"] = sid
 			}
@@ -679,6 +697,48 @@ var sensitiveSkills = map[string]bool{
 	"shell_command": true,
 	"ssh_command":   true,
 	"jwt_inspect":   true,
+}
+
+// eventArgs returns the args to publish in a tool_call event or debug line.
+// It is a deep copy: the live map is handed to the tool, which may run while
+// the SSE handler is still encoding the event, and concurrent map access is
+// a fatal runtime error that recover() cannot catch. Sensitive skills (whose
+// args can be a bearer token or a command line with credentials) are redacted.
+func eventArgs(name string, args map[string]any) map[string]any {
+	if sensitiveSkills[name] && name != "shell_command" && name != "ssh_command" {
+		return map[string]any{"redacted": true}
+	}
+	b, err := json.Marshal(args)
+	if err != nil {
+		return map[string]any{"unserializable": true}
+	}
+	var out map[string]any
+	if err := json.Unmarshal(b, &out); err != nil {
+		return map[string]any{"unserializable": true}
+	}
+	return out
+}
+
+// debugResult renders a tool result for the debug log, which /api/query
+// returns to the caller — so a password_gen result must not appear there.
+func debugResult(name string, result any, n int) string {
+	if name == "password_gen" || name == "jwt_inspect" {
+		return "[redacted]"
+	}
+	return truncate(fmt.Sprint(result), n)
+}
+
+// maxToolContentBytes caps a single tool message in the LLM context. Every
+// later step resends the whole history, so one oversized result (a scraped
+// page, a large MCP response) would otherwise overflow the context window
+// and fail the run with a provider 400.
+const maxToolContentBytes = 32 << 10
+
+func capToolContent(s string) string {
+	if len(s) <= maxToolContentBytes {
+		return s
+	}
+	return truncate(s, maxToolContentBytes) + fmt.Sprintf("…[truncated %d bytes]", len(s)-maxToolContentBytes)
 }
 
 func (s *Service) buildSystemPrompt(tools map[string]Skill, skillNames map[string]bool) string {
@@ -898,12 +958,15 @@ func normalizeToolCall(data map[string]any, knownTools map[string]bool) map[stri
 		return data
 	}
 	if knownTools[t] {
-		args := map[string]any{}
-		for k, v := range data {
-			if k == "type" || k == "why" {
-				continue
+		args, _ := data["args"].(map[string]any)
+		if args == nil {
+			args = map[string]any{}
+			for k, v := range data {
+				if k == "type" || k == "why" {
+					continue
+				}
+				args[k] = v
 			}
-			args[k] = v
 		}
 		why, _ := data["why"].(string)
 		if why == "" {

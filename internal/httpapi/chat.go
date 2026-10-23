@@ -61,7 +61,7 @@ func (d *Deps) handleQuery(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "query is required")
 		return
 	}
-	res, err := d.Agent.Run(req.toAgentReq(d.Cfg.AgentMaxSteps))
+	res, err := d.Agent.RunContext(r.Context(), req.toAgentReq(d.Cfg.AgentMaxSteps))
 	if err != nil {
 		log.Printf("agent run error: %v", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]any{

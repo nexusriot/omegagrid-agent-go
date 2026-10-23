@@ -183,3 +183,35 @@ func TestSearchSkipsInternalLinks(t *testing.T) {
 		t.Fatalf("snippet = %q, want the one paired with this result", results[0].Snippet)
 	}
 }
+
+// The results page is read through a cap; an endless body must not be
+// buffered whole.
+func TestSearchCapsResponseBody(t *testing.T) {
+	s := NewWebSearchSkill()
+	var served int64
+	s.client.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		body := io.MultiReader(strings.NewReader(ddgHTML), &countingZeros{n: &served})
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(body), Header: make(http.Header)}, nil
+	})
+	m := s.Execute(map[string]any{"query": "go"}).(map[string]any)
+	if m["error"] != nil {
+		t.Fatalf("unexpected error: %v", m["error"])
+	}
+	if m["count"] != 2 {
+		t.Errorf("count = %v, want 2", m["count"])
+	}
+	if served > maxResponseBytes {
+		t.Errorf("read %d bytes, cap is %d", served, maxResponseBytes)
+	}
+}
+
+// countingZeros is an infinite reader of spaces that records how much was read.
+type countingZeros struct{ n *int64 }
+
+func (c *countingZeros) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = ' '
+	}
+	*c.n += int64(len(p))
+	return len(p), nil
+}

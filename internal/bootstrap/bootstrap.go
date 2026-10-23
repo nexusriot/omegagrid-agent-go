@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/nexusriot/omegagrid-agent-go/internal/agent"
 	"github.com/nexusriot/omegagrid-agent-go/internal/config"
@@ -54,7 +55,7 @@ type Services struct {
 	Memory *memory.Client
 	Skills *skills.Client
 	Sched  *scheduler.Store
-	Runner *scheduler.Runner
+	Runner *scheduler.Runner // not started; the caller opts in with Runner.Start()
 	Agent  *agent.Service
 
 	// Exposed so callers can build httpapi.Deps without re-importing agent.
@@ -158,11 +159,14 @@ func New(cfg config.Config) (*Services, func(), error) {
 		return sk.Execute(name, args)
 	}
 
+	// The runner is built but not started: only the long-running gateway
+	// should execute scheduled tasks. CLI local mode also goes through New,
+	// and starting it here gave every `omega` invocation its own runner
+	// racing the gateway's on the same scheduler DB.
 	runner := scheduler.NewRunner(
 		store, exec, cfg.TelegramBotToken,
 		time.Duration(cfg.SchedulerTickSec)*time.Second,
 	)
-	runner.Start()
 
 	ag := &agent.Service{
 		Memory:          mem,
@@ -268,10 +272,11 @@ func getString(m map[string]any, key string) string {
 // and registers them into the skill registry namespaced as "<server>_<tool>".
 // Errors are logged and the server skipped; startup is never blocked.
 func connectMCPServers(cfg config.Config, sk *skills.Client) {
-	for _, entry := range cfg.MCPServers {
+	for i, entry := range cfg.MCPServers {
 		name, url, headers, err := parseMCPEntry(entry)
 		if err != nil {
-			log.Printf("mcp client: skipping %q: %v", entry, err)
+			// Never log entry itself: it can carry "|Authorization: Bearer …".
+			log.Printf("mcp client: skipping MCP_SERVERS entry #%d: %v", i+1, err)
 			continue
 		}
 		client := mcp.NewClient(url, headers, 30*time.Second)
@@ -294,9 +299,27 @@ func connectMCPServers(cfg config.Config, sk *skills.Client) {
 	}
 }
 
+// maxRemoteDescription caps a remote tool description. Descriptions go into
+// the system prompt verbatim, so a hostile MCP server could otherwise inject
+// paragraphs of instructions there.
+const maxRemoteDescription = 300
+
+// sanitizeRemoteDescription flattens a remote description to one bounded line.
+func sanitizeRemoteDescription(d string) string {
+	d = strings.Join(strings.Fields(d), " ")
+	if len(d) > maxRemoteDescription {
+		cut := maxRemoteDescription
+		for cut > 0 && !utf8.RuneStart(d[cut]) {
+			cut--
+		}
+		d = d[:cut] + "…"
+	}
+	return d
+}
+
 func registerRemoteTool(sk *skills.Client, client *mcp.Client, server string, t mcp.Tool) {
 	skillName := server + "_" + t.Name
-	desc := t.Description
+	desc := sanitizeRemoteDescription(t.Description)
 	if desc == "" {
 		desc = t.Name
 	}

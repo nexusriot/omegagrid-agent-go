@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -126,8 +127,22 @@ func (c *Client) CallTool(ctx context.Context, name string, args map[string]any)
 	return text, nil
 }
 
-// call sends a JSON-RPC request and returns the raw result payload.
+// call sends a JSON-RPC request and returns the raw result payload. When the
+// server reports our session as gone (HTTP 404 on a request that carried a
+// session id — e.g. the remote restarted) the client re-initializes once and
+// replays the request, instead of failing every call until a gateway restart.
 func (c *Client) call(ctx context.Context, method string, params any) (json.RawMessage, error) {
+	raw, err := c.callOnce(ctx, method, params)
+	if errors.Is(err, errSessionExpired) && method != "initialize" {
+		if ierr := c.Initialize(ctx); ierr != nil {
+			return nil, fmt.Errorf("re-initialize after expired session: %w", ierr)
+		}
+		raw, err = c.callOnce(ctx, method, params)
+	}
+	return raw, err
+}
+
+func (c *Client) callOnce(ctx context.Context, method string, params any) (json.RawMessage, error) {
 	idBytes, _ := json.Marshal(c.takeID())
 	body := rpcRequest{JSONRPC: "2.0", ID: idBytes, Method: method}
 	if params != nil {
@@ -142,8 +157,10 @@ func (c *Client) call(ctx context.Context, method string, params any) (json.RawM
 	if resp.Error != nil {
 		return nil, fmt.Errorf("rpc error %d: %s", resp.Error.Code, resp.Error.Message)
 	}
-	rb, _ := json.Marshal(resp.Result)
-	return rb, nil
+	if len(resp.Result) == 0 || string(resp.Result) == "null" {
+		return nil, fmt.Errorf("rpc response for %s has neither result nor error", method)
+	}
+	return resp.Result, nil
 }
 
 // notify sends a JSON-RPC notification (no id, no response read).
@@ -168,13 +185,28 @@ func (c *Client) notify(ctx context.Context, method string, params any) error {
 	return nil
 }
 
-func (c *Client) post(ctx context.Context, body rpcRequest) (*rpcResponse, error) {
+// errSessionExpired marks a 404 for a request sent with a session id.
+var errSessionExpired = errors.New("mcp session expired")
+
+// maxResponseBytes caps a remote server's reply; the remote is not trusted.
+const maxResponseBytes = 16 << 20
+
+// clientResponse is rpcResponse as decoded on the client side: Result stays
+// raw so an absent result is distinguishable from an empty one.
+type clientResponse struct {
+	ID     json.RawMessage `json:"id"`
+	Result json.RawMessage `json:"result"`
+	Error  *rpcError       `json:"error"`
+}
+
+func (c *Client) post(ctx context.Context, body rpcRequest) (*clientResponse, error) {
 	b, _ := json.Marshal(body)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url, bytes.NewReader(b))
 	if err != nil {
 		return nil, err
 	}
 	c.setHeaders(req)
+	sentSession := req.Header.Get("Mcp-Session-Id") != ""
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -182,6 +214,10 @@ func (c *Client) post(ctx context.Context, body rpcRequest) (*rpcResponse, error
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusNotFound && sentSession {
+		c.setSessionID("")
+		return nil, errSessionExpired
+	}
 	if sid := resp.Header.Get("Mcp-Session-Id"); sid != "" {
 		c.setSessionID(sid)
 	}
@@ -190,15 +226,7 @@ func (c *Client) post(ctx context.Context, body rpcRequest) (*rpcResponse, error
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
 	}
 
-	payload, err := readResponseBody(resp)
-	if err != nil {
-		return nil, err
-	}
-	var out rpcResponse
-	if err := json.Unmarshal(payload, &out); err != nil {
-		return nil, fmt.Errorf("decode response: %w", err)
-	}
-	return &out, nil
+	return readResponse(resp, body.ID)
 }
 
 func (c *Client) setHeaders(req *http.Request) {
@@ -232,25 +260,62 @@ func (c *Client) setSessionID(sid string) {
 	c.sessionID = sid
 }
 
-// readResponseBody extracts the JSON-RPC payload from either a plain JSON
-// response or a single-event SSE stream (the two streamable-HTTP variants).
-func readResponseBody(resp *http.Response) ([]byte, error) {
-	ct := resp.Header.Get("Content-Type")
-	if strings.Contains(ct, "text/event-stream") {
-		scanner := bufio.NewScanner(resp.Body)
-		scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-		for scanner.Scan() {
-			line := scanner.Text()
-			if data, ok := strings.CutPrefix(line, "data:"); ok {
-				return []byte(strings.TrimSpace(data)), nil
-			}
-		}
-		if err := scanner.Err(); err != nil {
+// readResponse extracts the JSON-RPC response to request wantID from either a
+// plain JSON body or an SSE stream. On the SSE variant the server may send
+// notifications (progress, log messages) or its own requests before the
+// response, and one event's JSON may span several data: lines, so events are
+// reassembled and the first message whose id matches is returned.
+func readResponse(resp *http.Response, wantID json.RawMessage) (*clientResponse, error) {
+	body := io.LimitReader(resp.Body, maxResponseBytes)
+	if !strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
+		payload, err := io.ReadAll(body)
+		if err != nil {
 			return nil, err
 		}
-		return nil, fmt.Errorf("no data event in SSE response")
+		var out clientResponse
+		if err := json.Unmarshal(payload, &out); err != nil {
+			return nil, fmt.Errorf("decode response: %w", err)
+		}
+		return &out, nil
 	}
-	return io.ReadAll(resp.Body)
+
+	scanner := bufio.NewScanner(body)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxResponseBytes)
+	var data []string
+	flush := func() (*clientResponse, bool) {
+		if len(data) == 0 {
+			return nil, false
+		}
+		payload := strings.Join(data, "\n")
+		data = data[:0]
+		var out clientResponse
+		if json.Unmarshal([]byte(payload), &out) != nil {
+			return nil, false
+		}
+		if !bytes.Equal(bytes.TrimSpace(out.ID), bytes.TrimSpace(wantID)) {
+			return nil, false // a notification or server-initiated request
+		}
+		return &out, true
+	}
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			if out, ok := flush(); ok {
+				return out, nil
+			}
+			continue
+		}
+		if d, ok := strings.CutPrefix(line, "data:"); ok {
+			data = append(data, strings.TrimPrefix(d, " "))
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	if out, ok := flush(); ok { // stream ended without a trailing blank line
+		return out, nil
+	}
+	return nil, fmt.Errorf("no response with id %s in SSE stream", wantID)
 }
 
 // paramsFromSchema converts a tool's inputSchema JSON Schema into a Param map.

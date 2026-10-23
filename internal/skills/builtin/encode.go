@@ -230,7 +230,12 @@ func PasswordGen() Executor {
 		for i := range passwords {
 			p := make([]byte, length)
 			for j := range p {
-				idx, _ := rand.Int(rand.Reader, big.NewInt(int64(len(charset))))
+				// A failed read leaves idx nil; dereferencing it panicked.
+				// Never fall back to a weaker source for a password.
+				idx, err := rand.Int(rand.Reader, big.NewInt(int64(len(charset))))
+				if err != nil {
+					return map[string]any{"error": fmt.Sprintf("random source: %v", err)}, nil
+				}
 				p[j] = charset[idx.Int64()]
 			}
 			passwords[i] = string(p)

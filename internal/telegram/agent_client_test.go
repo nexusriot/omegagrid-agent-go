@@ -51,7 +51,7 @@ func TestQueryStreamParsesEvents(t *testing.T) {
 	}, "\n"))
 	defer srv.Close()
 
-	c := NewAgentClient(srv.URL)
+	c := NewAgentClient(srv.URL, "")
 	events := make(chan Event, 16)
 	errCh := make(chan error, 1)
 	go func() { errCh <- c.QueryStream("weather in London?", 777, 42, events) }()
@@ -99,7 +99,7 @@ func TestQueryStreamOmitsZeroSession(t *testing.T) {
 	srv, gotBody := sseServer(t, "event: final\ndata: {\"event\":\"final\",\"answer\":\"x\"}\n\n")
 	defer srv.Close()
 
-	c := NewAgentClient(srv.URL)
+	c := NewAgentClient(srv.URL, "")
 	events := make(chan Event, 4)
 	go func() { _ = c.QueryStream("q", 1, 0, events) }()
 	drain(events)
@@ -115,7 +115,7 @@ func TestQueryStreamClosesChannelOnTruncatedStream(t *testing.T) {
 	srv, _ := sseServer(t, "event: thinking\ndata: {\"event\":\"thinking\",\"step\":1}\n\n")
 	defer srv.Close()
 
-	c := NewAgentClient(srv.URL)
+	c := NewAgentClient(srv.URL, "")
 	events := make(chan Event, 4)
 	errCh := make(chan error, 1)
 	go func() { errCh <- c.QueryStream("q", 1, 0, events) }()
@@ -136,7 +136,7 @@ func TestQueryStreamReturnsGatewayError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewAgentClient(srv.URL)
+	c := NewAgentClient(srv.URL, "")
 	events := make(chan Event, 4)
 	errCh := make(chan error, 1)
 	go func() { errCh <- c.QueryStream("q", 1, 0, events) }()
@@ -156,7 +156,7 @@ func TestQueryStreamReturnsGatewayError(t *testing.T) {
 
 // A malformed GATEWAY_URL must be reported, not panic on a nil request.
 func TestQueryStreamMalformedBaseURL(t *testing.T) {
-	c := NewAgentClient("http://bad host:8000")
+	c := NewAgentClient("http://bad host:8000", "")
 	events := make(chan Event, 4)
 	errCh := make(chan error, 1)
 	go func() { errCh <- c.QueryStream("q", 1, 0, events) }()
@@ -180,7 +180,7 @@ func TestQueryStreamSkipsUnparseableEvents(t *testing.T) {
 	}, "\n"))
 	defer srv.Close()
 
-	c := NewAgentClient(srv.URL)
+	c := NewAgentClient(srv.URL, "")
 	events := make(chan Event, 8)
 	go func() { _ = c.QueryStream("q", 1, 0, events) }()
 
@@ -198,7 +198,7 @@ func TestQueryFallbackEndpoint(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewAgentClient(srv.URL + "/")
+	c := NewAgentClient(srv.URL+"/", "")
 	resp, err := c.Query("q", 5, 0)
 	if err != nil {
 		t.Fatalf("Query: %v", err)
@@ -221,7 +221,7 @@ func TestQueryReportsGatewayError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := NewAgentClient(srv.URL).Query("", 1, 0)
+	_, err := NewAgentClient(srv.URL, "").Query("", 1, 0)
 	if err == nil {
 		t.Fatal("expected an error for HTTP 400")
 	}
@@ -235,7 +235,7 @@ func TestQueryUnreachableGateway(t *testing.T) {
 	url := srv.URL
 	srv.Close()
 
-	if _, err := NewAgentClient(url).Query("q", 1, 0); err == nil {
+	if _, err := NewAgentClient(url, "").Query("q", 1, 0); err == nil {
 		t.Fatal("expected a transport error")
 	}
 }

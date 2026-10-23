@@ -3,10 +3,10 @@ package telegram
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
-	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,6 +16,12 @@ import (
 )
 
 const editIntervalMs = 1500
+
+// maxConcurrentHandlers caps how many updates are processed at once across all
+// chats. Each one can hold an agent run open for minutes, and spawning one per
+// update without a bound let a burst of messages fan out into as many parallel
+// agent runs against the gateway.
+const maxConcurrentHandlers = 8
 
 // Bot is the main long-running entity.  It owns one Telegram client, the
 // optional auth store, and a per-chat session map (chat_id -> session_id).
@@ -27,19 +33,40 @@ type Bot struct {
 
 	mu       sync.Mutex
 	sessions map[int64]int // chat_id -> agent session_id
+
+	// sem bounds concurrent handlers; chatLocks serialises updates within one
+	// chat so two quick messages don't race on the same session (both reading
+	// session 0 and each creating a new one, or answers arriving out of order).
+	sem       chan struct{}
+	locksMu   sync.Mutex
+	chatLocks map[int64]*chatLock
 }
 
-func New(token, gatewayURL string, auth *AuthStore) (*Bot, error) {
+// chatLock is a per-chat mutex, reference-counted so idle chats don't
+// accumulate entries forever.
+type chatLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+// New connects to Telegram. apiToken is the gateway's GATEWAY_API_TOKEN (may
+// be empty when the gateway runs without auth).
+func New(token, gatewayURL, apiToken string, auth *AuthStore) (*Bot, error) {
+	// tgbotapi logs request errors (*url.Error, whose URL embeds the bot
+	// token) through its own logger; route those through the redactor.
+	_ = tgbotapi.SetLogger(log.New(RedactingWriter(log.Writer(), token), "", log.LstdFlags))
 	api, err := tgbotapi.NewBotAPI(token)
 	if err != nil {
-		return nil, err
+		return nil, errors.New(redact(err.Error(), token))
 	}
 	return &Bot{
 		api:        api,
 		gatewayURL: strings.TrimRight(gatewayURL, "/"),
 		auth:       auth,
-		agent:      NewAgentClient(gatewayURL),
+		agent:      NewAgentClient(gatewayURL, apiToken),
 		sessions:   map[int64]int{},
+		sem:        make(chan struct{}, maxConcurrentHandlers),
+		chatLocks:  map[int64]*chatLock{},
 	}, nil
 }
 
@@ -53,7 +80,44 @@ func (b *Bot) Run() {
 		if update.Message == nil {
 			continue
 		}
-		go b.handle(update.Message)
+		go b.dispatch(update.Message)
+	}
+}
+
+// dispatch runs one update under its chat's lock and a global concurrency
+// slot. The chat lock is taken first so messages queued behind a busy chat
+// don't sit on slots other chats could use.
+func (b *Bot) dispatch(msg *tgbotapi.Message) {
+	var chatID int64
+	if msg.Chat != nil {
+		chatID = msg.Chat.ID
+	}
+	unlock := b.lockChat(chatID)
+	defer unlock()
+	b.sem <- struct{}{}
+	defer func() { <-b.sem }()
+	b.handle(msg)
+}
+
+func (b *Bot) lockChat(chatID int64) func() {
+	b.locksMu.Lock()
+	l := b.chatLocks[chatID]
+	if l == nil {
+		l = &chatLock{}
+		b.chatLocks[chatID] = l
+	}
+	l.refs++
+	b.locksMu.Unlock()
+
+	l.mu.Lock()
+	return func() {
+		l.mu.Unlock()
+		b.locksMu.Lock()
+		l.refs--
+		if l.refs == 0 {
+			delete(b.chatLocks, chatID)
+		}
+		b.locksMu.Unlock()
 	}
 }
 
@@ -101,20 +165,38 @@ func (b *Bot) setSession(chatID int64, sid int) {
 	}
 }
 
+// senderID returns the Telegram user who sent msg. Authorization is keyed on
+// the sender, not the chat: in a group the chat ID is shared by every member,
+// so allowlisting (or being admin of) a group let anyone in it drive the
+// agent. Messages with no sender (channel posts) report ok=false.
+func senderID(msg *tgbotapi.Message) (int64, bool) {
+	if msg.From == nil {
+		return 0, false
+	}
+	return msg.From.ID, true
+}
+
 func (b *Bot) ensureAuthorized(msg *tgbotapi.Message) bool {
-	if !b.auth.IsAuthorized(msg.Chat.ID) {
+	id, ok := senderID(msg)
+	if (b.auth.IsEnabled() && !ok) || !b.auth.IsAuthorized(id) {
 		b.send(msg.Chat.ID, "Access denied. Ask the bot admin to allow your Telegram ID.")
 		return false
 	}
-	b.auth.Touch(msg.Chat.ID)
+	b.auth.Touch(id)
 	return true
+}
+
+// isAdmin reports whether msg was sent by the configured admin user.
+func (b *Bot) isAdmin(msg *tgbotapi.Message) bool {
+	id, ok := senderID(msg)
+	return ok && b.auth.IsAdmin(id)
 }
 
 func (b *Bot) handleStart(msg *tgbotapi.Message) {
 	b.setSession(msg.Chat.ID, 0)
 	extra := ""
-	if b.auth.IsEnabled() {
-		extra = fmt.Sprintf("\n\nYour Telegram ID: `%d`", msg.Chat.ID)
+	if id, ok := senderID(msg); ok && b.auth.IsEnabled() {
+		extra = fmt.Sprintf("\n\nYour Telegram ID: `%d`", id)
 	}
 	b.send(msg.Chat.ID,
 		"Hello! I'm the OmegaGrid Agent bot.\n\n"+
@@ -152,13 +234,11 @@ func (b *Bot) handleSkills(msg *tgbotapi.Message) {
 	if !b.ensureAuthorized(msg) {
 		return
 	}
-	resp, err := http.Get(b.gatewayURL + "/api/skills")
+	raw, err := b.agent.ListSkillsRaw()
 	if err != nil {
 		b.send(msg.Chat.ID, "Error listing skills: "+err.Error())
 		return
 	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
 	var out struct {
 		Skills []struct {
 			Name        string `json:"name"`
@@ -186,7 +266,7 @@ func (b *Bot) handleAuthAdd(msg *tgbotapi.Message) {
 		b.send(msg.Chat.ID, "Auth is disabled.")
 		return
 	}
-	if !b.auth.IsAdmin(msg.Chat.ID) {
+	if !b.isAdmin(msg) {
 		b.send(msg.Chat.ID, "Only the admin can add users.")
 		return
 	}
@@ -212,7 +292,7 @@ func (b *Bot) handleAuthList(msg *tgbotapi.Message) {
 		b.send(msg.Chat.ID, "Auth is disabled.")
 		return
 	}
-	if !b.auth.IsAdmin(msg.Chat.ID) {
+	if !b.isAdmin(msg) {
 		b.send(msg.Chat.ID, "Only the admin can list users.")
 		return
 	}
@@ -266,8 +346,10 @@ func (b *Bot) processAgentText(chatID int64, text string, askMode bool) {
 		acc        []Event
 		lastEditMs int64
 		final      *Event
+		received   int
 	)
 	for ev := range events {
+		received++
 		evCopy := ev
 		switch ev.Event {
 		case "final":
@@ -285,13 +367,28 @@ func (b *Bot) processAgentText(chatID int64, text string, askMode bool) {
 	}
 	streamErr := <-errCh
 
-	// Streaming fallback: if streaming broke and we have no final, fall back
-	// to the synchronous endpoint so the user always gets an answer.
+	// A stream that delivered events and then broke means the gateway was
+	// already running the agent: re-sending the query to /api/query would run
+	// it a second time (duplicate tool calls, side effects, double cost), so
+	// report the interruption instead.
+	if final == nil && received > 0 {
+		log.Printf("stream interrupted after %d event(s): %v", received, streamErr)
+		reason := "connection closed"
+		if streamErr != nil {
+			reason = streamErr.Error()
+		}
+		b.editStatus(chatID, sent.MessageID, "⚠️ Stream interrupted before the answer arrived ("+reason+"). Please try again.")
+		return
+	}
+
+	// Streaming fallback: if the stream never got going (no event at all —
+	// e.g. a proxy rejecting SSE), fall back to the synchronous endpoint so the
+	// user still gets an answer.
 	if final == nil {
 		if streamErr != nil {
 			log.Printf("stream failed, falling back: %v", streamErr)
 		}
-		// The sync fallback re-runs the whole agent and can take minutes;
+		// The sync fallback runs the whole agent and can take minutes;
 		// without this edit the message keeps showing a stale "Thinking
 		// (step N)..." and looks frozen.
 		b.editStatus(chatID, sent.MessageID, "⚠️ Stream interrupted — retrying...")
@@ -474,4 +571,44 @@ func (b *Bot) editStatus(chatID int64, msgID int, text string) {
 			log.Printf("edit: %v", err)
 		}
 	}
+}
+
+// redact replaces every occurrence of secret in s. Telegram puts the bot token
+// in the request path, so any transport error (*url.Error prints its URL)
+// carries it verbatim into the logs.
+func redact(s, secret string) string {
+	if secret == "" {
+		return s
+	}
+	return strings.ReplaceAll(s, secret, "<redacted>")
+}
+
+// RedactingWriter wraps w so every write has the given secrets masked. The bot
+// binary points the standard logger at it, which covers our own log lines that
+// print tgbotapi errors as well as the library's internal ones.
+func RedactingWriter(w io.Writer, secrets ...string) io.Writer {
+	var keep []string
+	for _, s := range secrets {
+		if s != "" {
+			keep = append(keep, s)
+		}
+	}
+	return &redactingWriter{w: w, secrets: keep}
+}
+
+type redactingWriter struct {
+	w       io.Writer
+	secrets []string
+}
+
+func (r *redactingWriter) Write(p []byte) (int, error) {
+	s := string(p)
+	for _, sec := range r.secrets {
+		s = redact(s, sec)
+	}
+	if _, err := io.WriteString(r.w, s); err != nil {
+		return 0, err
+	}
+	// Report the caller's length: log.Logger treats a short count as failure.
+	return len(p), nil
 }

@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -480,7 +481,7 @@ func TestTruncate(t *testing.T) {
 func TestZeroValueClientSleepFallback(t *testing.T) {
 	c := &OpenAIChat{}
 	done := make(chan struct{})
-	go func() { c.sleepFor(0); close(done) }()
+	go func() { _ = c.sleepFor(context.Background(), 0); close(done) }()
 	select {
 	case <-done:
 	case <-time.After(time.Second):

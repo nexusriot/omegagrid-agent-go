@@ -3,9 +3,11 @@ package scheduler
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -25,8 +27,9 @@ type Runner struct {
 	botToken      string
 	checkInterval time.Duration
 
-	stop chan struct{}
-	wg   sync.WaitGroup
+	stop     chan struct{}
+	stopOnce sync.Once
+	wg       sync.WaitGroup
 
 	// lastMinute is the newest minute already evaluated. Ticks only ever look
 	// at whole minutes, and a 60s ticker drifts: fire at :59.8 and the next
@@ -60,10 +63,33 @@ func (r *Runner) Start() {
 	log.Printf("scheduler started (interval=%s)", r.checkInterval)
 }
 
-func (r *Runner) Stop() {
-	close(r.stop)
-	r.wg.Wait()
-	log.Printf("scheduler stopped")
+// defaultStopTimeout bounds how long Stop waits for an in-flight task.
+const defaultStopTimeout = 10 * time.Second
+
+// Stop signals the loop to exit and waits for the current tick, bounded by
+// defaultStopTimeout. Safe to call more than once and on a runner that was
+// never started.
+func (r *Runner) Stop() { r.StopTimeout(defaultStopTimeout) }
+
+// StopTimeout is Stop with an explicit bound. A task blocked in a skill (a
+// hung SSH or HTTP call) used to hold shutdown open indefinitely; past the
+// deadline the loop goroutine is abandoned and the process exits around it.
+// Reports whether the loop finished in time.
+func (r *Runner) StopTimeout(d time.Duration) bool {
+	r.stopOnce.Do(func() { close(r.stop) })
+	done := make(chan struct{})
+	go func() {
+		r.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		log.Printf("scheduler stopped")
+		return true
+	case <-time.After(d):
+		log.Printf("scheduler: still busy after %s, not waiting for the running task", d)
+		return false
+	}
 }
 
 func (r *Runner) loop() {
@@ -89,25 +115,31 @@ func (r *Runner) tick() {
 	}()
 	now := time.Now().UTC().Truncate(time.Minute)
 	minutes := r.pendingMinutes(now)
-	r.lastMinute = now
 
 	tasks, err := r.store.ListEnabled()
 	if err != nil {
+		// Leave lastMinute untouched so the next tick sweeps these minutes
+		// again instead of silently dropping them.
 		log.Printf("scheduler list failed: %v", err)
 		return
 	}
+	r.lastMinute = now
 	for _, task := range tasks {
 		// A task matching several of the swept minutes still runs once: the
 		// sweep exists to not lose a run, not to replay a backlog.
 		if !matchesAny(task.CronExpr, minutes) {
 			continue
 		}
-		// Skip tasks already executed inside this same minute window.
-		if task.LastRunAt != nil {
-			last := time.Unix(0, int64(*task.LastRunAt*1e9)).UTC().Truncate(time.Minute)
-			if !last.Before(now) {
-				continue
-			}
+		// Claim the minute atomically: skips tasks already run in this window
+		// and, when another process shares the database, lets only one of
+		// them run it.
+		won, err := r.store.ClaimRun(task.ID, now)
+		if err != nil {
+			log.Printf("scheduler claim failed for task #%d: %v", task.ID, err)
+			continue
+		}
+		if !won {
+			continue
 		}
 		r.runTask(task)
 	}
@@ -141,7 +173,9 @@ func matchesAny(cronExpr string, minutes []time.Time) bool {
 }
 
 func (r *Runner) runTask(t *Task) {
-	log.Printf("scheduler running task #%d %q: %s(%v)", t.ID, t.Name, t.Skill, t.Args)
+	// Args are deliberately not logged: they can carry credentials (an
+	// http_request Authorization header, an SSH command with a password).
+	log.Printf("scheduler running task #%d %q: skill=%s", t.ID, t.Name, t.Skill)
 	var resultStr string
 	res, err := r.safeExec(t)
 	if err != nil {
@@ -160,8 +194,8 @@ func (r *Runner) runTask(t *Task) {
 		}
 	}
 
-	if err := r.store.UpdateLastRun(t.ID, resultStr); err != nil {
-		log.Printf("scheduler update last_run failed: %v", err)
+	if err := r.store.RecordResult(t.ID, resultStr); err != nil {
+		log.Printf("scheduler record result failed: %v", err)
 	}
 
 	// One-shot tasks are disabled (not deleted) after their first run so the
@@ -242,15 +276,30 @@ func sendTelegram(token string, chatID int64, text string) {
 		log.Printf("telegram marshal error: %v", err)
 		return
 	}
-	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token)
+	endpoint := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token)
 	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Post(url, "application/json", bytes.NewReader(body))
+	resp, err := client.Post(endpoint, "application/json", bytes.NewReader(body))
 	if err != nil {
-		log.Printf("telegram send error: %v", err)
+		log.Printf("telegram send error: %s", redactTelegramErr(err, token))
 		return
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		log.Printf("telegram send failed: %d", resp.StatusCode)
 	}
+}
+
+// redactTelegramErr renders a send error without the bot token. Transport
+// failures come back as *url.Error, whose message embeds the request URL —
+// and Telegram puts the token in the path.
+func redactTelegramErr(err error, token string) string {
+	var uerr *url.Error
+	if errors.As(err, &uerr) {
+		err = fmt.Errorf("%s api.telegram.org: %w", uerr.Op, uerr.Err)
+	}
+	msg := err.Error()
+	if token != "" {
+		msg = strings.ReplaceAll(msg, token, "<redacted>")
+	}
+	return msg
 }

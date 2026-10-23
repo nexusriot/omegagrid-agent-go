@@ -43,7 +43,7 @@ services:
     networks: [e2e]
     # The distroless image runs as nonroot, but a fresh named volume is owned by
     # root, so the gateway could not create its databases. This is a throwaway
-    # test stack; production keeps the nonroot user and a host-owned bind mount.
+    # test stack; production runs as the host UID:GID against a host-owned bind mount.
     user: "0:0"
     environment:
       BACKEND_PORT: "8000"

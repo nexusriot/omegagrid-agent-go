@@ -2,13 +2,18 @@ package builtin
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/netip"
 	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/nexusriot/omegagrid-agent-go/internal/skills/netguard"
 )
 
 func DnsLookupSchema() Skill {
@@ -147,7 +152,7 @@ func PingCheck() Executor {
 			return map[string]any{"error": "host is required"}, nil
 		}
 		port := intOr(args, "port", 80)
-		timeout := floatOr(args, "timeout", 5)
+		timeout := clampTimeout(floatOr(args, "timeout", 5), 5, maxTimeoutSec)
 
 		t0 := time.Now()
 		addrs, err := net.LookupHost(host)
@@ -161,15 +166,21 @@ func PingCheck() Executor {
 		resolvedIP := addrs[0]
 
 		t1 := time.Now()
-		conn, err := net.DialTimeout("tcp", net.JoinHostPort(resolvedIP, strconv.Itoa(port)),
+		conn, err := netguard.DialTimeout("tcp", net.JoinHostPort(resolvedIP, strconv.Itoa(port)),
 			time.Duration(timeout*float64(time.Second)))
 		connectMs := time.Since(t1).Milliseconds()
 		if err != nil {
-			return map[string]any{
+			out := map[string]any{
 				"host": host, "resolved_ip": resolvedIP, "port": port,
 				"reachable": false, "dns_ms": dnsMs, "connect_ms": connectMs,
 				"total_ms": dnsMs + connectMs,
-			}, nil
+			}
+			// A refused destination is not "unreachable" — say why.
+			var blocked *netguard.ErrBlocked
+			if errors.As(err, &blocked) {
+				out["error"] = blocked.Error()
+			}
+			return out, nil
 		}
 		_ = conn.Close()
 		return map[string]any{
@@ -199,7 +210,9 @@ func PortScan() Executor {
 		if portsStr == "" {
 			portsStr = "21,22,25,53,80,110,143,443,993,995,3306,3389,5432,6379,8080,8443,9200"
 		}
-		timeout := floatOr(args, "timeout", 2)
+		// Per-port, so the cap is tighter than other skills': 1024 ports at 100
+		// concurrent dials already take ~10 rounds of this timeout.
+		timeout := clampTimeout(floatOr(args, "timeout", 2), 2, maxPortScanTimeoutSec)
 
 		ports, err := parsePorts(portsStr)
 		if err != nil {
@@ -207,6 +220,14 @@ func PortScan() Executor {
 		}
 		if len(ports) > 1024 {
 			ports = ports[:1024]
+		}
+
+		// Resolve once and scan the address: a policy refusal then surfaces as
+		// an error instead of every port silently reading as closed, and the
+		// target cannot re-resolve elsewhere mid-scan.
+		target, err := resolveScanTarget(host)
+		if err != nil {
+			return map[string]any{"host": host, "error": err.Error()}, nil
 		}
 
 		t0 := time.Now()
@@ -221,8 +242,8 @@ func PortScan() Executor {
 			go func(port int) {
 				defer wg.Done()
 				defer func() { <-sem }()
-				addr := net.JoinHostPort(host, strconv.Itoa(port))
-				conn, err := net.DialTimeout("tcp", addr, time.Duration(timeout*float64(time.Second)))
+				addr := net.JoinHostPort(target, strconv.Itoa(port))
+				conn, err := netguard.DialTimeout("tcp", addr, time.Duration(timeout*float64(time.Second)))
 				if err == nil {
 					_ = conn.Close()
 					mu.Lock()
@@ -236,12 +257,35 @@ func PortScan() Executor {
 		sortInts(open)
 		return map[string]any{
 			"host":          host,
+			"resolved_ip":   target,
 			"open_ports":    open,
 			"closed_count":  len(ports) - len(open),
 			"scanned_count": len(ports),
 			"elapsed_s":     time.Since(t0).Seconds(),
 		}, nil
 	}
+}
+
+const maxPortScanTimeoutSec = 10
+
+// resolveScanTarget resolves host to one address and vets it against the
+// network policy.
+func resolveScanTarget(host string) (string, error) {
+	addrs, err := net.LookupHost(host)
+	if err != nil {
+		return "", err
+	}
+	if len(addrs) == 0 {
+		return "", fmt.Errorf("no addresses returned for host")
+	}
+	ip, err := netip.ParseAddr(addrs[0])
+	if err != nil {
+		return "", err
+	}
+	if err := netguard.CheckAddr(ip); err != nil {
+		return "", err
+	}
+	return ip.String(), nil
 }
 
 // parsePorts expands a ports specification into individual port numbers.
@@ -309,6 +353,11 @@ func WhoisLookup() Executor {
 		if domain == "" {
 			return map[string]any{"error": "domain is required"}, nil
 		}
+		// The domain is written verbatim onto the WHOIS connection; a CR/LF in
+		// it would smuggle extra query lines.
+		if !isHostname(domain) {
+			return map[string]any{"error": fmt.Sprintf("invalid domain: %q", domain)}, nil
+		}
 		raw, err := whoisQuery("whois.iana.org", domain)
 		if err != nil {
 			return map[string]any{"domain": domain, "error": err.Error()}, nil
@@ -326,7 +375,9 @@ func WhoisLookup() Executor {
 				break
 			}
 		}
-		if server != "" {
+		// The referral comes from the remote response; only follow it when it
+		// is a plain hostname (whoisQuery's guarded dial vets where it lands).
+		if server != "" && isHostname(server) {
 			if r2, err := whoisQuery(server, domain); err == nil {
 				raw = r2
 			}
@@ -339,14 +390,14 @@ func WhoisLookup() Executor {
 }
 
 func whoisQuery(server, domain string) (string, error) {
-	conn, err := net.DialTimeout("tcp", server+":43", 10*time.Second)
+	conn, err := netguard.DialTimeout("tcp", net.JoinHostPort(server, "43"), 10*time.Second)
 	if err != nil {
 		return "", err
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
 	fmt.Fprintf(conn, "%s\r\n", domain)
-	sc := bufio.NewScanner(conn)
+	sc := bufio.NewScanner(io.LimitReader(conn, maxBodyBytes))
 	var sb strings.Builder
 	for sc.Scan() {
 		sb.WriteString(sc.Text())

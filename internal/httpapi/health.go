@@ -1,9 +1,75 @@
 package httpapi
 
-import "net/http"
+import (
+	"errors"
+	"net/http"
+	"sync"
+	"time"
+
+	"github.com/nexusriot/omegagrid-agent-go/internal/memory"
+)
+
+// Each /health hit used to make a real embedding call, so a docker
+// healthcheck or uptime monitor polling every few seconds turned into a
+// steady stream of paid (or GPU-bound) embed requests, and a slow backend made
+// /health itself hang. The probe result is now cached per memory client and
+// the probe is bounded.
+const (
+	embedProbeTTL     = 30 * time.Second
+	embedProbeTimeout = 5 * time.Second
+)
+
+var errEmbedProbeTimeout = errors.New("embedding probe timed out")
+
+type embedProbe struct {
+	mu       sync.Mutex
+	at       time.Time
+	err      error
+	inflight chan struct{} // non-nil while a probe runs; closed when it ends
+}
+
+var embedProbes sync.Map // *memory.Client -> *embedProbe
+
+// cachedEmbedHealth returns the embed backend's health, probing at most once
+// per embedProbeTTL. Concurrent callers share one in-flight probe, and none
+// waits longer than embedProbeTimeout — a probe that overruns keeps going in
+// the background and its result is cached when it lands.
+func cachedEmbedHealth(m *memory.Client) error {
+	v, _ := embedProbes.LoadOrStore(m, &embedProbe{})
+	p := v.(*embedProbe)
+
+	p.mu.Lock()
+	if !p.at.IsZero() && time.Since(p.at) < embedProbeTTL {
+		err := p.err
+		p.mu.Unlock()
+		return err
+	}
+	ch := p.inflight
+	if ch == nil {
+		ch = make(chan struct{})
+		p.inflight = ch
+		go func() {
+			err := m.EmbedHealthy()
+			p.mu.Lock()
+			p.at, p.err, p.inflight = time.Now(), err, nil
+			p.mu.Unlock()
+			close(ch)
+		}()
+	}
+	p.mu.Unlock()
+
+	select {
+	case <-ch:
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.err
+	case <-time.After(embedProbeTimeout):
+		return errEmbedProbeTimeout
+	}
+}
 
 func (d *Deps) handleHealth(w http.ResponseWriter, _ *http.Request) {
-	embedErr := d.Memory.EmbedHealthy()
+	embedErr := cachedEmbedHealth(d.Memory)
 	embedOK := embedErr == nil
 	embedErrStr := ""
 	if !embedOK {

@@ -67,8 +67,10 @@ func newTestBot(t *testing.T, f *fakeTelegram, auth *AuthStore, gatewayURL strin
 		api:        api,
 		gatewayURL: strings.TrimRight(gatewayURL, "/"),
 		auth:       auth,
-		agent:      NewAgentClient(gatewayURL),
+		agent:      NewAgentClient(gatewayURL, ""),
 		sessions:   map[int64]int{},
+		sem:        make(chan struct{}, maxConcurrentHandlers),
+		chatLocks:  map[int64]*chatLock{},
 	}
 }
 
@@ -82,6 +84,7 @@ func command(chatID int64, name, args string) *tgbotapi.Message {
 	return &tgbotapi.Message{
 		MessageID: 1,
 		Chat:      &tgbotapi.Chat{ID: chatID, Type: "private"},
+		From:      &tgbotapi.User{ID: chatID},
 		Text:      text,
 		Entities: []tgbotapi.MessageEntity{
 			{Type: "bot_command", Offset: 0, Length: len(name) + 1},

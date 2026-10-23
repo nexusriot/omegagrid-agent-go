@@ -27,6 +27,7 @@ func clearEnv(t *testing.T) {
 		"OPENCODE_TIMEOUT", "EMBED_PROVIDER",
 		"SKILL_HTTP_TIMEOUT", "SKILL_SHELL_ENABLED", "SKILL_SSH_ENABLED",
 		"SKILL_SSH_PRIVATE_KEY", "SKILL_SSH_DEFAULT_USER", "SKILL_SSH_IDENTITY_FILE",
+		"SKILL_ALLOW_PRIVATE_NETWORKS",
 		"AGENT_CONTEXT_TAIL", "AGENT_MEMORY_HITS", "AGENT_MAX_STEPS",
 		"AGENT_PARALLEL_TOOLS", "AGENT_MAX_PARALLEL",
 		"AUTO_MEMORY_EXTRACT", "AUTO_MEMORY_MAX_FACTS", "AUTO_MEMORY_MIN_ANSWER_LEN",
@@ -725,6 +726,37 @@ func TestInvertedToggles(t *testing.T) {
 			c := Load()
 			if c.MCPServerEnabled != tt.enabled {
 				t.Errorf("MCPServerEnabled = %v, want %v (MCP_SERVER_DISABLED=%q)", c.MCPServerEnabled, tt.enabled, tt.value)
+			}
+		})
+	}
+}
+
+// SKILL_ALLOW_PRIVATE_NETWORKS defaults to true (LAN administration is the
+// main use case); only an explicit negative makes outbound skills refuse
+// loopback and private ranges.
+func TestSkillAllowPrivateNetworks(t *testing.T) {
+	tests := []struct {
+		value string
+		block bool
+	}{
+		{"", false},
+		{"true", false},
+		{"1", false},
+		{"maybe", false},
+		{"false", true},
+		{"FALSE", true},
+		{"0", true},
+		{"no", true},
+		{"off", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.value, func(t *testing.T) {
+			clearEnv(t)
+			t.Setenv("SKILL_ALLOW_PRIVATE_NETWORKS", tt.value)
+			c := Load()
+			if c.SkillBlockPrivateNetworks != tt.block {
+				t.Errorf("SkillBlockPrivateNetworks = %v, want %v (SKILL_ALLOW_PRIVATE_NETWORKS=%q)",
+					c.SkillBlockPrivateNetworks, tt.block, tt.value)
 			}
 		})
 	}

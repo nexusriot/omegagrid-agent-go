@@ -15,6 +15,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/nexusriot/omegagrid-agent-go/internal/skills/netguard"
 )
 
 // ---------------------------------------------------------------------------
@@ -44,10 +46,7 @@ func TlsProbe() Executor {
 		if port < 1 || port > 65535 {
 			return map[string]any{"error": fmt.Sprintf("port %d outside 1-65535", port)}, nil
 		}
-		timeout := floatOr(args, "timeout", 10)
-		if timeout <= 0 {
-			timeout = 10
-		}
+		timeout := clampTimeout(floatOr(args, "timeout", 10), 10, maxTimeoutSec)
 		sni := str(args, "server_name")
 		if sni == "" && net.ParseIP(host) == nil {
 			sni = host
@@ -57,7 +56,7 @@ func TlsProbe() Executor {
 		}
 
 		addr := net.JoinHostPort(host, strconv.Itoa(port))
-		dialer := &net.Dialer{Timeout: time.Duration(timeout * float64(time.Second))}
+		dialer := netguard.Dialer(time.Duration(timeout * float64(time.Second)))
 		// InsecureSkipVerify so we still return the peer cert on name/expiry
 		// mismatch; verification status is reported separately.
 		cfg := &tls.Config{
@@ -224,14 +223,14 @@ func HttpHeaders() Executor {
 		if _, err := url.ParseRequestURI(rawURL); err != nil {
 			return map[string]any{"error": fmt.Sprintf("invalid url: %v", err)}, nil
 		}
+		if err := checkHTTPURL(rawURL); err != nil {
+			return map[string]any{"error": err.Error()}, nil
+		}
 		method := strings.ToUpper(str(args, "method"))
 		if method == "" {
 			method = http.MethodGet
 		}
-		timeout := floatOr(args, "timeout", 15)
-		if timeout <= 0 {
-			timeout = 15
-		}
+		timeout := clampTimeout(floatOr(args, "timeout", 15), 15, maxTimeoutSec)
 		maxRedir := intOr(args, "max_redirects", 10)
 		if maxRedir < 0 {
 			maxRedir = 0
@@ -249,13 +248,11 @@ func HttpHeaders() Executor {
 		// Manual redirect loop so every hop's status/Location is recorded.
 		// http.Client's automatic follow only exposes the final response.
 		deadline := time.Now().Add(time.Duration(timeout * float64(time.Second)))
-		transport := http.DefaultTransport
-		cl := &http.Client{
-			Timeout: time.Until(deadline),
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-			Transport: transport,
+		// The guarded client vets every hop's resolved address, so a redirect
+		// into cloud metadata is refused at dial time.
+		cl := netguard.Client(time.Until(deadline))
+		cl.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
 		}
 
 		current := rawURL
@@ -463,10 +460,7 @@ func BannerGrab() Executor {
 		if port < 1 || port > 65535 {
 			return map[string]any{"error": fmt.Sprintf("port %d outside 1-65535", port)}, nil
 		}
-		timeout := floatOr(args, "timeout", 5)
-		if timeout <= 0 {
-			timeout = 5
-		}
+		timeout := clampTimeout(floatOr(args, "timeout", 5), 5, maxTimeoutSec)
 		maxBytes := intOr(args, "max_bytes", 1024)
 		if maxBytes <= 0 {
 			maxBytes = 1024
@@ -478,7 +472,7 @@ func BannerGrab() Executor {
 		send := expandCRLF(str(args, "send"))
 
 		addr := net.JoinHostPort(host, strconv.Itoa(port))
-		d := &net.Dialer{Timeout: time.Duration(timeout * float64(time.Second))}
+		d := netguard.Dialer(time.Duration(timeout * float64(time.Second)))
 		t0 := time.Now()
 		raw, err := d.Dial("tcp", addr)
 		if err != nil {
@@ -644,13 +638,7 @@ func EmailAuth() Executor {
 		}
 		domain = strings.TrimSuffix(strings.ToLower(domain), ".")
 
-		timeout := floatOr(args, "timeout", 10)
-		if timeout <= 0 {
-			timeout = 10
-		}
-		if timeout > 60 {
-			timeout = 60
-		}
+		timeout := clampTimeout(floatOr(args, "timeout", 10), 10, maxTimeoutSec)
 		// One deadline for the whole skill: SPF, DMARC and every DKIM probe
 		// share it, so the call can never outlast what the caller asked for.
 		ctx, cancel := context.WithTimeout(context.Background(),

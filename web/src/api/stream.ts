@@ -1,4 +1,5 @@
 import type { StreamEvent, QueryRequest } from './types'
+import { authHeaders, promptForToken } from './auth'
 
 const BASE = import.meta.env.VITE_API_BASE ?? ''
 
@@ -19,10 +20,16 @@ export function streamQuery(
       const res = await fetch(`${BASE}/api/query/stream`, {
         method: 'POST',
         signal: ctrl.signal,
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify(req),
       })
 
+      if (res.status === 401) {
+        promptForToken()
+        onEvent({ event: 'error', data: { message: 'API token required — saved, please resend.' } })
+        onDone()
+        return
+      }
       if (!res.ok || !res.body) {
         onEvent({ event: 'error', data: { message: `HTTP ${res.status}` } })
         onDone()

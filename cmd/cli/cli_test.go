@@ -375,3 +375,40 @@ func TestResolveMaxSteps(t *testing.T) {
 		})
 	}
 }
+
+// Remote mode must authenticate once the gateway requires GATEWAY_API_TOKEN.
+func TestRemoteRequestsSendBearerToken(t *testing.T) {
+	var unauth int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer tok123" {
+			unauth++
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":"unauthorized"}`))
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/stream") {
+			_, _ = w.Write([]byte("event: final\ndata: {\"answer\":\"ok\"}\n\n"))
+			return
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+	t.Setenv("OMEGA_REMOTE", srv.URL)
+	t.Setenv("GATEWAY_API_TOKEN", "tok123")
+
+	if err := httpJSON("GET", "/api/skills", nil, &map[string]any{}); err != nil {
+		t.Fatalf("httpJSON: %v", err)
+	}
+	if err := httpStream("/api/query/stream", map[string]any{"query": "q"}, func(string, string) {}); err != nil {
+		t.Fatalf("httpStream: %v", err)
+	}
+	if unauth != 0 {
+		t.Fatalf("%d request(s) sent without the bearer token", unauth)
+	}
+
+	// A rejected stream reports the status instead of silently yielding nothing.
+	t.Setenv("GATEWAY_API_TOKEN", "")
+	if err := httpStream("/api/query/stream", map[string]any{"query": "q"}, func(string, string) {}); err == nil || !strings.Contains(err.Error(), "401") {
+		t.Fatalf("httpStream without a token: err = %v, want HTTP 401", err)
+	}
+}

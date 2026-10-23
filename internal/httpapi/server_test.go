@@ -380,16 +380,84 @@ func TestNotFoundPaths(t *testing.T) {
 }
 
 func TestCORSPreflight(t *testing.T) {
-	h := NewRouter(newTestDeps(t))
+	d := newTestDeps(t)
+	d.Cfg.CORSAllowedOrigins = []string{"http://ui.example"}
+	h := NewRouter(d)
+
 	r := httptest.NewRequest("OPTIONS", "/api/query", nil)
+	r.Header.Set("Origin", "http://ui.example")
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, r)
-
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("preflight status %d, want 204", w.Code)
 	}
-	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "http://ui.example" {
 		t.Fatalf("Allow-Origin = %q", got)
+	}
+
+	// An origin that is not configured gets no CORS grant.
+	r = httptest.NewRequest("OPTIONS", "/api/query", nil)
+	r.Header.Set("Origin", "http://evil.example")
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "" {
+		t.Fatalf("unlisted origin granted CORS: %q", got)
+	}
+}
+
+// A cross-site page can POST a text/plain "simple request" without any
+// preflight; the origin guard must refuse it before the handler runs.
+func TestOriginGuardRejectsForeignPost(t *testing.T) {
+	h := NewRouter(newTestDeps(t))
+	r := httptest.NewRequest("POST", "/api/sessions/new", nil)
+	r.Header.Set("Origin", "http://evil.example")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("foreign-origin POST: status %d, want 403", w.Code)
+	}
+
+	// Same-origin (the nginx-served UI) and Origin-less clients still work.
+	r = httptest.NewRequest("POST", "/api/sessions/new", nil)
+	r.Host = "localhost:3000"
+	r.Header.Set("Origin", "http://localhost:3000")
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("same-origin POST: status %d, want 200 (%s)", w.Code, w.Body.String())
+	}
+}
+
+func TestAPITokenRequired(t *testing.T) {
+	d := newTestDeps(t)
+	d.Cfg.APIToken = "s3cret"
+	h := NewRouter(d)
+
+	if code, _ := doJSON(t, h, "GET", "/api/sessions", ""); code != http.StatusUnauthorized {
+		t.Fatalf("no token: status %d, want 401", code)
+	}
+	r := httptest.NewRequest("GET", "/api/sessions", nil)
+	r.Header.Set("Authorization", "Bearer s3cret")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("valid token: status %d, want 200", w.Code)
+	}
+	// /health stays open for container healthchecks.
+	r = httptest.NewRequest("GET", "/health", nil)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code == http.StatusUnauthorized {
+		t.Fatal("/health must not require the API token")
+	}
+}
+
+func TestRequestBodyLimit(t *testing.T) {
+	h := NewRouter(newTestDeps(t))
+	big := `{"text":"` + strings.Repeat("a", maxRequestBodyBytes+1) + `"}`
+	code, _ := doJSON(t, h, "POST", "/api/memory/add", big)
+	if code < 400 || code >= 500 {
+		t.Fatalf("oversized body: status %d, want 4xx", code)
 	}
 }
 

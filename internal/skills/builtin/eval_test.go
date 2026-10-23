@@ -1,6 +1,7 @@
 package builtin
 
 import (
+	"encoding/json"
 	"math"
 	"reflect"
 	"strings"
@@ -78,7 +79,18 @@ func TestMathEvalValues(t *testing.T) {
 		{"binary_plus_unary", "2 + -3", -1},
 		// NOTE: Python evaluates -2**2 == -4 (** binds tighter than unary minus).
 		// This parser applies unary minus to the base first, yielding pow(-2,2)=4.
-		{"neg_binds_base_in_pow", "-2 ** 2", 4},
+		// Python precedence: unary minus is looser than ** on its left.
+		{"neg_binds_looser_than_pow", "-2 ** 2", -4},
+		{"parenthesised_neg_base", "(-2) ** 2", 4},
+		{"pow_right_assoc", "2 ** 3 ** 2", 512},
+		{"pow_signed_exp_chain", "2 ** -1 ** 2", 0.5},
+		{"double_negation", "--3", 3},
+		{"neg_pow_in_product", "3 * -2 ** 2", -12},
+		{"sci_negative_exponent", "1e-5 * 100000", 1},
+		{"sci_positive_exponent", "1e+3", 1000},
+		{"sci_upper_signed", "2.5E-1", 0.25},
+		{"sci_then_minus", "1e3-1", 999},
+		{"gcd_ints", "gcd(12, 18)", 6},
 		{"pow_with_negative_exp", "2 ** -1", 0.5},
 		{"scientific_notation", "1.5e3", 1500},
 		{"underscore_separator", "1_000 + 1", 1001},
@@ -116,11 +128,22 @@ func TestMathEvalValues(t *testing.T) {
 	}
 }
 
-func TestMathEvalInfConstant(t *testing.T) {
-	m := runExec(t, MathEval(), map[string]any{"expression": "inf"})
-	got, ok := m["result"].(float64)
-	if !ok || !math.IsInf(got, 1) {
-		t.Fatalf("eval(inf) = %#v, want +Inf", m["result"])
+// Non-finite results come back as text: encoding/json cannot marshal Inf or
+// NaN, so returning the float failed the whole tool response.
+func TestMathEvalNonFiniteIsString(t *testing.T) {
+	for expr, want := range map[string]string{
+		"inf":       "+Inf",
+		"-inf":      "-Inf",
+		"inf - inf": "NaN",
+		"log(0)":    "-Inf",
+	} {
+		m := runExec(t, MathEval(), map[string]any{"expression": expr})
+		if got, ok := m["result"].(string); !ok || got != want {
+			t.Errorf("eval(%q) = %#v, want %q", expr, m["result"], want)
+		}
+		if _, err := json.Marshal(m); err != nil {
+			t.Errorf("eval(%q) result does not marshal: %v", expr, err)
+		}
 	}
 }
 
@@ -144,7 +167,10 @@ func TestMathEvalErrors(t *testing.T) {
 		{"factorial_negative", "factorial(-1)", "out of range"},
 		// NOTE: chained power (a ** b ** c) is unsupported and errors out;
 		// Python treats it as right-associative. Documenting actual behavior.
-		{"chained_power", "2 ** 3 ** 2", ""},
+		{"gcd_fraction", "gcd(2.5, 5)", "integer"},
+		{"gcd_inf", "gcd(inf, 4)", "integer"},
+		{"gcd_nan", "gcd(inf - inf, 4)", "integer"},
+		{"dangling_exponent_sign", "1e-", ""},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

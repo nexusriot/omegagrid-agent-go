@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/nexusriot/omegagrid-agent-go/internal/telegram"
 )
@@ -54,6 +55,10 @@ func main() {
 	if token == "" {
 		log.Fatalf("TELEGRAM_BOT_TOKEN is not set. Cannot start bot.")
 	}
+	// Telegram errors are *url.Error values whose URL embeds the bot token;
+	// mask it (and the gateway token) in everything this process logs.
+	apiToken := strings.TrimSpace(os.Getenv("GATEWAY_API_TOKEN"))
+	log.SetOutput(telegram.RedactingWriter(os.Stderr, token, apiToken))
 	gatewayURL := os.Getenv("GATEWAY_URL")
 	if gatewayURL == "" {
 		gatewayURL = "http://127.0.0.1:8000"
@@ -68,7 +73,7 @@ func main() {
 		log.Fatalf("auth: %v", err)
 	}
 
-	bot, err := telegram.New(token, gatewayURL, auth)
+	bot, err := telegram.New(token, gatewayURL, apiToken, auth)
 	if err != nil {
 		log.Fatalf("bot init: %v", err)
 	}

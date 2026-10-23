@@ -51,6 +51,12 @@ func MathEval() Executor {
 		if err != nil {
 			return map[string]any{"error": err.Error(), "expression": expr}, nil
 		}
+		// encoding/json refuses Inf and NaN ("unsupported value"), which
+		// failed the whole tool response for inputs as ordinary as 1/0.0 via
+		// inf or log(0). Report them as text instead.
+		if math.IsInf(result, 0) || math.IsNaN(result) {
+			return map[string]any{"expression": expr, "result": strconv.FormatFloat(result, 'g', -1, 64)}, nil
+		}
 		return map[string]any{"expression": expr, "result": result}, nil
 	}
 }
@@ -77,9 +83,22 @@ var mathFuncs = map[string]func([]float64) (float64, error){
 	"atan2":   func2(math.Atan2),
 	"pow":     func2(math.Pow),
 	"hypot":   func2(math.Hypot),
-	"gcd":     func2(func(a, b float64) float64 { return float64(gcdInt(int64(a), int64(b))) }),
-	"min":     func2(math.Min),
-	"max":     func2(math.Max),
+	"gcd": func(args []float64) (float64, error) {
+		if len(args) != 2 {
+			return 0, fmt.Errorf("expected 2 arguments")
+		}
+		// int64(x) of a fraction, Inf or NaN is truncated or undefined, so
+		// gcd(2.5, 5) used to answer 1 and gcd(inf, 4) whatever the
+		// conversion produced. Only exact integers are meaningful here.
+		for _, x := range args {
+			if math.IsInf(x, 0) || math.IsNaN(x) || x != math.Trunc(x) || math.Abs(x) > 1<<53 {
+				return 0, fmt.Errorf("gcd requires integer arguments")
+			}
+		}
+		return float64(gcdInt(int64(args[0]), int64(args[1]))), nil
+	},
+	"min": func2(math.Min),
+	"max": func2(math.Max),
 	"factorial": func(args []float64) (float64, error) {
 		if len(args) != 1 {
 			return 0, fmt.Errorf("factorial takes 1 argument")
@@ -232,34 +251,49 @@ func (p *parser) parseMulDiv() (float64, error) {
 	return left, nil
 }
 
+// Precedence follows Python, which the skill description mirrors: unary
+// minus binds looser than ** on its left (-2**2 == -4) but an exponent may
+// itself be signed (2**-1 == 0.5), and ** is right-associative
+// (2**3**2 == 2**9 == 512). The old grammar applied the sign to the base and
+// parsed a**b**c as (a**b)**c.
+//
+//	unary := ('-' | '+') unary | power
+//	power := primary ('**' unary)?
+
+// parsePow is the multiplicative operand: a signed power expression.
 func (p *parser) parsePow() (float64, error) {
-	base, err := p.parseUnary()
+	return p.parseUnary()
+}
+
+func (p *parser) parseUnary() (float64, error) {
+	p.skipWS()
+	if p.pos < len(p.s) && (p.s[p.pos] == '-' || p.s[p.pos] == '+') {
+		neg := p.s[p.pos] == '-'
+		p.pos++
+		v, err := p.parseUnary()
+		if neg {
+			v = -v
+		}
+		return v, err
+	}
+	return p.parsePower()
+}
+
+func (p *parser) parsePower() (float64, error) {
+	base, err := p.parsePrimary()
 	if err != nil {
 		return 0, err
 	}
 	p.skipWS()
 	if p.pos+1 < len(p.s) && p.s[p.pos] == '*' && p.s[p.pos+1] == '*' {
 		p.pos += 2
-		exp, err := p.parseUnary()
+		exp, err := p.parseUnary() // right-recursive: right-associative
 		if err != nil {
 			return 0, err
 		}
 		return math.Pow(base, exp), nil
 	}
 	return base, nil
-}
-
-func (p *parser) parseUnary() (float64, error) {
-	p.skipWS()
-	if p.pos < len(p.s) && p.s[p.pos] == '-' {
-		p.pos++
-		v, err := p.parsePrimary()
-		return -v, err
-	}
-	if p.pos < len(p.s) && p.s[p.pos] == '+' {
-		p.pos++
-	}
-	return p.parsePrimary()
 }
 
 func (p *parser) parsePrimary() (float64, error) {
@@ -302,8 +336,23 @@ func (p *parser) parsePrimary() (float64, error) {
 
 func (p *parser) parseNumber() (float64, error) {
 	start := p.pos
-	for p.pos < len(p.s) && (unicode.IsDigit(rune(p.s[p.pos])) || p.s[p.pos] == '.' || p.s[p.pos] == 'e' || p.s[p.pos] == 'E' || p.s[p.pos] == '_') {
+	isDigitAt := func(i int) bool { return i < len(p.s) && p.s[i] >= '0' && p.s[i] <= '9' }
+	for p.pos < len(p.s) && (isDigitAt(p.pos) || p.s[p.pos] == '.' || p.s[p.pos] == '_') {
 		p.pos++
+	}
+	// Exponent: e/E, an optional sign, then digits. The sign used to end the
+	// token, so 1e-5 lexed as "1e" (a parse error) and 1e+3 likewise.
+	if p.pos < len(p.s) && (p.s[p.pos] == 'e' || p.s[p.pos] == 'E') {
+		j := p.pos + 1
+		if j < len(p.s) && (p.s[j] == '+' || p.s[j] == '-') {
+			j++
+		}
+		if isDigitAt(j) {
+			p.pos = j
+			for isDigitAt(p.pos) || (p.pos < len(p.s) && p.s[p.pos] == '_') {
+				p.pos++
+			}
+		}
 	}
 	tok := strings.ReplaceAll(p.s[start:p.pos], "_", "")
 	return strconv.ParseFloat(tok, 64)

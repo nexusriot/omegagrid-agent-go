@@ -13,10 +13,15 @@ import (
 	"unicode/utf8"
 
 	"golang.org/x/net/html"
+
+	"github.com/nexusriot/omegagrid-agent-go/internal/skills/netguard"
 )
 
+// httpClient returns a client whose dials go through the SSRF guard, so a
+// model-chosen URL (or a redirect from one) cannot reach cloud metadata or,
+// when SKILL_ALLOW_PRIVATE_NETWORKS=false, the local network.
 func httpClient(timeoutSec float64) *http.Client {
-	return &http.Client{Timeout: time.Duration(timeoutSec * float64(time.Second))}
+	return netguard.Client(time.Duration(timeoutSec * float64(time.Second)))
 }
 
 // getWithRetry issues a GET via cl, retrying transient transport errors
@@ -74,7 +79,7 @@ func Weather(timeoutSec float64) Executor {
 				Longitude float64 `json:"longitude"`
 			} `json:"results"`
 		}
-		if err := json.NewDecoder(geoResp.Body).Decode(&geo); err != nil || len(geo.Results) == 0 {
+		if err := json.NewDecoder(io.LimitReader(geoResp.Body, maxBodyBytes)).Decode(&geo); err != nil || len(geo.Results) == 0 {
 			return map[string]any{"error": fmt.Sprintf("city '%s' not found", city)}, nil
 		}
 		r := geo.Results[0]
@@ -99,7 +104,7 @@ func Weather(timeoutSec float64) Executor {
 				Weathercode   int     `json:"weathercode"`
 			} `json:"current"`
 		}
-		if err := json.NewDecoder(wResp.Body).Decode(&w); err != nil {
+		if err := json.NewDecoder(io.LimitReader(wResp.Body, maxBodyBytes)).Decode(&w); err != nil {
 			return map[string]any{"error": "weather API error"}, nil
 		}
 		return map[string]any{
@@ -132,6 +137,9 @@ func HttpRequest(timeoutSec float64) Executor {
 		if rawURL == "" {
 			return map[string]any{"error": "url is required"}, nil
 		}
+		if err := checkHTTPURL(rawURL); err != nil {
+			return map[string]any{"error": err.Error()}, nil
+		}
 		method := strings.ToUpper(str(args, "method"))
 		if method == "" {
 			method = "GET"
@@ -160,12 +168,17 @@ func HttpRequest(timeoutSec float64) Executor {
 			return map[string]any{"error": err.Error()}, nil
 		}
 		defer resp.Body.Close()
-		raw, _ := io.ReadAll(resp.Body)
+		raw, truncated, _ := readCapped(resp.Body, maxBodyBytes)
 		var body any
-		if err := json.Unmarshal(raw, &body); err != nil {
-			body = string(raw)
+		if truncated || json.Unmarshal(raw, &body) != nil {
+			// A cut-off JSON document never parses; return the text instead.
+			body = string(trimPartialRune(raw))
 		}
-		return map[string]any{"status_code": resp.StatusCode, "body": body}, nil
+		out := map[string]any{"status_code": resp.StatusCode, "body": body}
+		if truncated {
+			out["truncated"] = true
+		}
+		return out, nil
 	}
 }
 
@@ -184,6 +197,9 @@ func WebScrape(timeoutSec float64) Executor {
 		if rawURL == "" {
 			return map[string]any{"error": "url is required"}, nil
 		}
+		if err := checkHTTPURL(rawURL); err != nil {
+			return map[string]any{"error": err.Error()}, nil
+		}
 		// A non-positive max_chars is meaningless, and a negative one used to
 		// panic outright on the rune slice below ("slice bounds out of range
 		// [:-1]") — from a value an LLM can put in the args map, on a goroutine
@@ -199,7 +215,10 @@ func WebScrape(timeoutSec float64) Executor {
 		}
 		defer resp.Body.Close()
 		ct := resp.Header.Get("Content-Type")
-		raw, _ := io.ReadAll(resp.Body)
+		raw, bodyTruncated, _ := readCapped(resp.Body, maxBodyBytes)
+		if bodyTruncated {
+			raw = trimPartialRune(raw)
+		}
 
 		var text string
 		if strings.Contains(ct, "text/html") {
@@ -210,7 +229,7 @@ func WebScrape(timeoutSec float64) Executor {
 		text = strings.TrimSpace(collapseWhitespace(text))
 		// max_chars means characters: byte-slicing a UTF-8 page cut runes in
 		// half, so a Cyrillic or CJK page came back with a mangled tail.
-		truncated := false
+		truncated := bodyTruncated
 		if utf8.RuneCountInString(text) > maxChars {
 			text = string([]rune(text)[:maxChars])
 			truncated = true
@@ -274,13 +293,16 @@ func HttpHealth() Executor {
 		if rawURL == "" {
 			return map[string]any{"error": "url is required"}, nil
 		}
+		if err := checkHTTPURL(rawURL); err != nil {
+			return map[string]any{"url": rawURL, "ok": false, "error": err.Error(), "response_time_ms": 0}, nil
+		}
 		method := strings.ToUpper(str(args, "method"))
 		if method == "" {
 			method = "GET"
 		}
 		expected := intOr(args, "expected_status", 200)
 		bodyContains := str(args, "body_contains")
-		timeout := floatOr(args, "timeout", 10)
+		timeout := clampTimeout(floatOr(args, "timeout", 10), 10, maxTimeoutSec)
 		cl := httpClient(timeout)
 
 		start := time.Now()
@@ -300,7 +322,7 @@ func HttpHealth() Executor {
 			return map[string]any{"url": rawURL, "ok": false, "error": err.Error(), "response_time_ms": elapsed}, nil
 		}
 		defer resp.Body.Close()
-		raw, _ := io.ReadAll(resp.Body)
+		raw, bodyTruncated, _ := readCapped(resp.Body, maxBodyBytes)
 		bodyMatch := bodyContains == "" || strings.Contains(string(raw), bodyContains)
 		ok := resp.StatusCode == expected && bodyMatch
 		return map[string]any{
@@ -310,6 +332,7 @@ func HttpHealth() Executor {
 			"response_time_ms": elapsed,
 			"body_match":       bodyMatch,
 			"content_length":   len(raw),
+			"body_truncated":   bodyTruncated,
 		}, nil
 	}
 }
@@ -335,7 +358,7 @@ func IpInfo(timeoutSec float64) Executor {
 		}
 		defer resp.Body.Close()
 		var m map[string]any
-		if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
+		if err := json.NewDecoder(io.LimitReader(resp.Body, maxBodyBytes)).Decode(&m); err != nil {
 			return map[string]any{"error": "ip-api decode error"}, nil
 		}
 		return m, nil

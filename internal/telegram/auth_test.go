@@ -3,6 +3,7 @@ package telegram
 import (
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -28,13 +29,13 @@ func newAuthStore(t *testing.T, adminID int64) *AuthStore {
 // With auth off the bot is open to everyone, and none of the store methods may
 // touch the (nil) database.
 func TestAuthDisabledAcceptsEveryone(t *testing.T) {
-	t.Setenv("BOT_AUTH_ENABLED", "")
+	t.Setenv("BOT_AUTH_ENABLED", "false")
 	a, err := AuthFromEnv()
 	if err != nil {
 		t.Fatalf("AuthFromEnv: %v", err)
 	}
 	if a.IsEnabled() {
-		t.Fatal("auth reported enabled without BOT_AUTH_ENABLED")
+		t.Fatal("auth reported enabled with BOT_AUTH_ENABLED=false")
 	}
 	if !a.IsAuthorized(12345) {
 		t.Fatal("a disabled allowlist must authorize every chat")
@@ -65,6 +66,30 @@ func TestAuthEnabledRequiresAdminID(t *testing.T) {
 	t.Setenv("BOT_ADMIN_ID", "")
 	if _, err := AuthFromEnv(); err == nil {
 		t.Fatal("expected an error when auth is enabled with no BOT_ADMIN_ID")
+	}
+}
+
+// An unset BOT_AUTH_ENABLED used to leave the bot open to anyone; it must now
+// fail closed — enabled, so a missing admin ID refuses to start.
+func TestAuthDefaultsToEnabled(t *testing.T) {
+	t.Setenv("BOT_AUTH_ENABLED", "")
+	t.Setenv("BOT_ADMIN_ID", "")
+	if _, err := AuthFromEnv(); err == nil || !strings.Contains(err.Error(), "BOT_ADMIN_ID") {
+		t.Fatalf("unset BOT_AUTH_ENABLED without an admin: err = %v, want a BOT_ADMIN_ID error", err)
+	}
+
+	t.Setenv("BOT_ADMIN_ID", "777")
+	t.Setenv("BOT_AUTH_DB", filepath.Join(t.TempDir(), "auth.sqlite3"))
+	a, err := AuthFromEnv()
+	if err != nil {
+		t.Fatalf("AuthFromEnv: %v", err)
+	}
+	t.Cleanup(func() { _ = a.db.Close() })
+	if !a.IsEnabled() {
+		t.Fatal("auth is disabled although BOT_AUTH_ENABLED was not set")
+	}
+	if a.IsAuthorized(12345) {
+		t.Fatal("a stranger was authorized under the default config")
 	}
 }
 

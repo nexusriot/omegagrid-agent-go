@@ -20,11 +20,12 @@ repository.
 │  frontend (nginx)   │ ────────► │   Go gateway                     :8000   │
 │  React UI  :80      │           │                                          │
 │  proxies /api/*     │           │  agent loop · scheduler · skills         │
-└─────────────────────┘           │  vector memory · history                 │
-         ▲                        └─────────────────┬────────────────────────┘
-         │ Telegram Bot API                         │ HTTP
-         │                                          ▼
-         └──────────── telegram-bot (Go) ──► Ollama / OpenAI / OpenAI Codex / DigitalOcean / opencode
+└─────────────────────┘           │  vector memory · history · /mcp          │
+                                  └──────▲───────────────────┬───────────────┘
+                 HTTP /api/query[/stream]│                   │ HTTP
+                                         │                   ▼
+ Telegram Bot API ◄── telegram-bot (Go) ─┘    Ollama / OpenAI / OpenAI Codex /
+                                              DigitalOcean / opencode
 ```
 
 ## Repository layout
@@ -45,6 +46,7 @@ internal/
     audit.go            GET /api/invocations, GET /api/invocations/{id}, POST …/replay
   llm/                  Ollama + OpenAI chat clients (chat_completions & responses)
                         opencode.go reuses OpenAIChat for the opencode Zen relay
+  mcp/                  MCP server (/mcp) + client for remote MCP servers (JSON-RPC 2.0)
   memory/               In-process history (SQLite) + vector store (chromem-go)
     client.go           Public API — CreateSession / AddMemory / SearchMemory / …
     history.go          SQLite sessions + messages (modernc.org/sqlite, no CGO)
@@ -60,12 +62,13 @@ internal/
       web.go            weather, http_request, web_scrape, http_health, ip_info
       network.go        dns_lookup, ping_check, port_scan, whois_lookup
       recon.go          tls_probe, http_headers, banner_grab, ptr_lookup, email_auth
-      encode.go         base64, hash, uuid_gen, password_gen, cidr_calc, jwt_inspect
-      eval.go           datetime, math_eval (safe parser), cron_schedule
+      encode.go         base64_skill, hash_skill, uuid_gen, password_gen, cidr_calc, jwt_inspect
+      eval.go           datetime_skill, math_eval (safe parser), cron_schedule
       reminder.go       reminder (echo message for one-shot scheduled tasks)
       exec.go           shell_command, ssh_command
       qr.go             qr_generate
     markdown/           Markdown skill loader + pipeline executor
+    netguard/           SSRF guard: vets every outbound skill dial (after DNS resolution)
   search/               Native web_search skill (DuckDuckGo HTML scrape, no API key)
   telegram/             Bot poller, command handlers, SQLite auth allowlist
 test/e2e/               End-to-end suite — drives a running gateway over HTTP
@@ -83,7 +86,7 @@ docker/
   gateway.Dockerfile    golang:1.25-bookworm build → distroless runtime (~16 MB)
   telegram.Dockerfile   golang:1.25-bookworm build → distroless runtime (~12 MB)
   e2e.Dockerfile        mockllm + the compiled e2e test binary
-  migrate.Dockerfile    Two-stage: Python exporter + Go importer (migration only)
+  migrate.Dockerfile    Three-stage: Python exporter, Go builder, distroless importer (migration only)
   nginx.conf            SPA routing + /api proxy + SSE streaming support
 docker-compose.yml           3-service stack (frontend + gateway + telegram-bot)
 docker-compose.e2e.yml       e2e stack (mockllm + gateway + gateway-locked + runner)
@@ -91,7 +94,7 @@ docker-compose.migrate.yml   One-shot migration containers
 scripts/e2e.sh         Runs the end-to-end suite (docker, or --host for a fast loop)
 run_tests.sh           Runs the unit suite (local -race, or --docker)
 Dockerfile.test        Image `make test` runs the unit suite in
-Makefile               init / web / build / build-all / cli / vet / test / e2e / e2e-host / dev-web / vector-* targets
+Makefile               init / web / build / build-all / cli / migrate-vector / vet / test / e2e / e2e-host / dev-web / vector-* targets
 ```
 
 ## Running with Docker Compose
@@ -112,9 +115,9 @@ docker compose up --build
 
 | URL | What |
 |---|---|
-| `http://localhost/ui/` | React web UI (chat, memory, skills, scheduler, health) |
+| `http://localhost/ui/` | React web UI (chat, memory, skills, scheduler, activity, health) |
 | `http://localhost/api/` | REST API proxied through nginx |
-| `http://localhost:8000/` | Go gateway direct access |
+| `http://localhost:8000/` | Go gateway direct access (`/api/*`, `/health`, `/mcp`; published on `127.0.0.1` only) |
 
 Set `FRONTEND_PORT` (default `80`) or `BACKEND_PORT` (default `8000`) in `.env`
 to use different host ports.
@@ -175,11 +178,11 @@ docker compose down && docker compose up -d
 The gateway auto-creates `DATA_DIR` and its subdirectories (`chromem/`, `skills/`,
 and the parent dirs of `AGENT_DB` / `SCHEDULER_DB`) on first start, so no
 `mkdir -p data/skills` step is required. If you prefer to pre-create them (e.g.
-to set custom permissions, or to bind-mount the dir into Docker), `make build`
-still runs `mkdir -p data/skills` for you.
+to set custom permissions, or to bind-mount the dir into Docker), `make init`
+runs `mkdir -p data/skills` for you.
 
 ```bash
-# 1. Go gateway  (serves /api/* and /health on :8000 — no UI)
+# 1. Go gateway  (serves /api/*, /health and /mcp on :8000 — no UI)
 LLM_PROVIDER=ollama OLLAMA_URL=http://127.0.0.1:11434 \
 DATA_DIR=$PWD/data \
     go run ./cmd/gateway
@@ -189,8 +192,10 @@ DATA_DIR=$PWD/data \
 make dev-web
 # → http://localhost:5173/ui/
 
-# (optional) Telegram bot
-TELEGRAM_BOT_TOKEN=... GATEWAY_URL=http://127.0.0.1:8000 \
+# (optional) Telegram bot  (auth is on by default — BOT_ADMIN_ID is required)
+TELEGRAM_BOT_TOKEN=... BOT_ADMIN_ID=<your-telegram-user-id> \
+GATEWAY_URL=http://127.0.0.1:8000 \
+DATA_DIR=$PWD/data BOT_AUTH_DB=$PWD/data/telegram_auth.sqlite3 \
     go run ./cmd/telegram-bot
 ```
 
@@ -202,6 +207,7 @@ make web          # cd web && npm run build  (populates web/dist/)
 make build        # web + go build -o bin/gateway
 make build-all    # web + build gateway + telegram-bot + migrate-vector + omega CLI
 make cli          # go build -o bin/omega ./cmd/cli
+make migrate-vector  # go build -o bin/migrate-vector ./cmd/migrate-vector
 make dev-web      # cd web && npm run dev  (Vite dev server, hot-reload)
 make vet          # go vet ./...
 make test         # unit suite inside a Docker container (Dockerfile.test)
@@ -248,7 +254,7 @@ Coverage, by package:
 | `internal/config` | 100% | |
 | `internal/observability` | 100% | |
 | `internal/search` | 95% | DuckDuckGo HTML parsing driven through a fake `http.RoundTripper` |
-| `internal/llm` | 94% | both providers against `httptest`, including the retry schedule |
+| `internal/llm` | 96% | Ollama, OpenAI and opencode clients against `httptest`, including the retry schedule |
 | `internal/skills` | 94% | `skill_creator` YAML output is loaded back and compared |
 | `internal/mcp` | 90% | JSON and single-event SSE transports, both directions |
 | `internal/bootstrap` | 89% | `New()` wires real stores against a temp dir |
@@ -280,17 +286,23 @@ go build -o bin/omega ./cmd/cli
 ```
 
 By default the CLI wires services in-process (same construction as the
-gateway), reading the same `LLM_PROVIDER`, `DATA_DIR`, etc. env vars.  Set
-`OMEGA_REMOTE=http://localhost:8000` to hit a running gateway over HTTP
-instead.
+gateway), reading the same `LLM_PROVIDER`, `DATA_DIR`, etc. env vars — outside
+Docker set `DATA_DIR=$PWD/data`, since the default is the container path
+`/app/data`.  Set `OMEGA_REMOTE=http://localhost:8000` to hit a running gateway
+over HTTP instead; `GATEWAY_API_TOKEN` is sent as the bearer token when set.
+Local mode does not run scheduled tasks — only the gateway does.
+
+Flags use Go's `flag` package, so they must come **before** the positional
+arguments (`omega ask --stream "..."`, not `omega ask "..." --stream`).
 
 ```bash
 # Local mode (in-process services)
-omega ask "what's the weather in Berlin?" --stream
+export DATA_DIR=$PWD/data
+omega ask --stream "what's the weather in Berlin?"
 omega skills list
-omega skills run weather --arg city=Berlin
-omega memory search "kubernetes notes" -k 10
-omega memory add "vlad prefers tabs" --meta tag=preference
+omega skills run --arg city=Berlin weather
+omega memory search -k 10 "kubernetes notes"
+omega memory add --meta tag=preference "vlad prefers tabs"
 omega memory list --limit 50
 omega memory delete <memory-id>
 omega schedule list
@@ -302,6 +314,7 @@ omega session export 42 > session-42.json
 
 # Remote mode (talks to a running gateway)
 OMEGA_REMOTE=http://localhost:8000 omega ask "..."
+OMEGA_REMOTE=http://localhost:8000 GATEWAY_API_TOKEN=... omega ask "..."   # token-protected gateway
 ```
 
 `omega ask --stream` renders SSE events with ANSI color when stdout is a TTY
@@ -324,9 +337,9 @@ Everything is compiled into the gateway binary (pure Go, no CGO, distroless runt
 
 **Core platform:**
 - HTTP gateway, REST API, SSE streaming
-- Agent tool-calling loop with JSON recovery and **optional parallel tool calls** (`tool_calls` batch envelope, gated by `AGENT_PARALLEL_TOOLS`)
+- Agent tool-calling loop with JSON recovery and **optional parallel tool calls** (`tool_calls` batch envelope, gated by `AGENT_PARALLEL_TOOLS`); each tool result is capped at 32 KiB in the LLM context
 - Ollama + OpenAI (chat_completions & responses) LLM clients
-- Cron scheduler (SQLite store, matcher, runner)
+- Cron scheduler (SQLite store, matcher, runner) — run by the gateway only; atomic per-minute task claims
 - Telegram bot with SQLite auth allowlist
 - `omega` CLI binary with local + remote modes (`cmd/cli`)
 - **Skill playground** endpoint (`POST /api/skills/{name}/invoke`) for invoking any skill directly without going through the agent loop
@@ -362,13 +375,13 @@ Everything is compiled into the gateway binary (pure Go, no CGO, distroless runt
 | `password_gen` | Cryptographically secure password generator |
 | `cidr_calc` | CIDR network details + IP membership check |
 | `jwt_inspect` | Decode JWT header/payload without verifying; flags `alg=none` and exp/nbf.  Args/result are redacted in the audit log |
-| `math_eval` | Safe expression evaluator (custom AST parser, no `eval`) |
+| `math_eval` | Safe expression evaluator (custom AST parser, no `eval`). Python-style precedence (`-2**2` = `-4`, `**` right-associative), exponent literals such as `1e-5`; `inf`/`nan` results are returned as strings |
 | `cron_schedule` | Parse cron expression, explain it, show next N run times. Out-of-range fields are rejected rather than yielding an empty run list |
 | `reminder` | Echo a message back; used by one-shot scheduled tasks to deliver reminders at a set time |
-| `shell_command` | Local shell (requires `SKILL_SHELL_ENABLED=true`) |
-| `ssh_command` | Remote SSH command (requires `SKILL_SSH_ENABLED=true`) |
+| `shell_command` | Local shell (requires `SKILL_SHELL_ENABLED=true`). Timeout clamped to 1–300 s, stdout/stderr capped at 256 KiB each. Its command blocklist is **not** a security boundary |
+| `ssh_command` | Remote SSH command (requires `SKILL_SSH_ENABLED=true`). Same timeout clamp and output cap as `shell_command` |
 | `qr_generate` | QR code as base64 PNG. `error_correction` is case-insensitive; `box_size` is the exact pixels per module and `border` the exact quiet-zone width in modules |
-| `skill_creator` | Hot-register new skills from YAML + Markdown at runtime. Skill names are validated on every action, so they always resolve inside `SKILLS_DIR` |
+| `skill_creator` | Hot-register new skills from YAML + Markdown at runtime. Skill names are validated on every action, so they always resolve inside `SKILLS_DIR`; built-in names (and `skill_creator` itself) cannot be created or overwritten |
 
 **Native agent skills (registered directly into the agent's tool table):**
 
@@ -386,6 +399,19 @@ The free-text instructions block of a markdown skill (everything after the YAML
 frontmatter) is surfaced in the agent's system prompt (first 5 lines) and drives
 prompt-only skill execution.
 
+Rules the loader and `skill_creator` enforce:
+- A markdown file whose name collides with a built-in skill is skipped at load
+  (logged), so it can never shadow e.g. `http_request`.
+- Pipelines nest at most 5 levels deep and may not call themselves.
+- The frontmatter's closing `---` must be on a line of its own.
+- **Behaviour change:** values substituted into an `endpoint` URL are
+  percent-encoded, so a placeholder can no longer inject `/` path segments or
+  change the host. Put path structure in the template itself, not in a
+  parameter value.
+
+Outbound skills (built-in and markdown `endpoint` steps) go through the
+`netguard` dial check — see [Security](#security).
+
 ## MCP (Model Context Protocol)
 
 The gateway speaks MCP in both directions over a hand-rolled JSON-RPC 2.0
@@ -395,7 +421,9 @@ transport (no SDK dependency).
 any consumed remote tools) is exposed as an MCP tool at `POST /mcp`. Point any
 MCP client (Claude Desktop, Cursor, …) at the **gateway** port — the frontend
 nginx proxies `/ui/`, `/health` and `/api/` but deliberately not `/mcp`, so use
-`http://<host>:${BACKEND_PORT:-8000}/mcp`, not the UI port:
+`http://localhost:${BACKEND_PORT:-8000}/mcp` (compose publishes it on
+`127.0.0.1` only), not the UI port. When `GATEWAY_API_TOKEN` is set, add
+`-H "Authorization: Bearer $GATEWAY_API_TOKEN"` to the requests below:
 
 ```bash
 # initialize
@@ -422,7 +450,10 @@ MCP_SERVERS='weather=https://example.com/mcp,docs=https://docs.host/mcp|Authoriz
 ```
 
 A remote server that is unreachable at startup is logged and skipped — it never
-blocks the gateway from coming up.
+blocks the gateway from coming up. The client re-initializes once when a server
+reports its session expired (HTTP 404), accepts SSE responses that interleave
+notifications before the result, and flattens remote tool descriptions to one
+line of at most 300 characters before they reach the agent's prompt.
 
 ## Memory management API
 
@@ -582,7 +613,81 @@ all, which is still marginally cheaper.
 | `400 MissingSessionID` | Something stripped the `x-opencode-session` header the client sends on every request |
 | `401 Invalid API key` | Key is wrong, or `OPENCODE_API_KEY` never reached the process |
 | `401 CreditsError` | Go-tier key against the `zen` tier — that tier bills credits separately |
-| `embed_ok: false` in `/health` | No Ollama reachable and no `EMBED_PROVIDER` set — opencode cannot serve embeddings |
+| `embed_ok: false` in `/health` | No Ollama reachable and no `EMBED_PROVIDER` set — opencode cannot serve embeddings. The embed probe is cached for 30 s (5 s timeout), so a fix can take up to 30 s to show |
+
+## Telegram bot
+
+Commands (anything else is sent to the agent as a plain question):
+
+| Command | What |
+|---|---|
+| `/start` | Reset the session and show help |
+| `/ask <question>` | Ask the agent explicitly (answer is suffixed with model + step count) |
+| `/new` | Start a new session |
+| `/skills` | List available skills |
+| `/auth_add <telegram_id>` | Admin only — allow a user |
+| `/auth_list` | Admin only — list allowed users |
+
+Auth is **on by default**: the bot refuses to start unless `BOT_ADMIN_ID` is set
+or `BOT_AUTH_ENABLED=false` is given explicitly. Authorization is by the
+sender's Telegram user ID, so allowlisting a group chat's ID does not authorize
+its members; unauthorized users get an "Access denied" reply. Up to 8 updates
+are handled concurrently, and messages within one chat are processed in order.
+If a streamed answer breaks after the agent has started, the bot reports the
+interruption instead of re-running the query.
+
+## Security
+
+The gateway runs tools that reach the network and (optionally) a shell, so treat
+its API as privileged.
+
+- **Bind address.** Compose publishes the gateway and the UI on `127.0.0.1`
+  only. Keep it that way unless you also set a token.
+- **`GATEWAY_API_TOKEN`.** When set, `/api/*` and `/mcp` require
+  `Authorization: Bearer <token>`; `/health` stays open. The Telegram bot and
+  `omega` remote mode send it automatically from the same variable; the web UI
+  prompts for it on the first 401 and keeps it in the browser's `localStorage`.
+  Set it whenever the gateway is reachable beyond loopback.
+- **CORS / Origin.** No wildcard CORS. `CORS_ALLOWED_ORIGINS` (comma-separated)
+  lists cross-origin callers; empty means same-origin only, which is all the
+  bundled UI (served through nginx) needs. State-changing requests that carry a
+  foreign `Origin` header are rejected with 403; clients that send no `Origin`
+  (curl, the CLI, the bot) are unaffected.
+- **Request limits.** Bodies are capped at 4 MiB; the server uses a 60 s read
+  timeout and 120 s idle timeout. SIGTERM cancels in-flight requests, and
+  `/api/query` aborts the agent run when the client disconnects.
+- **Outbound skill connections** (`netguard`). Every dial is checked after DNS
+  resolution (redirects included): link-local / cloud metadata
+  (`169.254.0.0/16`, `fe80::/10`, `fd00:ec2::254`), unspecified and multicast
+  addresses are always refused. `SKILL_ALLOW_PRIVATE_NETWORKS=false` also
+  blocks loopback, RFC1918, ULA and CGNAT. The check is not enforced on the
+  final target when an HTTP(S) proxy is configured through the environment —
+  it then vets the proxy address. URL-taking skills accept only `http`/`https`;
+  remote response bodies are read up to 2 MiB; skill timeouts are clamped
+  (60 s; `port_scan` 10 s per port; shell/SSH 1–300 s).
+- **Shell / SSH skills** are off by default. The `shell_command` blocklist is a
+  guard against accidents, not a security boundary — enable these skills only
+  for trusted users.
+- **Telegram** — auth is on by default (see [Telegram bot](#telegram-bot)).
+
+## Upgrade notes / behaviour changes
+
+Breaking changes in this release:
+
+- `BOT_AUTH_ENABLED` now defaults to `true`. Set `BOT_ADMIN_ID`, or
+  `BOT_AUTH_ENABLED=false` to keep an open bot.
+- Telegram authorization checks the **sender's user ID**; an allowlisted group
+  chat ID no longer authorizes everyone in that group. Add users individually.
+- CORS is no longer `*`. Browser clients on another origin need
+  `CORS_ALLOWED_ORIGINS`.
+- Markdown skill `endpoint` placeholder values are now URL-escaped (see
+  [Markdown / pipeline skills](#whats-in-go)).
+- `omega` local mode no longer executes due scheduled tasks; only the gateway
+  runs the scheduler. Task claims are atomic, so several processes can share
+  the scheduler DB, and `last_run_at` records the scheduled minute.
+- The migration containers now run as the host UID:GID. A `data/chromem`
+  created by an earlier (root) migration may need
+  `sudo chown -R $(id -u):$(id -g) data/chromem`.
 
 ## Environment variables
 
@@ -600,11 +705,11 @@ all, which is still marginally cheaper.
 | `OLLAMA_TIMEOUT` | `120` | Ollama request timeout (seconds) |
 | `OPENAI_API_KEY` | — | Required for `openai` / `openai-codex` provider |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible base URL |
-| `OPENAI_CHAT_MODEL` | `gpt-4o-mini` | OpenAI chat model |
+| `OPENAI_CHAT_MODEL` | `gpt-4o-mini` | OpenAI chat model (`gpt-5.3-codex` for `openai-codex`) |
 | `OPENAI_EMBED_MODEL` | `text-embedding-3-small` | OpenAI embeddings model (for vector memory) |
-| `OPENAI_API_MODE` | auto | `chat_completions` \| `responses` (auto-selected for codex models) |
+| `OPENAI_API_MODE` | auto | `chat_completions` \| `responses` (auto: `responses` when the model name contains `codex`) |
 | `OPENAI_REASONING_EFFORT` | — | Reasoning effort for the `responses` API (omitted from requests when unset) |
-| `OPENAI_TEMPERATURE` | `0.2` | Sampling temperature for the `chat_completions` path (also used by the `digitalocean` provider). Set to `none` (or `omit` / `off`) to leave temperature out of the request entirely — reasoning models such as the o-series and gpt-5 family reject any non-default value. The client also drops it on its own after a model rejects it |
+| `OPENAI_TEMPERATURE` | `0.2` | Sampling temperature for the `chat_completions` path (also used by the `digitalocean` and `opencode` providers). Set to `none` (or `omit` / `off`) to leave temperature out of the request entirely — reasoning models such as the o-series and gpt-5 family reject any non-default value. The client also drops it on its own after a model rejects it |
 | `OPENAI_TIMEOUT` | `120` | OpenAI request timeout (seconds) |
 | `DIGITALOCEAN_API_KEY` | — | Required for `digitalocean` provider (model access key or DO personal access token) |
 | `DIGITALOCEAN_BASE_URL` | `https://inference.do-ai.run/v1` | DigitalOcean Serverless Inference base URL |
@@ -626,7 +731,7 @@ all, which is still marginally cheaper.
 | `AGENT_MAX_STEPS` | `25` | Maximum tool-call steps per agent run |
 | `AGENT_PARALLEL_TOOLS` | `false` | Allow the LLM to emit `tool_calls` batches that execute concurrently |
 | `AGENT_MAX_PARALLEL` | `4` | Max tool calls per `tool_calls` batch when `AGENT_PARALLEL_TOOLS=true` — both the concurrency limit and the batch-size cap. Extra calls in an oversized batch are dropped before execution and the model is told to re-issue them |
-| `AUTO_MEMORY_EXTRACT` | `false` | After each final answer, run a background LLM pass that distils the turn into durable facts and stores them in vector memory (tagged `source=auto-extract`). Existing SHA256 + cosine dedup applies |
+| `AUTO_MEMORY_EXTRACT` | `false` | After each final answer, run a background LLM pass that distils the turn into durable facts and stores them in vector memory (tagged `source=auto-extract`). Existing SHA256 + cosine dedup applies. At most 2 passes run at once; extra passes are dropped |
 | `AUTO_MEMORY_MAX_FACTS` | `5` | Maximum facts stored per turn by auto-extraction |
 | `AUTO_MEMORY_MIN_ANSWER_LEN` | `80` | Skip auto-extraction when the final answer is shorter than this many characters |
 | `PLAYGROUND_DISABLED` | `false` | Disable `POST /api/skills/{name}/invoke` (skill playground) |
@@ -638,19 +743,23 @@ all, which is still marginally cheaper.
 | `SKILL_SSH_IDENTITY_FILE` | — | Path to SSH private key file |
 | `SKILL_SSH_DEFAULT_USER` | `root` | Default SSH username |
 | `SKILL_SSH_PRIVATE_KEY` | — | PEM or base64-encoded PEM private key (alternative to identity file) |
+| `SKILL_ALLOW_PRIVATE_NETWORKS` | `true` | Let outbound skills reach loopback, RFC1918/ULA and CGNAT addresses. `false` blocks them. Link-local / cloud-metadata, unspecified and multicast addresses are always refused |
 | `SCHEDULER_DB` | `{DATA_DIR}/scheduler.sqlite3` | Scheduler database path |
 | `SCHEDULER_TICK_SEC` | `60` | Scheduler poll interval (seconds). Each tick also sweeps any whole minutes skipped since the previous one (up to 60), so ticker drift or a suspended host does not lose a scheduled run |
 | `TELEGRAM_BOT_TOKEN` | — | Telegram bot token |
-| `BOT_AUTH_ENABLED` | `false` | Enable Telegram user allowlist |
-| `BOT_ADMIN_ID` | `0` | Telegram user ID of the admin |
+| `BOT_AUTH_ENABLED` | `true` | Telegram user allowlist. On unless explicitly `false`; with it on the bot refuses to start without `BOT_ADMIN_ID` |
+| `BOT_ADMIN_ID` | `0` | Telegram user ID of the admin (required while auth is enabled) |
+| `BOT_AUTH_DB` | `/app/data/telegram_auth.sqlite3` | Telegram allowlist database |
 | `GATEWAY_URL` | `http://127.0.0.1:8000` | Telegram bot → gateway base URL |
+| `GATEWAY_API_TOKEN` | — | When set, `/api/*` and `/mcp` require `Authorization: Bearer <token>` (`/health` stays open). The Telegram bot and `omega` remote mode send it automatically |
+| `CORS_ALLOWED_ORIGINS` | — | Comma-separated origins allowed to call the API cross-origin (`*` = any). Empty = same-origin only |
 | `AUDIT_MAX_BLOB_BYTES` | `65536` | Max bytes stored per args/result blob in the audit log. Set to `0` to disable audit logging entirely |
 | `MCP_SERVER_DISABLED` | `false` | Disable the MCP server endpoint (`POST /mcp`) that exposes skills as MCP tools |
 | `MCP_SERVERS` | — | Remote MCP servers to consume, comma-separated `name=url` entries (append `\|Header: Value` for one auth header). Their tools are registered locally as `<name>_<tool>` |
 
 ## Frontend / gateway separation
 
-The gateway binary is a pure JSON API: it serves only `/health` and `/api/*`
+The gateway binary is a pure JSON API: it serves only `/health`, `/api/*` and `/mcp`
 and contains no static-file serving, no UI redirect, and no `//go:embed`
 assets.  The React UI is built and served exclusively by the **frontend**
 nginx service, which also reverse-proxies `/api/*` and `/health` back to

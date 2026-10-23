@@ -8,7 +8,9 @@
 # Or use the Makefile shortcut:
 #   make vector-migrate
 #
-# Both services mount ./data so the JSONL handoff file stays on the host.
+# Both services mount ./data so the JSONL handoff file stays on the host, and
+# run as the host UID:GID (same as the gateway in docker-compose.yml) so the
+# files they write are owned by you and writable by the gateway — not root.
 
 services:
 
@@ -18,6 +20,7 @@ services:
       context: .
       dockerfile: docker/migrate.Dockerfile
       target: exporter
+    user: "${UID:-1000}:${GID:-1000}"
     command:
       - "--persist=/data/vector_db"
       - "--collection=${AGENT_VECTOR_COLLECTION:-memories}"
@@ -31,6 +34,7 @@ services:
       context: .
       dockerfile: docker/migrate.Dockerfile
       target: importer
+    user: "${UID:-1000}:${GID:-1000}"
     command:
       - "--in=/data/vector_db.jsonl"
       - "--db=/data/chromem"

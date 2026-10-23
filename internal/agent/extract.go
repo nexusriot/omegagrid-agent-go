@@ -41,6 +41,9 @@ User query:
 Assistant answer:
 %s`
 
+// extractSlots bounds concurrent background extraction passes.
+var extractSlots = make(chan struct{}, 2)
+
 // maybeExtractMemories fires the extraction pass in the background when the
 // feature is enabled and the turn looks substantial enough to bother.
 func (s *Service) maybeExtractMemories(sid int, query, answer string) {
@@ -50,7 +53,18 @@ func (s *Service) maybeExtractMemories(sid int, query, answer string) {
 	if len(strings.TrimSpace(answer)) < s.AutoMemoryMinAnswerLen {
 		return
 	}
+	// Each extraction is an extra LLM call that can take minutes with
+	// retries; under a burst of turns they would pile up without limit and
+	// compete with foreground requests for the same provider quota. Drop the
+	// pass rather than queue it — auto-memory is best-effort.
+	select {
+	case extractSlots <- struct{}{}:
+	default:
+		log.Printf("auto-memory: skipped, %d extractions already in flight", cap(extractSlots))
+		return
+	}
 	go func() {
+		defer func() { <-extractSlots }()
 		// Nothing above this detached goroutine can recover it, so a panic in
 		// the LLM client or the vector store would take the gateway down long
 		// after the answer it belongs to was delivered — with no request left

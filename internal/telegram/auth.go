@@ -24,8 +24,9 @@ type AuthUser struct {
 	LastActivity string
 }
 
-// AuthStore is an optional sqlite-backed allowlist.  When disabled all chats
-// are accepted.  Mirrors integrations/telegram/auth.py.
+// AuthStore is a sqlite-backed allowlist keyed by the sender's Telegram user
+// ID.  It is on unless BOT_AUTH_ENABLED is explicitly false; when disabled all
+// users are accepted.  Mirrors integrations/telegram/auth.py.
 type AuthStore struct {
 	enabled bool
 	adminID int64
@@ -34,15 +35,21 @@ type AuthStore struct {
 }
 
 // AuthFromEnv reads the same env vars as the Python version.
+//
+// Auth fails closed: an unset BOT_AUTH_ENABLED means enabled, because the bot
+// drives an agent that can run shell/SSH skills and an open default handed
+// that to anyone who found the bot's username.  Opting out takes an explicit
+// BOT_AUTH_ENABLED=false.
 func AuthFromEnv() (*AuthStore, error) {
-	enabled := boolEnv("BOT_AUTH_ENABLED", false)
+	enabled := boolEnv("BOT_AUTH_ENABLED", true)
 	if !enabled {
-		log.Printf("auth: disabled (BOT_AUTH_ENABLED is not true). Bot is open for everyone.")
+		log.Printf("auth: WARNING — disabled (BOT_AUTH_ENABLED=false). Bot is open for everyone.")
 		return &AuthStore{enabled: false}, nil
 	}
 	admin, _ := strconv.ParseInt(os.Getenv("BOT_ADMIN_ID"), 10, 64)
 	if admin == 0 {
-		return nil, errors.New("auth enabled but BOT_ADMIN_ID is 0")
+		return nil, errors.New("auth is enabled (the default) but BOT_ADMIN_ID is not set: " +
+			"set BOT_ADMIN_ID to your numeric Telegram user ID, or set BOT_AUTH_ENABLED=false to run an open bot")
 	}
 	dbPath := os.Getenv("BOT_AUTH_DB")
 	if dbPath == "" {

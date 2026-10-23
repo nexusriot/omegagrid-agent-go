@@ -11,6 +11,12 @@ Thumbs.db
 # Build output (all binaries land in ./bin via the Makefile: gateway, telegram-bot, migrate-vector, omega)
 build/
 /bin/
+# `go build ./cmd/<name>` without -o drops the binary in the repo root
+/gateway
+/telegram-bot
+/migrate-vector
+/cli
+/omega
 
 # Go test / coverage artifacts
 *.test
@@ -21,7 +27,7 @@ coverage.*
 # Runtime state: SQLite DBs, chromem-go vector store, dynamic markdown skills
 data/
 
-# Secrets / local env (‑ .env.example stays tracked)
+# Secrets / local env (.env.example stays tracked)
 .env
 .env.*
 !.env.example

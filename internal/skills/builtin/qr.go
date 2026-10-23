@@ -27,6 +27,9 @@ func padImage(src image.Image, pad int) image.Image {
 	return out
 }
 
+// maxQRImagePx bounds the side length of the generated PNG.
+const maxQRImagePx = 2048
+
 func QrGenerateSchema() Skill {
 	return Skill{Name: "qr_generate", Description: "Generate a QR code image (returned as base64 PNG).",
 		Parameters: map[string]Param{
@@ -89,6 +92,13 @@ func QrGenerate() Executor {
 		qr.DisableBorder = true
 
 		modules := len(qr.Bitmap())
+		// Cap the rendered side length: a version-40 symbol (177 modules) at
+		// box_size 40 with a 20-module border is ~8700px square — ~300 MB of
+		// RGBA and a multi-megabyte base64 string handed back to the model.
+		// Shrink the box size (never below 1px) until the image fits.
+		if maxBox := maxQRImagePx / (modules + 2*border); boxSize > maxBox {
+			boxSize = max(maxBox, 1)
+		}
 		img := padImage(qr.Image(boxSize*modules), border*boxSize)
 
 		var buf bytes.Buffer

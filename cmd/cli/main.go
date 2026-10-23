@@ -76,6 +76,8 @@ Environment:
   OMEGA_REMOTE   Base URL of a running gateway (e.g. http://localhost:8000).
                  When set, all commands hit the remote API instead of
                  wiring services in-process.
+  GATEWAY_API_TOKEN  Sent as "Authorization: Bearer <token>" in remote mode;
+                 required when the gateway has it configured.
   All other env vars (LLM_PROVIDER, DATA_DIR, etc.) configure local mode.
 `)
 }

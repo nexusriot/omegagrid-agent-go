@@ -4,14 +4,18 @@ import type {
   HealthStatus, QueryResult, QueryRequest,
   InvocationListResult, InvocationFilter, ReplayResult,
 } from './types'
+import { authHeaders, promptForToken } from './auth'
 
 const BASE = import.meta.env.VITE_API_BASE ?? ''
 
-async function json<T>(path: string, init?: RequestInit): Promise<T> {
+async function json<T>(path: string, init?: RequestInit, retried = false): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json', ...init?.headers },
     ...init,
+    headers: { 'Content-Type': 'application/json', ...authHeaders(), ...init?.headers },
   })
+  if (res.status === 401 && !retried && promptForToken()) {
+    return json<T>(path, init, true)
+  }
   if (!res.ok) {
     const msg = await res.text().catch(() => res.statusText)
     throw new Error(`${res.status}: ${msg}`)

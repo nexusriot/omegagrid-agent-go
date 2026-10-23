@@ -7,13 +7,17 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/nexusriot/omegagrid-agent-go/internal/skills/netguard"
 )
 
 // SkillExecutor lets pipeline steps invoke other registered skills by name.
@@ -55,9 +59,34 @@ type step struct {
 	Args     map[string]any `yaml:"args"`
 }
 
-// Execute runs the skill; executor is used for pipeline skill-steps.
+// MaxPipelineDepth bounds how deeply pipelines may nest through skill steps.
+// Without it a pipeline reaching itself (directly or via another pipeline)
+// recursed until the goroutine stack overflowed — a fatal runtime error, not a
+// panic, so nothing could recover it and the whole process died.
+const MaxPipelineDepth = 5
+
+// maxBodyBytes caps how much of an endpoint response is read into memory.
+const maxBodyBytes = 2 << 20
+
+// maxTextBody is how much of a non-JSON response body is returned.
+const maxTextBody = 4000
+
+// Execute runs the skill as a top-level call; executor is used for pipeline
+// skill-steps.
 func (s *Skill) Execute(args map[string]any, executor SkillExecutor) (any, error) {
+	return s.ExecuteAt(args, executor, 0)
+}
+
+// ExecuteAt runs the skill at the given pipeline nesting depth (0 for a
+// top-level call). The caller supplies an executor that runs nested skills at
+// depth+1; a pipeline at MaxPipelineDepth or deeper refuses to run.
+func (s *Skill) ExecuteAt(args map[string]any, executor SkillExecutor, depth int) (any, error) {
 	if len(s.steps) > 0 {
+		if depth >= MaxPipelineDepth {
+			return map[string]any{"error": fmt.Sprintf(
+				"pipeline %q exceeds the maximum nesting depth of %d (recursive pipeline?)",
+				s.Schema.Name, MaxPipelineDepth)}, nil
+		}
 		return s.execPipeline(args, executor)
 	}
 	if s.endpoint != "" {
@@ -76,7 +105,7 @@ func (s *Skill) Execute(args map[string]any, executor SkillExecutor) (any, error
 }
 
 func (s *Skill) execSingle(args map[string]any) (any, error) {
-	cl := &http.Client{Timeout: time.Duration(s.timeout * float64(time.Second))}
+	cl := netguard.Client(time.Duration(s.timeout * float64(time.Second)))
 	var query map[string]any
 	if strings.ToUpper(s.method) != "POST" {
 		query = args
@@ -86,12 +115,46 @@ func (s *Skill) execSingle(args map[string]any) (any, error) {
 		return map[string]any{"error": err.Error()}, nil
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
-	var body any
-	if jerr := json.Unmarshal(raw, &body); jerr != nil {
-		body = string(raw[:min(4000, len(raw))])
+	body, truncated := readBody(resp.Body)
+	out := map[string]any{"status_code": resp.StatusCode, "body": body}
+	if truncated {
+		out["truncated"] = true
 	}
-	return map[string]any{"status_code": resp.StatusCode, "body": body}, nil
+	return out, nil
+}
+
+// readBody reads a capped response body and decodes it as JSON, falling back
+// to (at most maxTextBody bytes of) text. truncated reports that the body was
+// cut, either by the read cap or the text limit.
+func readBody(r io.Reader) (body any, truncated bool) {
+	raw, _ := io.ReadAll(io.LimitReader(r, maxBodyBytes+1))
+	if len(raw) > maxBodyBytes {
+		raw, truncated = raw[:maxBodyBytes], true
+	}
+	if !truncated && json.Unmarshal(raw, &body) == nil {
+		return body, false
+	}
+	if len(raw) > maxTextBody {
+		raw, truncated = raw[:maxTextBody], true
+	}
+	if truncated {
+		raw = trimPartialRune(raw)
+	}
+	return string(raw), truncated
+}
+
+// trimPartialRune drops an incomplete UTF-8 sequence at the end of b: a byte
+// limit used to cut multi-byte characters in half, leaving a mangled tail.
+func trimPartialRune(b []byte) []byte {
+	for i := 1; i <= utf8.UTFMax && i <= len(b); i++ {
+		if utf8.RuneStart(b[len(b)-i]) {
+			if !utf8.FullRune(b[len(b)-i:]) {
+				return b[:len(b)-i]
+			}
+			return b
+		}
+	}
+	return b
 }
 
 // doRequest builds and sends one skill HTTP request. method selects GET/POST,
@@ -140,7 +203,7 @@ func doRequest(cl *http.Client, method, endpoint string, headers map[string]any,
 func (s *Skill) execPipeline(kwargs map[string]any, executor SkillExecutor) (any, error) {
 	ctx := map[string]any{}
 	var results []any
-	cl := &http.Client{Timeout: time.Duration(s.timeout * float64(time.Second))}
+	cl := netguard.Client(time.Duration(s.timeout * float64(time.Second)))
 
 	for i, st := range s.steps {
 		name := st.Name
@@ -165,7 +228,10 @@ func (s *Skill) execPipeline(kwargs map[string]any, executor SkillExecutor) (any
 			continue
 		}
 		// http step
-		endpoint := resolveStr(st.Endpoint, kwargs, ctx)
+		// Escaped: a value substituted into the URL must stay data. Raw, an
+		// argument such as "@evil.example/" or "x/../../admin?" rewrote the
+		// host, path or query the skill author wrote.
+		endpoint := resolveStrEscaped(st.Endpoint, kwargs, ctx, escapeURLValue)
 		method := strings.ToUpper(st.Method)
 		if method == "" {
 			method = "GET"
@@ -192,11 +258,8 @@ func (s *Skill) execPipeline(kwargs map[string]any, executor SkillExecutor) (any
 			parsed = map[string]any{"error": err.Error()}
 		} else {
 			statusCode = resp.StatusCode
-			raw, _ := io.ReadAll(resp.Body)
+			parsed, _ = readBody(resp.Body)
 			resp.Body.Close()
-			if jerr := json.Unmarshal(raw, &parsed); jerr != nil {
-				parsed = string(raw[:min(4000, len(raw))])
-			}
 		}
 		ctx[name] = parsed
 		results = append(results, map[string]any{"step": name, "kind": "http", "status": statusCode, "body": parsed})
@@ -212,10 +275,28 @@ func (s *Skill) execPipeline(kwargs map[string]any, executor SkillExecutor) (any
 var placeholderRE = regexp.MustCompile(`\{\{(.+?)\}\}`)
 
 func resolveStr(text string, params, ctx map[string]any) string {
+	return resolveStrEscaped(text, params, ctx, nil)
+}
+
+// resolveStrEscaped is resolveStr with every substituted value passed through
+// escape (when non-nil). Unresolved placeholders are left as written.
+func resolveStrEscaped(text string, params, ctx map[string]any, escape func(string) string) string {
 	return placeholderRE.ReplaceAllStringFunc(text, func(m string) string {
 		key := m[2 : len(m)-2]
-		return resolveValue(key, params, ctx)
+		v := resolveValue(key, params, ctx)
+		if escape == nil || v == m {
+			return v
+		}
+		return escape(v)
 	})
+}
+
+// escapeURLValue percent-encodes everything outside RFC 3986's unreserved
+// set. url.PathEscape alone is not enough: it leaves '@', ':', '&', '=' and
+// '+' intact, so "https://api.example.com{{p}}" with p="@evil.example" moved
+// the request to evil.example. Space becomes %20, valid in path and query.
+func escapeURLValue(v string) string {
+	return strings.ReplaceAll(url.QueryEscape(v), "+", "%20")
 }
 
 func resolveValue(key string, params, ctx map[string]any) string {
@@ -279,17 +360,32 @@ type frontmatter struct {
 	Steps       []step                    `yaml:"steps"`
 }
 
+// parseFrontmatter splits a "---" delimited YAML header from the body. The
+// closing delimiter must be a line of its own: matching any "---" substring
+// ended the header inside a value (description: "a --- b"), producing a YAML
+// error or a silently truncated schema.
 func parseFrontmatter(content string) (frontmatter, string, error) {
-	content = strings.TrimSpace(content)
-	if !strings.HasPrefix(content, "---") {
+	content = strings.TrimSpace(strings.ReplaceAll(content, "\r\n", "\n"))
+	if !strings.HasPrefix(content, "---\n") {
 		return frontmatter{}, content, nil
 	}
-	end := strings.Index(content[3:], "---")
-	if end < 0 {
-		return frontmatter{}, content, nil
+	rest := content[len("---\n"):]
+	var yamlStr, body string
+	switch {
+	case strings.HasPrefix(rest, "---\n") || rest == "---":
+		yamlStr, body = "", strings.TrimPrefix(rest, "---")
+	default:
+		end := strings.Index(rest, "\n---\n")
+		switch {
+		case end >= 0:
+			yamlStr, body = rest[:end], rest[end+len("\n---\n"):]
+		case strings.HasSuffix(rest, "\n---"):
+			yamlStr, body = strings.TrimSuffix(rest, "\n---"), ""
+		default:
+			return frontmatter{}, content, nil
+		}
 	}
-	yamlStr := content[3 : end+3]
-	body := strings.TrimSpace(content[end+6:])
+	body = strings.TrimSpace(body)
 	var fm frontmatter
 	if err := yaml.Unmarshal([]byte(yamlStr), &fm); err != nil {
 		return fm, body, err

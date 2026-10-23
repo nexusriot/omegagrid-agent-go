@@ -13,7 +13,7 @@ init:
 web:
 	cd web && npm run build
 
-## Build the Go gateway (requires web/dist to exist)
+## Build the Go gateway (also builds the UI first; the gateway itself does not use web/dist)
 build: web
 	go build -o bin/gateway ./cmd/gateway
 

@@ -6,6 +6,7 @@ package skills
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -14,6 +15,7 @@ import (
 	"github.com/nexusriot/omegagrid-agent-go/internal/config"
 	"github.com/nexusriot/omegagrid-agent-go/internal/skills/builtin"
 	"github.com/nexusriot/omegagrid-agent-go/internal/skills/markdown"
+	"github.com/nexusriot/omegagrid-agent-go/internal/skills/netguard"
 )
 
 // Param describes a single skill parameter.
@@ -43,32 +45,33 @@ func New(cfg config.Config) (*Client, error) {
 	reg := newRegistry()
 	c := &Client{reg: reg, skillsDir: cfg.SkillsDir}
 
-	// executor closure used by markdown pipeline steps + skill_creator
-	executor := func(name string, args map[string]any) (any, error) {
-		return reg.execute(name, args)
-	}
+	// Outbound policy for every skill that dials (http_request, port_scan,
+	// markdown endpoints, ...). Process-wide: the guard lives in the dialers.
+	netguard.SetAllowPrivate(!cfg.SkillBlockPrivateNetworks)
 
 	registerBuiltins(reg, cfg)
 
-	reg.register(skillCreatorSchema(), skillCreatorFunc(cfg.SkillsDir, reg, executor))
+	reg.registerReserved(skillCreatorSchema(), skillCreatorFunc(cfg.SkillsDir, reg))
 
-	if err := c.loadMarkdownSkills(executor); err != nil {
+	if err := c.loadMarkdownSkills(); err != nil {
 		return nil, fmt.Errorf("load markdown skills: %w", err)
 	}
 
 	return c, nil
 }
 
-func (c *Client) loadMarkdownSkills(executor markdown.SkillExecutor) error {
+func (c *Client) loadMarkdownSkills() error {
 	loaded, err := markdown.LoadDir(c.skillsDir)
 	if err != nil {
 		return err
 	}
-	for _, s := range loaded {
-		sk := s // capture
-		c.reg.register(mdToSkill(sk.Schema), func(args map[string]any) (any, error) {
-			return sk.Execute(args, executor)
-		})
+	for _, sk := range loaded {
+		if c.reg.isReserved(sk.Schema.Name) {
+			log.Printf("skills: ignoring markdown skill %q in %s: name collides with a built-in skill",
+				sk.Schema.Name, c.skillsDir)
+			continue
+		}
+		c.reg.registerMarkdown(sk)
 	}
 	return nil
 }
@@ -110,44 +113,46 @@ func toSkill(b builtin.Skill) Skill {
 
 func registerBuiltins(reg *Registry, cfg config.Config) {
 	t := cfg.SkillHTTPTimeout
+	// Every built-in name is reserved against markdown skills.
+	register := reg.registerReserved
 
-	reg.register(toSkill(builtin.WeatherSchema()), builtin.Weather(t))
-	reg.register(toSkill(builtin.HttpRequestSchema()), builtin.HttpRequest(t))
-	reg.register(toSkill(builtin.WebScrapeSchema()), builtin.WebScrape(t))
-	reg.register(toSkill(builtin.HttpHealthSchema()), builtin.HttpHealth())
-	reg.register(toSkill(builtin.IpInfoSchema()), builtin.IpInfo(t))
+	register(toSkill(builtin.WeatherSchema()), builtin.Weather(t))
+	register(toSkill(builtin.HttpRequestSchema()), builtin.HttpRequest(t))
+	register(toSkill(builtin.WebScrapeSchema()), builtin.WebScrape(t))
+	register(toSkill(builtin.HttpHealthSchema()), builtin.HttpHealth())
+	register(toSkill(builtin.IpInfoSchema()), builtin.IpInfo(t))
 
-	reg.register(toSkill(builtin.DnsLookupSchema()), builtin.DnsLookup())
-	reg.register(toSkill(builtin.PingCheckSchema()), builtin.PingCheck())
-	reg.register(toSkill(builtin.PortScanSchema()), builtin.PortScan())
-	reg.register(toSkill(builtin.WhoisLookupSchema()), builtin.WhoisLookup())
-	reg.register(toSkill(builtin.TlsProbeSchema()), builtin.TlsProbe())
-	reg.register(toSkill(builtin.HttpHeadersSchema()), builtin.HttpHeaders())
-	reg.register(toSkill(builtin.BannerGrabSchema()), builtin.BannerGrab())
-	reg.register(toSkill(builtin.PtrLookupSchema()), builtin.PtrLookup())
-	reg.register(toSkill(builtin.EmailAuthSchema()), builtin.EmailAuth())
+	register(toSkill(builtin.DnsLookupSchema()), builtin.DnsLookup())
+	register(toSkill(builtin.PingCheckSchema()), builtin.PingCheck())
+	register(toSkill(builtin.PortScanSchema()), builtin.PortScan())
+	register(toSkill(builtin.WhoisLookupSchema()), builtin.WhoisLookup())
+	register(toSkill(builtin.TlsProbeSchema()), builtin.TlsProbe())
+	register(toSkill(builtin.HttpHeadersSchema()), builtin.HttpHeaders())
+	register(toSkill(builtin.BannerGrabSchema()), builtin.BannerGrab())
+	register(toSkill(builtin.PtrLookupSchema()), builtin.PtrLookup())
+	register(toSkill(builtin.EmailAuthSchema()), builtin.EmailAuth())
 
-	reg.register(toSkill(builtin.Base64Schema()), builtin.Base64())
-	reg.register(toSkill(builtin.HashSchema()), builtin.Hash())
-	reg.register(toSkill(builtin.UuidGenSchema()), builtin.UuidGen())
-	reg.register(toSkill(builtin.PasswordGenSchema()), builtin.PasswordGen())
-	reg.register(toSkill(builtin.CidrCalcSchema()), builtin.CidrCalc())
-	reg.register(toSkill(builtin.JwtInspectSchema()), builtin.JwtInspect())
+	register(toSkill(builtin.Base64Schema()), builtin.Base64())
+	register(toSkill(builtin.HashSchema()), builtin.Hash())
+	register(toSkill(builtin.UuidGenSchema()), builtin.UuidGen())
+	register(toSkill(builtin.PasswordGenSchema()), builtin.PasswordGen())
+	register(toSkill(builtin.CidrCalcSchema()), builtin.CidrCalc())
+	register(toSkill(builtin.JwtInspectSchema()), builtin.JwtInspect())
 
-	reg.register(toSkill(builtin.DateTimeSchema()), builtin.DateTime())
-	reg.register(toSkill(builtin.MathEvalSchema()), builtin.MathEval())
-	reg.register(toSkill(builtin.CronScheduleSchema()), builtin.CronSchedule())
-	reg.register(toSkill(builtin.ReminderSchema()), builtin.Reminder())
+	register(toSkill(builtin.DateTimeSchema()), builtin.DateTime())
+	register(toSkill(builtin.MathEvalSchema()), builtin.MathEval())
+	register(toSkill(builtin.CronScheduleSchema()), builtin.CronSchedule())
+	register(toSkill(builtin.ReminderSchema()), builtin.Reminder())
 
-	reg.register(toSkill(builtin.ShellCommandSchema()), builtin.ShellCommand(cfg.SkillShellEnabled))
-	reg.register(toSkill(builtin.SshCommandSchema()), builtin.SshCommand(builtin.SSHConfig{
+	register(toSkill(builtin.ShellCommandSchema()), builtin.ShellCommand(cfg.SkillShellEnabled))
+	register(toSkill(builtin.SshCommandSchema()), builtin.SshCommand(builtin.SSHConfig{
 		Enabled:     cfg.SkillSSHEnabled,
 		PrivKey:     cfg.SkillSSHPrivKey,
 		DefaultUser: cfg.SkillSSHDefaultUser,
 		IdentFile:   cfg.SkillSSHIdentFile,
 	}))
 
-	reg.register(toSkill(builtin.QrGenerateSchema()), builtin.QrGenerate())
+	register(toSkill(builtin.QrGenerateSchema()), builtin.QrGenerate())
 }
 
 func skillCreatorSchema() Skill {
@@ -200,12 +205,12 @@ var safeNameChars = func(name string) bool {
 	return true
 }
 
-func skillCreatorFunc(skillsDir string, reg *Registry, executor markdown.SkillExecutor) func(map[string]any) (any, error) {
+func skillCreatorFunc(skillsDir string, reg *Registry) func(map[string]any) (any, error) {
 	return func(args map[string]any) (any, error) {
 		action := strings.ToLower(strings.TrimSpace(strArg(args, "action")))
 		switch action {
 		case "create":
-			return scCreate(skillsDir, reg, executor, args)
+			return scCreate(skillsDir, reg, args)
 		case "list":
 			return scList(skillsDir)
 		case "show":
@@ -218,13 +223,16 @@ func skillCreatorFunc(skillsDir string, reg *Registry, executor markdown.SkillEx
 	}
 }
 
-func scCreate(dir string, reg *Registry, executor markdown.SkillExecutor, args map[string]any) (any, error) {
+func scCreate(dir string, reg *Registry, args map[string]any) (any, error) {
 	name := strings.ToLower(strings.TrimSpace(strArg(args, "name")))
 	if name == "" {
 		return map[string]any{"error": "name is required for create"}, nil
 	}
 	if !safeNameChars(name) {
 		return map[string]any{"error": invalidNameMsg(name)}, nil
+	}
+	if reg.isReserved(name) {
+		return map[string]any{"error": fmt.Sprintf("%q is a built-in skill and cannot be created or overwritten", name)}, nil
 	}
 	desc := strings.TrimSpace(strArg(args, "description"))
 	if desc == "" {
@@ -244,6 +252,13 @@ func scCreate(dir string, reg *Registry, executor markdown.SkillExecutor, args m
 	}
 	instructions := strings.TrimSpace(strArg(args, "instructions"))
 	steps := normalizeSteps(args["steps"])
+	// A step calling the skill being defined recurses on every run. Deeper
+	// cycles (a -> b -> a) are cut off at run time by the depth limit.
+	for _, st := range steps {
+		if callee, _ := st["skill"].(string); strings.EqualFold(strings.TrimSpace(callee), name) {
+			return map[string]any{"error": fmt.Sprintf("pipeline step calls %q itself; recursive pipelines are not allowed", name)}, nil
+		}
+	}
 
 	// build YAML frontmatter
 	fm := map[string]any{"name": name, "description": desc}
@@ -272,10 +287,7 @@ func scCreate(dir string, reg *Registry, executor markdown.SkillExecutor, args m
 	if err != nil {
 		return map[string]any{"error": fmt.Sprintf("reload skill: %v", err)}, nil
 	}
-	sk := s
-	reg.register(mdToSkill(sk.Schema), func(a map[string]any) (any, error) {
-		return sk.Execute(a, executor)
-	})
+	reg.registerMarkdown(s)
 
 	skillType := "prompt-only"
 	if len(steps) > 0 {
@@ -369,8 +381,12 @@ func scDelete(dir string, reg *Registry, args map[string]any) (any, error) {
 		}
 		return map[string]any{"error": err.Error()}, nil
 	}
-	reg.unregister(registered)
-	if registered != name {
+	// Removing a stray file must never take a built-in down with it: a file
+	// named after (or declaring) a built-in was never registered over it.
+	if !reg.isReserved(registered) {
+		reg.unregister(registered)
+	}
+	if registered != name && !reg.isReserved(name) {
 		reg.unregister(name)
 	}
 	return map[string]any{"status": "deleted", "skill_name": registered, "file": fpath}, nil

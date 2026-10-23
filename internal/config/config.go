@@ -80,6 +80,13 @@ type Config struct {
 	SkillSSHPrivKey     string // PEM or base64-encoded PEM
 	SkillSSHDefaultUser string
 	SkillSSHIdentFile   string
+	// SkillBlockPrivateNetworks stops outbound skills (http_request,
+	// port_scan, markdown endpoints, ...) from reaching loopback, RFC1918/ULA
+	// and CGNAT addresses. It is the inverse of SKILL_ALLOW_PRIVATE_NETWORKS,
+	// which defaults to true because the agent is used for LAN administration;
+	// the inversion keeps a zero Config permissive. Link-local and cloud
+	// metadata addresses are refused regardless.
+	SkillBlockPrivateNetworks bool
 
 	// Agent loop
 	ContextTail        int
@@ -107,57 +114,64 @@ type Config struct {
 	// MCP (Model Context Protocol)
 	MCPServerEnabled bool     // expose skills as MCP tools at /mcp
 	MCPServers       []string // remote MCP servers to consume: "name=url" entries
+
+	// HTTP API access control
+	APIToken           string   // when set, /api/* and /mcp require "Authorization: Bearer <token>"
+	CORSAllowedOrigins []string // cross-origin callers allowed to use the API; empty = same-origin only
 }
 
 func Load() Config {
 	dataDir := getOr(os.Getenv("DATA_DIR"), "/app/data")
 	c := Config{
-		BackendPort:            atoiOr(os.Getenv("BACKEND_PORT"), 8000),
-		DataDir:                dataDir,
-		Provider:               strings.ToLower(getOr(os.Getenv("LLM_PROVIDER"), "ollama")),
-		OllamaURL:              strings.TrimRight(getOr(os.Getenv("OLLAMA_URL"), "http://127.0.0.1:11434"), "/"),
-		OllamaModel:            getOr(os.Getenv("OLLAMA_MODEL"), "llama3:latest"),
-		OllamaTimeoutSec:       atofOr(os.Getenv("OLLAMA_TIMEOUT"), 120),
-		OpenAIAPIKey:           os.Getenv("OPENAI_API_KEY"),
-		OpenAIBaseURL:          strings.TrimRight(getOr(os.Getenv("OPENAI_BASE_URL"), "https://api.openai.com/v1"), "/"),
-		OpenAIChatModel:        os.Getenv("OPENAI_CHAT_MODEL"),
-		OpenAITimeoutSec:       atofOr(os.Getenv("OPENAI_TIMEOUT"), 120),
-		OpenAIAPIMode:          strings.ToLower(strings.TrimSpace(os.Getenv("OPENAI_API_MODE"))),
-		OpenAIReasoning:        strings.ToLower(strings.TrimSpace(os.Getenv("OPENAI_REASONING_EFFORT"))),
-		VectorCollection:       getOr(os.Getenv("AGENT_VECTOR_COLLECTION"), "memories"),
-		DedupDistance:          atofOr(os.Getenv("AGENT_DEDUP_DISTANCE"), 0.08),
-		OllamaEmbedModel:       getOr(os.Getenv("OLLAMA_EMBED_MODEL"), "nomic-embed-text"),
-		OpenAIEmbedModel:       getOr(os.Getenv("OPENAI_EMBED_MODEL"), "text-embedding-3-small"),
-		DigitalOceanAPIKey:     os.Getenv("DIGITALOCEAN_API_KEY"),
-		DigitalOceanBaseURL:    strings.TrimRight(getOr(os.Getenv("DIGITALOCEAN_BASE_URL"), "https://inference.do-ai.run/v1"), "/"),
-		DigitalOceanChatModel:  getOr(os.Getenv("DIGITALOCEAN_CHAT_MODEL"), defaultDigitalOceanModel),
-		DigitalOceanEmbedModel: getOr(os.Getenv("DIGITALOCEAN_EMBED_MODEL"), "qwen3-embedding-0.6b"),
-		DigitalOceanTimeoutSec: atofOr(os.Getenv("DIGITALOCEAN_TIMEOUT"), 120),
-		OpenCodeAPIKey:         firstOf(os.Getenv("OPENCODE_API_KEY"), os.Getenv("OPENCODE_GO_API_KEY"), os.Getenv("OPENCODE_ZEN_API_KEY")),
-		OpenCodeChatModel:      os.Getenv("OPENCODE_CHAT_MODEL"),
-		OpenCodeSessionID:      strings.TrimSpace(os.Getenv("OPENCODE_SESSION_ID")),
-		OpenCodeTimeoutSec:     atofOr(os.Getenv("OPENCODE_TIMEOUT"), 120),
-		EmbedProvider:          strings.ToLower(strings.TrimSpace(os.Getenv("EMBED_PROVIDER"))),
-		SkillHTTPTimeout:       atofOr(os.Getenv("SKILL_HTTP_TIMEOUT"), 30),
-		SkillShellEnabled:      isTruthy(os.Getenv("SKILL_SHELL_ENABLED")),
-		SkillSSHEnabled:        isTruthy(os.Getenv("SKILL_SSH_ENABLED")),
-		SkillSSHPrivKey:        os.Getenv("SKILL_SSH_PRIVATE_KEY"),
-		SkillSSHDefaultUser:    getOr(os.Getenv("SKILL_SSH_DEFAULT_USER"), "root"),
-		SkillSSHIdentFile:      os.Getenv("SKILL_SSH_IDENTITY_FILE"),
-		ContextTail:            atoiOr(os.Getenv("AGENT_CONTEXT_TAIL"), 30),
-		MemoryHits:             atoiOr(os.Getenv("AGENT_MEMORY_HITS"), 5),
-		AgentMaxSteps:          atoiOr(os.Getenv("AGENT_MAX_STEPS"), 25),
-		AgentParallelTools:     isTruthy(os.Getenv("AGENT_PARALLEL_TOOLS")),
-		AgentMaxParallel:       atoiOr(os.Getenv("AGENT_MAX_PARALLEL"), 4),
-		AutoMemoryExtract:      isTruthy(os.Getenv("AUTO_MEMORY_EXTRACT")),
-		AutoMemoryMaxFacts:     atoiOr(os.Getenv("AUTO_MEMORY_MAX_FACTS"), 5),
-		AutoMemoryMinAnswerLen: atoiOr(os.Getenv("AUTO_MEMORY_MIN_ANSWER_LEN"), 80),
-		PlaygroundEnabled:      !isTruthy(os.Getenv("PLAYGROUND_DISABLED")),
-		SchedulerTickSec:       atoiOr(os.Getenv("SCHEDULER_TICK_SEC"), 60),
-		TelegramBotToken:       os.Getenv("TELEGRAM_BOT_TOKEN"),
-		AuditMaxBlobBytes:      atoiOr(os.Getenv("AUDIT_MAX_BLOB_BYTES"), 65536),
-		MCPServerEnabled:       !isTruthy(os.Getenv("MCP_SERVER_DISABLED")),
-		MCPServers:             splitCSV(os.Getenv("MCP_SERVERS")),
+		BackendPort:               atoiOr(os.Getenv("BACKEND_PORT"), 8000),
+		DataDir:                   dataDir,
+		Provider:                  strings.ToLower(getOr(os.Getenv("LLM_PROVIDER"), "ollama")),
+		OllamaURL:                 strings.TrimRight(getOr(os.Getenv("OLLAMA_URL"), "http://127.0.0.1:11434"), "/"),
+		OllamaModel:               getOr(os.Getenv("OLLAMA_MODEL"), "llama3:latest"),
+		OllamaTimeoutSec:          atofOr(os.Getenv("OLLAMA_TIMEOUT"), 120),
+		OpenAIAPIKey:              os.Getenv("OPENAI_API_KEY"),
+		OpenAIBaseURL:             strings.TrimRight(getOr(os.Getenv("OPENAI_BASE_URL"), "https://api.openai.com/v1"), "/"),
+		OpenAIChatModel:           os.Getenv("OPENAI_CHAT_MODEL"),
+		OpenAITimeoutSec:          atofOr(os.Getenv("OPENAI_TIMEOUT"), 120),
+		OpenAIAPIMode:             strings.ToLower(strings.TrimSpace(os.Getenv("OPENAI_API_MODE"))),
+		OpenAIReasoning:           strings.ToLower(strings.TrimSpace(os.Getenv("OPENAI_REASONING_EFFORT"))),
+		VectorCollection:          getOr(os.Getenv("AGENT_VECTOR_COLLECTION"), "memories"),
+		DedupDistance:             atofOr(os.Getenv("AGENT_DEDUP_DISTANCE"), 0.08),
+		OllamaEmbedModel:          getOr(os.Getenv("OLLAMA_EMBED_MODEL"), "nomic-embed-text"),
+		OpenAIEmbedModel:          getOr(os.Getenv("OPENAI_EMBED_MODEL"), "text-embedding-3-small"),
+		DigitalOceanAPIKey:        os.Getenv("DIGITALOCEAN_API_KEY"),
+		DigitalOceanBaseURL:       strings.TrimRight(getOr(os.Getenv("DIGITALOCEAN_BASE_URL"), "https://inference.do-ai.run/v1"), "/"),
+		DigitalOceanChatModel:     getOr(os.Getenv("DIGITALOCEAN_CHAT_MODEL"), defaultDigitalOceanModel),
+		DigitalOceanEmbedModel:    getOr(os.Getenv("DIGITALOCEAN_EMBED_MODEL"), "qwen3-embedding-0.6b"),
+		DigitalOceanTimeoutSec:    atofOr(os.Getenv("DIGITALOCEAN_TIMEOUT"), 120),
+		OpenCodeAPIKey:            firstOf(os.Getenv("OPENCODE_API_KEY"), os.Getenv("OPENCODE_GO_API_KEY"), os.Getenv("OPENCODE_ZEN_API_KEY")),
+		OpenCodeChatModel:         os.Getenv("OPENCODE_CHAT_MODEL"),
+		OpenCodeSessionID:         strings.TrimSpace(os.Getenv("OPENCODE_SESSION_ID")),
+		OpenCodeTimeoutSec:        atofOr(os.Getenv("OPENCODE_TIMEOUT"), 120),
+		EmbedProvider:             strings.ToLower(strings.TrimSpace(os.Getenv("EMBED_PROVIDER"))),
+		SkillHTTPTimeout:          atofOr(os.Getenv("SKILL_HTTP_TIMEOUT"), 30),
+		SkillShellEnabled:         isTruthy(os.Getenv("SKILL_SHELL_ENABLED")),
+		SkillSSHEnabled:           isTruthy(os.Getenv("SKILL_SSH_ENABLED")),
+		SkillSSHPrivKey:           os.Getenv("SKILL_SSH_PRIVATE_KEY"),
+		SkillSSHDefaultUser:       getOr(os.Getenv("SKILL_SSH_DEFAULT_USER"), "root"),
+		SkillSSHIdentFile:         os.Getenv("SKILL_SSH_IDENTITY_FILE"),
+		SkillBlockPrivateNetworks: isFalsy(os.Getenv("SKILL_ALLOW_PRIVATE_NETWORKS")),
+		ContextTail:               atoiOr(os.Getenv("AGENT_CONTEXT_TAIL"), 30),
+		MemoryHits:                atoiOr(os.Getenv("AGENT_MEMORY_HITS"), 5),
+		AgentMaxSteps:             atoiOr(os.Getenv("AGENT_MAX_STEPS"), 25),
+		AgentParallelTools:        isTruthy(os.Getenv("AGENT_PARALLEL_TOOLS")),
+		AgentMaxParallel:          atoiOr(os.Getenv("AGENT_MAX_PARALLEL"), 4),
+		AutoMemoryExtract:         isTruthy(os.Getenv("AUTO_MEMORY_EXTRACT")),
+		AutoMemoryMaxFacts:        atoiOr(os.Getenv("AUTO_MEMORY_MAX_FACTS"), 5),
+		AutoMemoryMinAnswerLen:    atoiOr(os.Getenv("AUTO_MEMORY_MIN_ANSWER_LEN"), 80),
+		PlaygroundEnabled:         !isTruthy(os.Getenv("PLAYGROUND_DISABLED")),
+		SchedulerTickSec:          atoiOr(os.Getenv("SCHEDULER_TICK_SEC"), 60),
+		TelegramBotToken:          os.Getenv("TELEGRAM_BOT_TOKEN"),
+		AuditMaxBlobBytes:         atoiOr(os.Getenv("AUDIT_MAX_BLOB_BYTES"), 65536),
+		MCPServerEnabled:          !isTruthy(os.Getenv("MCP_SERVER_DISABLED")),
+		MCPServers:                splitCSV(os.Getenv("MCP_SERVERS")),
+		APIToken:                  strings.TrimSpace(os.Getenv("GATEWAY_API_TOKEN")),
+		CORSAllowedOrigins:        splitCSV(os.Getenv("CORS_ALLOWED_ORIGINS")),
 	}
 	c.AgentDB = getOr(os.Getenv("AGENT_DB"), dataDir+"/agent_memory.sqlite3")
 	c.VectorDir = getOr(os.Getenv("AGENT_VECTOR_DIR"), dataDir+"/chromem")
@@ -270,6 +284,14 @@ func firstOf(vals ...string) string {
 func isTruthy(v string) bool {
 	v = strings.ToLower(strings.TrimSpace(v))
 	return v == "true" || v == "1" || v == "yes"
+}
+
+// isFalsy is isTruthy's counterpart for settings that default to on: only an
+// explicit negative turns them off, so unset or unrecognised values keep the
+// default.
+func isFalsy(v string) bool {
+	v = strings.ToLower(strings.TrimSpace(v))
+	return v == "false" || v == "0" || v == "no" || v == "off"
 }
 
 func getOr(v, def string) string {

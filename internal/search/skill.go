@@ -17,6 +17,9 @@ type SearchResult struct {
 	Snippet string `json:"snippet"`
 }
 
+// maxResponseBytes caps how much of the results page is read.
+const maxResponseBytes = 2 << 20
+
 // WebSearchSkill scrapes DuckDuckGo HTML — no API key required.
 type WebSearchSkill struct {
 	client *http.Client
@@ -99,7 +102,9 @@ func (s *WebSearchSkill) search(query string, maxResults int) ([]SearchResult, e
 		return nil, fmt.Errorf("search returned status %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	// Bounded: results sit near the top of the page, and an unbounded read
+	// let a misbehaving (or spoofed) upstream exhaust memory.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
 		return nil, fmt.Errorf("reading response: %w", err)
 	}

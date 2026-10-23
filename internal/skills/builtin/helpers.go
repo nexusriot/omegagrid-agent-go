@@ -2,8 +2,12 @@ package builtin
 
 import (
 	"encoding/json"
+	"fmt"
+	"io"
+	"net/url"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // Skill and Param are defined locally to avoid an import cycle with the
@@ -103,4 +107,67 @@ func numArg(v any) (float64, bool) {
 		return f, err == nil
 	}
 	return 0, false
+}
+
+// maxTimeoutSec bounds every user-supplied timeout. A model asking for
+// timeout=86400 would otherwise park the agent step (and one of the parallel
+// tool slots) for a day on a blackholed host.
+const maxTimeoutSec = 60
+
+// clampTimeout returns v bounded to (0, max], substituting def for a
+// non-positive or non-numeric value. A zero timeout is not "fast": for
+// net.DialTimeout and http.Client it means no timeout at all.
+func clampTimeout(v, def, max float64) float64 {
+	if !(v > 0) { // also catches NaN
+		return def
+	}
+	if v > max {
+		return max
+	}
+	return v
+}
+
+// maxBodyBytes caps how much of a remote response body a skill reads into
+// memory. A hostile or merely huge endpoint could otherwise exhaust the
+// process with one tool call.
+const maxBodyBytes = 2 << 20
+
+// readCapped reads at most limit bytes of r, reporting whether more remained.
+func readCapped(r io.Reader, limit int64) ([]byte, bool, error) {
+	b, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if int64(len(b)) > limit {
+		return b[:limit], true, err
+	}
+	return b, false, err
+}
+
+// checkHTTPURL accepts only absolute http(s) URLs with a host. The skills that
+// take a URL from the model are HTTP clients; anything else is a mistake or
+// an attempt to reach something they were not meant to.
+func checkHTTPURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid url: %v", err)
+	}
+	if s := strings.ToLower(u.Scheme); s != "http" && s != "https" {
+		return fmt.Errorf("unsupported url scheme %q (only http and https are allowed)", u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("invalid url: missing host")
+	}
+	return nil
+}
+
+// trimPartialRune drops an incomplete UTF-8 sequence at the end of b, as left
+// by cutting a buffer at a byte limit. Bytes before it are untouched.
+func trimPartialRune(b []byte) []byte {
+	for i := 1; i <= utf8.UTFMax && i <= len(b); i++ {
+		if utf8.RuneStart(b[len(b)-i]) {
+			if !utf8.FullRune(b[len(b)-i:]) {
+				return b[:len(b)-i]
+			}
+			return b
+		}
+	}
+	return b
 }

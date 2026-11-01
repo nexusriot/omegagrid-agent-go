@@ -13,12 +13,24 @@ data/
 
 # Local secrets — must never enter the build context
 .env
-.env.local
-.env.*.local
+.env.*
 
-# Prebuilt binaries / build output
+# Prebuilt binaries / build output (`go build ./cmd/<name>` without -o drops
+# the binary in the repo root)
 /bin/
 build/
+/gateway
+/telegram-bot
+/migrate-vector
+/cli
+/omega
+/mockllm
+
+# Test / coverage artifacts and CI config
+*.out
+coverage.*
+*.prof
+.github/
 
 # Frontend deps & build output (the frontend image runs `npm ci` + `npm run build` fresh)
 web/node_modules/

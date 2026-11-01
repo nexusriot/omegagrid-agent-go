@@ -1,6 +1,7 @@
 package bootstrap
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -223,12 +224,12 @@ func TestToolProviderUnionsSkillsAndNatives(t *testing.T) {
 	native := map[string]agent.Skill{
 		"schedule_task": {
 			Schema:  skills.Skill{Name: "schedule_task", Description: "cron"},
-			Execute: func(map[string]any) (any, error) { return map[string]any{"native": true}, nil },
+			Execute: func(context.Context, map[string]any) (any, error) { return map[string]any{"native": true}, nil },
 		},
 	}
-	exec := func(name string, args map[string]any) (any, error) {
+	exec := func(_ context.Context, name string, args map[string]any) (any, error) {
 		if n, ok := native[name]; ok {
-			return n.Execute(args)
+			return n.Execute(context.Background(), args)
 		}
 		return sk.Execute(name, args)
 	}
@@ -250,7 +251,7 @@ func TestToolProviderUnionsSkillsAndNatives(t *testing.T) {
 	}
 
 	// A native skill overrides nothing but must be callable through Call.
-	res, err := p.Call("schedule_task", map[string]any{})
+	res, err := p.Call(context.Background(), "schedule_task", map[string]any{})
 	if err != nil {
 		t.Fatalf("Call(schedule_task): %v", err)
 	}
@@ -259,10 +260,10 @@ func TestToolProviderUnionsSkillsAndNatives(t *testing.T) {
 	}
 
 	// A registry skill routes to the registry.
-	if _, err := p.Call("datetime_skill", map[string]any{}); err != nil {
+	if _, err := p.Call(context.Background(), "datetime_skill", map[string]any{}); err != nil {
 		t.Fatalf("Call(datetime_skill): %v", err)
 	}
-	if _, err := p.Call("no_such_tool", map[string]any{}); err == nil {
+	if _, err := p.Call(context.Background(), "no_such_tool", map[string]any{}); err == nil {
 		t.Fatal("Call accepted an unknown tool")
 	}
 }
@@ -347,7 +348,7 @@ func TestConnectMCPServersRegistersRemoteTools(t *testing.T) {
 	if err != nil {
 		t.Fatalf("skills.New: %v", err)
 	}
-	connectMCPServers(config.Config{MCPServers: []string{"remote=" + srv.URL}}, sk)
+	startMCPServers(t.Context(), config.Config{MCPServers: []string{"remote=" + srv.URL}}, sk, nativeSkillNames)
 
 	list, err := sk.List()
 	if err != nil {
@@ -397,12 +398,12 @@ func TestConnectMCPServersToleratesBadEntries(t *testing.T) {
 	}
 	before, _ := sk.List()
 
-	connectMCPServers(config.Config{MCPServers: []string{
+	startMCPServers(t.Context(), config.Config{MCPServers: []string{
 		"no-equals-sign",
 		"=missing-name",
 		"empty-url=",
 		"dead=" + deadURL,
-	}}, sk)
+	}}, sk, nativeSkillNames)
 
 	after, _ := sk.List()
 	if len(after) != len(before) {
@@ -433,9 +434,9 @@ func TestConnectMCPServersSendsAuthHeader(t *testing.T) {
 	if err != nil {
 		t.Fatalf("skills.New: %v", err)
 	}
-	connectMCPServers(config.Config{
+	startMCPServers(t.Context(), config.Config{
 		MCPServers: []string{"remote=" + srv.URL + "|Authorization: Bearer tok123"},
-	}, sk)
+	}, sk, nativeSkillNames)
 
 	if gotAuth != "Bearer tok123" {
 		t.Fatalf("Authorization = %q, want %q", gotAuth, "Bearer tok123")
@@ -508,7 +509,7 @@ func TestNewWiresEveryService(t *testing.T) {
 	}
 
 	// schedule_task talks to the same store the gateway exposes over HTTP.
-	if _, err := svc.NativeSkills["schedule_task"].Execute(map[string]any{
+	if _, err := svc.NativeSkills["schedule_task"].Execute(context.Background(), map[string]any{
 		"action": "create", "cron_expr": "0 9 * * *", "skill": "reminder",
 		"args": map[string]any{"message": "standup"},
 	}); err != nil {
@@ -592,5 +593,34 @@ func TestSanitizeRemoteDescription(t *testing.T) {
 	}
 	if len(got) > maxRemoteDescription+len("…") || !utf8.ValidString(got) {
 		t.Fatalf("not capped to valid UTF-8: len=%d", len(got))
+	}
+}
+
+// The remote server picks the tool half of "<server>_<tool>", so a server
+// named "http" offering "request" replaced the built-in http_request (and its
+// private-network gate); "web"+"search" collided with the native web_search.
+func TestRemoteToolCannotShadowExistingSkills(t *testing.T) {
+	sk, err := skills.New(config.Config{SkillsDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("skills.New: %v", err)
+	}
+	for _, c := range []struct{ server, tool string }{
+		{"http", "request"}, {"shell", "command"}, {"skill", "creator"}, {"web", "search"}, {"vector", "add"},
+	} {
+		if err := registerRemoteTool(sk, nil, c.server, mcp.Tool{Name: c.tool}, nativeSkillNames); err == nil {
+			t.Errorf("remote %s_%s was registered over an existing skill", c.server, c.tool)
+		}
+	}
+	if err := registerRemoteTool(sk, nil, "remote", mcp.Tool{Name: "echo"}, nativeSkillNames); err != nil {
+		t.Fatalf("fresh name refused: %v", err)
+	}
+	if err := registerRemoteTool(sk, nil, "remote", mcp.Tool{Name: "echo"}, nativeSkillNames); err == nil {
+		t.Error("a second server's duplicate tool name replaced the first")
+	}
+	list, _ := sk.List()
+	for _, s := range list {
+		if s.Name == "http_request" && strings.HasPrefix(s.Description, "[MCP:") {
+			t.Fatal("http_request now points at the remote tool")
+		}
 	}
 }

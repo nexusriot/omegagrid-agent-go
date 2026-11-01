@@ -111,6 +111,7 @@ type queryRequest struct {
 	Query          string `json:"query"`
 	SessionID      int    `json:"session_id,omitempty"`
 	TelegramChatID int64  `json:"telegram_chat_id"`
+	Namespace      string `json:"namespace,omitempty"`
 }
 
 type queryResponse struct {
@@ -122,7 +123,12 @@ type queryResponse struct {
 // Query is the non-streaming endpoint, used as a fallback when streaming
 // breaks (e.g. proxy issues).
 func (c *AgentClient) Query(text string, chatID int64, sessionID int) (*queryResponse, error) {
-	body, _ := json.Marshal(queryRequest{Query: text, SessionID: sessionID, TelegramChatID: chatID})
+	return c.QueryIn(text, chatID, sessionID, "")
+}
+
+// QueryIn is Query with the run's memory scoped to namespace.
+func (c *AgentClient) QueryIn(text string, chatID int64, sessionID int, namespace string) (*queryResponse, error) {
+	body, _ := json.Marshal(queryRequest{Query: text, SessionID: sessionID, TelegramChatID: chatID, Namespace: namespace})
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 	req, err := c.newRequest(ctx, http.MethodPost, "/api/query", bytes.NewReader(body))
@@ -149,8 +155,13 @@ func (c *AgentClient) Query(text string, chatID int64, sessionID int) (*queryRes
 // QueryStream consumes the SSE stream and pushes parsed events to out.
 // The function blocks until the stream ends.  Closes out on return.
 func (c *AgentClient) QueryStream(text string, chatID int64, sessionID int, out chan<- Event) error {
+	return c.QueryStreamIn(text, chatID, sessionID, "", out)
+}
+
+// QueryStreamIn is QueryStream with the run's memory scoped to namespace.
+func (c *AgentClient) QueryStreamIn(text string, chatID int64, sessionID int, namespace string, out chan<- Event) error {
 	defer close(out)
-	body, _ := json.Marshal(queryRequest{Query: text, SessionID: sessionID, TelegramChatID: chatID})
+	body, _ := json.Marshal(queryRequest{Query: text, SessionID: sessionID, TelegramChatID: chatID, Namespace: namespace})
 	// A malformed GATEWAY_URL makes NewRequest return a nil request together
 	// with its error; setting a header on it panicked instead of reporting the
 	// misconfiguration.

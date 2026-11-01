@@ -11,7 +11,10 @@
 // keeping the project's pure-Go, lean-go.mod ethos.
 package mcp
 
-import "encoding/json"
+import (
+	"context"
+	"encoding/json"
+)
 
 // ProtocolVersion is the MCP revision this implementation speaks. The server
 // echoes back a client's requested version when it is one we understand,
@@ -43,10 +46,11 @@ type Tool struct {
 
 // ToolProvider is the surface the MCP server needs from the rest of the app:
 // enumerate tools and invoke one by name. The bootstrap layer adapts the skill
-// registry + native skills to this interface.
+// registry + native skills to this interface. Call's ctx is the HTTP
+// request's, so a client that disconnects stops the tool.
 type ToolProvider interface {
 	Tools() []Tool
-	Call(name string, args map[string]any) (any, error)
+	Call(ctx context.Context, name string, args map[string]any) (any, error)
 }
 
 // rpcRequest is a JSON-RPC 2.0 request. An absent ID marks a notification,
@@ -78,12 +82,15 @@ const (
 	codeParseError     = -32700
 	codeInvalidRequest = -32600
 	codeMethodNotFound = -32601
+	codeInvalidParams  = -32602
 )
 
-// isNotification reports whether a parsed request carries no ID (JSON-RPC
-// notifications must not be answered with a response object).
+// isNotification reports whether a parsed request carries no "id" member
+// (JSON-RPC notifications must not be answered with a response object). An
+// explicit "id": null is a request, not a notification: treating it as one
+// dropped a tools/call that the client was waiting on.
 func (r *rpcRequest) isNotification() bool {
-	return len(r.ID) == 0 || string(r.ID) == "null"
+	return len(r.ID) == 0
 }
 
 // jsonSchema converts a tool's parameter map into a JSON Schema object, the

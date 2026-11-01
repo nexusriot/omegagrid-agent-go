@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // OllamaChat speaks to a local Ollama server's /api/chat endpoint and forces
@@ -44,26 +45,12 @@ func (o *OllamaChat) CompleteJSONContext(ctx context.Context, messages []Message
 		"format":   "json",
 		"options":  map[string]any{"temperature": 0.2},
 	}
-	body, err := json.Marshal(payload)
+	raw, status, err := o.postChat(ctx, payload)
 	if err != nil {
-		return "", 0, fmt.Errorf("marshal request: %w", err)
+		return "", time.Since(t0).Seconds(), err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, o.baseURL+"/api/chat", bytes.NewReader(body))
-	if err != nil {
-		return "", 0, fmt.Errorf("build request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := o.client.Do(req)
-	if err != nil {
-		return "", time.Since(t0).Seconds(), fmt.Errorf("ollama post: %w", err)
-	}
-	defer resp.Body.Close()
-	raw, err := readBody(resp.Body)
-	if err != nil {
-		return "", time.Since(t0).Seconds(), fmt.Errorf("ollama read body: %w", err)
-	}
-	if resp.StatusCode >= 400 {
-		return "", time.Since(t0).Seconds(), fmt.Errorf("ollama status %d: %s", resp.StatusCode, truncate(string(raw), 300))
+	if status >= 400 {
+		return "", time.Since(t0).Seconds(), fmt.Errorf("ollama status %d: %s", status, truncate(string(raw), 300))
 	}
 	var out struct {
 		Message struct {
@@ -74,6 +61,29 @@ func (o *OllamaChat) CompleteJSONContext(ctx context.Context, messages []Message
 		return "", time.Since(t0).Seconds(), fmt.Errorf("ollama decode: %w", err)
 	}
 	return out.Message.Content, time.Since(t0).Seconds(), nil
+}
+
+// postChat POSTs payload to /api/chat and returns the body and status.
+func (o *OllamaChat) postChat(ctx context.Context, payload map[string]any) ([]byte, int, error) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, 0, fmt.Errorf("marshal request: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, o.baseURL+"/api/chat", bytes.NewReader(body))
+	if err != nil {
+		return nil, 0, fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := o.client.Do(req)
+	if err != nil {
+		return nil, 0, fmt.Errorf("ollama post: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, err := readBody(resp.Body)
+	if err != nil {
+		return nil, 0, fmt.Errorf("ollama read body: %w", err)
+	}
+	return raw, resp.StatusCode, nil
 }
 
 // maxResponseBytes caps how much of an LLM response body is read. Real
@@ -97,6 +107,11 @@ func readBody(r io.Reader) ([]byte, error) {
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
+	}
+	// Back off to a rune boundary: the result lands in JSON error bodies and
+	// Telegram messages, which reject or mangle a split UTF-8 sequence.
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
 	}
 	return s[:n]
 }

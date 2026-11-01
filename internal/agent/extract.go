@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/nexusriot/omegagrid-agent-go/internal/llm"
+	"github.com/nexusriot/omegagrid-agent-go/internal/memory"
 )
 
 // extractionPromptTemplate must yield a JSON *object* (not a bare array):
@@ -46,7 +47,7 @@ var extractSlots = make(chan struct{}, 2)
 
 // maybeExtractMemories fires the extraction pass in the background when the
 // feature is enabled and the turn looks substantial enough to bother.
-func (s *Service) maybeExtractMemories(sid int, query, answer string) {
+func (s *Service) maybeExtractMemories(sid int, namespace, query, answer string) {
 	if !s.AutoMemoryExtract {
 		return
 	}
@@ -75,14 +76,14 @@ func (s *Service) maybeExtractMemories(sid int, query, answer string) {
 				log.Printf("auto-memory: extraction panicked: %v\n%s", r, debug.Stack())
 			}
 		}()
-		s.extractAndStoreMemories(sid, query, answer)
+		s.extractAndStoreMemories(sid, namespace, query, answer)
 	}()
 }
 
 // extractAndStoreMemories runs one LLM call to distil the turn into facts and
 // stores each through Memory.AddMemory.  Errors are logged, never surfaced —
 // memory extraction must not affect the answer the user already received.
-func (s *Service) extractAndStoreMemories(sid int, query, answer string) {
+func (s *Service) extractAndStoreMemories(sid int, namespace, query, answer string) {
 	maxFacts := s.AutoMemoryMaxFacts
 	if maxFacts <= 0 {
 		maxFacts = 5
@@ -100,10 +101,10 @@ func (s *Service) extractAndStoreMemories(sid int, query, answer string) {
 		facts = facts[:maxFacts]
 	}
 	for _, fact := range facts {
-		_, err := s.Memory.AddMemory(fact, map[string]any{
+		_, err := s.Memory.AddMemoryOpts(fact, map[string]any{
 			"source":     "auto-extract",
 			"session_id": sid,
-		})
+		}, memory.AddOptions{Namespace: namespace})
 		if err != nil {
 			log.Printf("auto-memory: store failed: %v", err)
 		}

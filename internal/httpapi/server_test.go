@@ -1,18 +1,22 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nexusriot/omegagrid-agent-go/internal/config"
 	"github.com/nexusriot/omegagrid-agent-go/internal/llm"
 	"github.com/nexusriot/omegagrid-agent-go/internal/memory"
 	"github.com/nexusriot/omegagrid-agent-go/internal/scheduler"
 	"github.com/nexusriot/omegagrid-agent-go/internal/skills"
+	"github.com/nexusriot/omegagrid-agent-go/internal/version"
 )
 
 // newTestDeps wires real stores against temp files. The embeddings backend is
@@ -36,7 +40,22 @@ func newTestDeps(t *testing.T) Deps {
 		SchedulerDB:       filepath.Join(dir, "sched.sqlite3"),
 		PlaygroundEnabled: true,
 		AgentMaxSteps:     25,
+		// httptest.NewRequest sends Host: example.com, which the
+		// DNS-rebinding guard rejects on a token-less gateway.
+		AllowedHosts: []string{"example.com"},
 	}
+	return newTestDepsWith(t, cfg)
+}
+
+// newTestDepsWith builds Deps from cfg against a fresh temp dir.
+func newTestDepsWith(t *testing.T, cfg config.Config) Deps {
+	t.Helper()
+	dir := t.TempDir()
+	cfg.DataDir = dir
+	cfg.AgentDB = filepath.Join(dir, "agent.sqlite3")
+	cfg.VectorDir = filepath.Join(dir, "chromem")
+	cfg.SkillsDir = filepath.Join(dir, "skills")
+	cfg.SchedulerDB = filepath.Join(dir, "sched.sqlite3")
 
 	mem, err := memory.New(cfg)
 	if err != nil {
@@ -428,6 +447,60 @@ func TestOriginGuardRejectsForeignPost(t *testing.T) {
 	}
 }
 
+// A DNS-rebinding page re-points its own name at the gateway, so its requests
+// arrive with Host and Origin both naming the attacker's domain and sail past
+// originGuard as "same-origin". Without a token only Host values no public
+// resolver can hand out may reach the API.
+func TestHostGuardBlocksDNSRebinding(t *testing.T) {
+	d := newTestDeps(t)
+	d.Cfg.AllowedHosts = nil
+	h := NewRouter(d)
+
+	send := func(method, path, host string) int {
+		r := httptest.NewRequest(method, path, nil)
+		r.Host = host
+		r.Header.Set("Origin", "http://"+host)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w.Code
+	}
+
+	for _, host := range []string{"evil.example", "evil.example:8000", "EVIL.example.", "localhost.evil.example"} {
+		if code := send("POST", "/api/sessions/new", host); code != http.StatusForbidden {
+			t.Errorf("POST from rebinding host %q: status %d, want 403", host, code)
+		}
+		if code := send("GET", "/api/invocations", host); code != http.StatusForbidden {
+			t.Errorf("GET from rebinding host %q: status %d, want 403 (reads leak the audit log)", host, code)
+		}
+	}
+	for _, host := range []string{"localhost", "localhost:8000", "127.0.0.1:8000", "[::1]:8000", "gateway:8000", "ui.localhost", "192.168.1.20"} {
+		if code := send("POST", "/api/sessions/new", host); code != http.StatusOK {
+			t.Errorf("POST with trusted host %q: status %d, want 200", host, code)
+		}
+	}
+
+	d.Cfg.AllowedHosts = []string{"agent.example.org"}
+	h = NewRouter(d)
+	if code := send("POST", "/api/sessions/new", "agent.example.org:80"); code != http.StatusOK {
+		t.Errorf("allowlisted host: status %d, want 200", code)
+	}
+
+	// A token defeats rebinding on its own (the page cannot read it), so the
+	// host check steps aside and a token-protected gateway keeps serving any
+	// hostname.
+	d.Cfg.AllowedHosts = nil
+	d.Cfg.APIToken = "s3cret"
+	h = NewRouter(d)
+	r := httptest.NewRequest("GET", "/api/sessions", nil)
+	r.Host = "agent.example.org"
+	r.Header.Set("Authorization", "Bearer s3cret")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Errorf("token + dotted host: status %d, want 200", w.Code)
+	}
+}
+
 func TestAPITokenRequired(t *testing.T) {
 	d := newTestDeps(t)
 	d.Cfg.APIToken = "s3cret"
@@ -533,3 +606,61 @@ type stubChat struct{}
 func (stubChat) CompleteJSON([]llm.Message) (string, float64, error) { return "{}", 0, nil }
 func (stubChat) Model() string                                       { return "stub-model" }
 func (stubChat) BaseURL() string                                     { return "http://stub" }
+
+func TestSchedulerExtendedRoutes(t *testing.T) {
+	d := newTestDeps(t)
+	h := NewRouter(d)
+	code, body := doJSON(t, h, "POST", "/api/scheduler/tasks",
+		`{"name":"digest","cron_expr":"0 8 * * *","prompt":"summarise","timezone":"Europe/Berlin","max_retries":2}`)
+	if code != http.StatusOK || body["skill"] != "agent" || body["timezone"] != "Europe/Berlin" || body["max_retries"] != float64(2) {
+		t.Fatalf("create prompt task = %d %v", code, body)
+	}
+	id := int(body["id"].(float64))
+	if code, body := doJSON(t, h, "POST", "/api/scheduler/tasks", `{"name":"x","cron_expr":"0 8 * * *","skill":"weather","timezone":"Mars/Base"}`); code != http.StatusBadRequest {
+		t.Fatalf("bad timezone = %d %v", code, body)
+	}
+	path := "/api/scheduler/tasks/" + strconv.Itoa(id)
+	if code, _ := doJSON(t, h, "POST", path+"/run", ""); code != http.StatusServiceUnavailable {
+		t.Fatalf("run without a runner = %d, want 503", code)
+	}
+
+	d.Runner = scheduler.NewRunner(d.Scheduler, nil, "", time.Hour)
+	d.Runner.SetAgent(func(context.Context, string) (string, error) { return "digest ready", nil })
+	h = NewRouter(d)
+	code, body = doJSON(t, h, "POST", path+"/run", "")
+	if code != http.StatusOK || body["ok"] != true || body["result"] != "digest ready" {
+		t.Fatalf("run = %d %v", code, body)
+	}
+	r := httptest.NewRequest("GET", path+"/runs", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	var runs []map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &runs)
+	if w.Code != http.StatusOK || len(runs) != 1 || runs[0]["trigger"] != "manual" {
+		t.Fatalf("runs = %d %s", w.Code, w.Body.String())
+	}
+	if code, _ := doJSON(t, h, "GET", "/api/scheduler/tasks/999/runs", ""); code != http.StatusNotFound {
+		t.Fatalf("runs of a missing task = %d", code)
+	}
+	if code, _ := doJSON(t, h, "POST", "/api/scheduler/tasks/999/run", ""); code != http.StatusNotFound {
+		t.Fatalf("run of a missing task = %d", code)
+	}
+}
+
+// /health and the MCP handshake report the one release version.
+func TestVersionIsReported(t *testing.T) {
+	d := newTestDeps(t)
+	d.Chat = stubChat{}
+	d.Cfg.MCPServerEnabled = true
+	d.ToolProvider = &stubProvider{}
+	h := NewRouter(d)
+	if _, body := doJSON(t, h, "GET", "/health", ""); body["version"] != version.Version {
+		t.Fatalf("/health version = %v, want %s", body["version"], version.Version)
+	}
+	r := httptest.NewRequest("POST", "/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize"}`))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if !strings.Contains(w.Body.String(), `"version":"`+version.Version+`"`) {
+		t.Fatalf("MCP serverInfo does not carry %s: %s", version.Version, w.Body.String())
+	}
+}

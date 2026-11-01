@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"context"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -26,7 +27,7 @@ func TestPanickingTaskDoesNotAbortTheTick(t *testing.T) {
 	}
 
 	var ran []string
-	r := NewRunner(store, func(skill string, _ map[string]any) (any, error) {
+	r := NewRunner(store, func(_ context.Context, skill string, _ map[string]any) (any, error) {
 		ran = append(ran, skill)
 		if skill == "panics" {
 			panic("skill exploded")

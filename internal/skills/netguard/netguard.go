@@ -51,6 +51,9 @@ var (
 	thisNetwork = netip.MustParsePrefix("0.0.0.0/8")
 	// RFC 6598 shared address space (carrier-grade NAT).
 	cgnat = netip.MustParsePrefix("100.64.0.0/10")
+	// IPv6 prefixes that embed an IPv4 destination.
+	nat64     = netip.MustParsePrefix("64:ff9b::/96")
+	sixToFour = netip.MustParsePrefix("2002::/16")
 )
 
 // ErrBlocked is returned (wrapped) for a refused destination.
@@ -68,8 +71,32 @@ func CheckAddr(ip netip.Addr) error {
 	return checkAddr(ip, allowPrivate.Load())
 }
 
+// embeddedIPv4 returns the IPv4 address an IPv6 translation prefix carries:
+// NAT64 (RFC 6052 well-known prefix 64:ff9b::/96, low 32 bits) and 6to4
+// (2002::/16, bits 16-47). On a host with NAT64 or a 6to4 relay,
+// 64:ff9b::a9fe:a9fe reaches 169.254.169.254, so these must be vetted as the
+// IPv4 they stand for.
+func embeddedIPv4(ip netip.Addr) (netip.Addr, bool) {
+	if !ip.Is6() {
+		return netip.Addr{}, false
+	}
+	b := ip.As16()
+	switch {
+	case nat64.Contains(ip):
+		return netip.AddrFrom4([4]byte{b[12], b[13], b[14], b[15]}), true
+	case sixToFour.Contains(ip):
+		return netip.AddrFrom4([4]byte{b[2], b[3], b[4], b[5]}), true
+	}
+	return netip.Addr{}, false
+}
+
 func checkAddr(ip netip.Addr, allowPriv bool) error {
 	ip = ip.Unmap() // ::ffff:169.254.169.254 is the same host
+	if v4, ok := embeddedIPv4(ip); ok {
+		if err := checkAddr(v4, allowPriv); err != nil {
+			return &ErrBlocked{Addr: ip, Reason: "translates to " + err.Error()}
+		}
+	}
 	switch {
 	case !ip.IsValid():
 		return &ErrBlocked{Addr: ip, Reason: "invalid address"}

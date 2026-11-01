@@ -3,12 +3,14 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // capture records what a fake OpenAI endpoint received.
@@ -751,5 +753,42 @@ func TestDropTemperatureSkippedOnResponsesMode(t *testing.T) {
 	c := NewOpenAIChat("sk-test", "http://x", "m", "responses", "", &temp, 5)
 	if c.dropTemperature(http.StatusBadRequest, []byte(temperatureBody)) {
 		t.Fatal("healed temperature on the responses path, which never sends it")
+	}
+}
+
+// NewOpenAIChat used to install time.Sleep as the backoff, so sleepFor never
+// reached its context-aware branch and a cancelled request still sat out the
+// full 2s retry wait.
+func TestRetryBackoffHonoursCancellation(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+	c := NewOpenAIChat("k", srv.URL, "m", "", "", nil, 5)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	t0 := time.Now()
+	_, _, err := c.CompleteJSONContext(ctx, []Message{{Role: "user", Content: "x"}})
+	if d := time.Since(t0); d > time.Second {
+		t.Fatalf("cancelled request returned after %v, want well under the 2s backoff", d)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want context.DeadlineExceeded", err)
+	}
+}
+
+// Provider error bodies are cut to 400 bytes; cutting through a multi-byte
+// rune produced an error string that is not valid UTF-8.
+func TestErrorBodyTruncationKeepsUTF8(t *testing.T) {
+	body := strings.Repeat("a", 399) + "ж"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+	c := NewOpenAIChat("k", srv.URL, "m", "", "", nil, 5)
+	_, _, err := c.CompleteJSON([]Message{{Role: "user", Content: "x"}})
+	if err == nil || !utf8.ValidString(err.Error()) {
+		t.Fatalf("err = %q, want a valid-UTF-8 error", err)
 	}
 }

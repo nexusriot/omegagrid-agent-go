@@ -28,7 +28,7 @@ func runSession(args []string) {
 func sessionList(args []string) {
 	fs := flag.NewFlagSet("session list", flag.ExitOnError)
 	jsonOut := fs.Bool("json", false, "JSON output")
-	fs.Parse(args)
+	parseArgs(fs, args)
 
 	sessions, err := listSessions()
 	if err != nil {
@@ -51,9 +51,9 @@ func sessionList(args []string) {
 
 func sessionExport(args []string) {
 	fs := flag.NewFlagSet("session export", flag.ExitOnError)
-	fs.Parse(args)
+	pos := parseArgs(fs, args)
 
-	idStr := fs.Arg(0)
+	idStr := argAt(pos, 0)
 	if idStr == "" {
 		fatalf("session export: session ID required")
 	}

@@ -275,3 +275,30 @@ func TestDispatchBoundsConcurrency(t *testing.T) {
 		t.Fatalf("peak concurrent agent runs = %d, want <= %d", p, maxConcurrentHandlers)
 	}
 }
+
+// /start reset the chat's session without any auth check, so in a group any
+// member could wipe the shared conversation the allowlisted users were in.
+func TestStartResetsSessionOnlyForAuthorizedSenders(t *testing.T) {
+	const admin = 999
+	const group = -100777
+	f := newFakeTelegram(t)
+	b := newTestBot(t, f, newAuthStore(t, admin), "http://unused")
+	b.setSession(group, 42)
+
+	msg := command(group, "start", "")
+	msg.Chat.Type = "group"
+	msg.From = &tgbotapi.User{ID: 1234}
+	b.handle(msg)
+	if got := b.getSession(group); got != 42 {
+		t.Fatalf("a stranger's /start reset the group session to %d", got)
+	}
+	if got := f.lastMessage(t); !strings.Contains(got, "Your Telegram ID: 1234") || strings.Contains(got, "`") {
+		t.Fatalf("/start reply = %q, want the plain-text ID", got)
+	}
+
+	msg.From = &tgbotapi.User{ID: admin}
+	b.handle(msg)
+	if got := b.getSession(group); got != 0 {
+		t.Fatalf("the admin's /start left session %d", got)
+	}
+}

@@ -2,6 +2,9 @@ export interface Session {
   id: number
   created_at: number
   message_count?: number
+  title?: string
+  preview?: string
+  last_at?: number
 }
 
 export interface Message {
@@ -23,6 +26,19 @@ export interface Skill {
   description: string
   parameters: Record<string, SkillParam>
   body?: string
+  kind?: 'builtin' | 'markdown' | 'remote'
+}
+
+export interface SkillValidateResult {
+  ok: boolean
+  skill?: Skill
+  error?: string
+}
+
+export interface SkillSaveResult {
+  ok: boolean
+  skill: Skill
+  created: boolean
 }
 
 export interface SchedulerTask {
@@ -30,21 +46,44 @@ export interface SchedulerTask {
   name: string
   cron_expr: string
   skill: string
-  args_json: string
+  args: Record<string, unknown>
   notify_telegram_chat_id: number | null
+  one_shot: boolean
   enabled: boolean
   created_at: number
   last_run_at: number | null
   last_result: string | null
   run_count: number
+  timezone: string
+  prompt?: string
+  max_retries: number
+  retry_delay_sec: number
+  retry_attempt: number
+  next_retry_at: number | null
 }
 
 export interface CreateTaskRequest {
   name: string
   cron_expr: string
-  skill: string
-  args: Record<string, unknown>
+  skill?: string
+  prompt?: string
+  args?: Record<string, unknown>
   notify_telegram_chat_id?: number | null
+  one_shot?: boolean
+  timezone?: string
+  max_retries?: number
+  retry_delay_sec?: number
+}
+
+export interface TaskRun {
+  id: number
+  task_id: number
+  trigger: 'cron' | 'retry' | 'manual'
+  attempt: number
+  started_at: number
+  finished_at: number
+  ok: boolean
+  result: string
 }
 
 export interface MemoryHit {
@@ -61,14 +100,57 @@ export interface MemoryAddResult {
   reason?: string
 }
 
+export interface MemoryNamespace {
+  namespace: string
+  count: number
+}
+
+export interface MemoryUpdateRequest {
+  text?: string
+  meta?: Record<string, string | null>
+  ttl_seconds?: number
+}
+
+export interface ImportReport {
+  imported: number
+  duplicates: number
+  existing: number
+  failed: number
+  errors?: string[]
+}
+
+export interface UsageBucket {
+  start: number
+  queries: number
+  tool_calls: number
+  tool_errors: number
+  avg_tool_ms: number
+}
+
+export interface SkillUsage {
+  skill: string
+  calls: number
+  errors: number
+  avg_ms: number
+}
+
+export interface UsageStats {
+  since: number
+  bucket: 'hour' | 'day'
+  buckets: UsageBucket[]
+  skills: SkillUsage[]
+}
+
 export interface HealthStatus {
   ok: boolean
+  version?: string
   provider: string
   chat_model: string
   chat_base: string
   skills_dir: string
   scheduler_db: string
   embed_model: string
+  embed_provider?: string
   embed_ok: boolean
   embed_error?: string
 }
@@ -151,7 +233,9 @@ export interface ThinkingEvent  { step: number }
 export interface ToolCallEvent  { step: number; tool: string; args: Record<string, unknown>; why: string }
 export interface ToolResultEvent { step: number; tool: string; result: string; elapsed_s: number }
 export interface FinalEvent     { session_id: number; answer: string; meta: QueryResult['meta'] }
-export interface ErrorEvent     { message: string }
+// The gateway sends {"error": "..."}; errors raised client-side in stream.ts
+// (401, network failure) use {"message": "..."}.
+export interface ErrorEvent     { error?: string; message?: string }
 
 export type StreamEvent =
   | { event: 'thinking';    data: ThinkingEvent }

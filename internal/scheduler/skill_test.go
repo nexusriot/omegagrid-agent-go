@@ -297,3 +297,33 @@ func TestAsString(t *testing.T) {
 		})
 	}
 }
+
+// Models often send the inner args as a JSON string. It was silently replaced
+// by {}, so a reminder fired with no message.
+func TestScheduleTaskAcceptsJSONStringArgs(t *testing.T) {
+	skill, store := newTestSkill(t)
+	m := mustMap(t, skill.Execute(map[string]any{
+		"action": "create", "cron_expr": "0 9 * * *", "skill": "reminder",
+		"args": `{"message":"stand-up"}`,
+	}))
+	if m["created"] != true {
+		t.Fatalf("create = %v", m)
+	}
+	task := m["task"].(*Task)
+	got, err := store.Get(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Args["message"] != "stand-up" {
+		t.Fatalf("stored args = %v, want the decoded message", got.Args)
+	}
+
+	for _, bad := range []any{"not json", `["a"]`, 42} {
+		m := mustMap(t, skill.Execute(map[string]any{
+			"action": "create", "cron_expr": "0 9 * * *", "skill": "reminder", "args": bad,
+		}))
+		if _, ok := m["error"]; !ok {
+			t.Errorf("args=%#v: want an error, got %v", bad, m)
+		}
+	}
+}

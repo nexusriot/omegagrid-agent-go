@@ -36,8 +36,10 @@ type OpenAIChat struct {
 	extraHeaders map[string]string
 	client       *http.Client
 
-	// sleep is the retry backoff, injectable so tests can assert the schedule
-	// without actually waiting seconds for it.
+	// sleep replaces the retry backoff in tests so they can assert the
+	// schedule without waiting seconds for it. Production leaves it nil, which
+	// selects the context-aware timer in sleepFor: a cancelled request must
+	// not sit out a 2s/4s backoff.
 	sleep func(time.Duration)
 }
 
@@ -67,7 +69,6 @@ func NewOpenAIChat(apiKey, baseURL, model, mode, reasoning string, temperature *
 		reasoning:   reasoning,
 		temperature: temperature,
 		client:      &http.Client{Timeout: time.Duration(timeoutSec * float64(time.Second))},
-		sleep:       time.Sleep,
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -119,8 +120,8 @@ func (o *OpenAIChat) mapMessages(messages []Message) []map[string]string {
 	return out
 }
 
-// sleepFor waits out the retry backoff, tolerating a zero-valued client built
-// without NewOpenAIChat.
+// sleepFor waits out the retry backoff, returning early with ctx.Err() when
+// the request is cancelled.
 func (o *OpenAIChat) sleepFor(ctx context.Context, d time.Duration) error {
 	if o.sleep != nil {
 		o.sleep(d)
@@ -185,11 +186,42 @@ func (o *OpenAIChat) postWithRetry(ctx context.Context, url string, body []byte)
 	return nil, fmt.Errorf("%w (after 3 attempts)", lastErr)
 }
 
+// post sends one request built by build (called afresh for every attempt, so
+// a self-heal that rewrites the model or drops temperature takes effect) and
+// returns the 2xx response body. label prefixes error messages.
+func (o *OpenAIChat) post(ctx context.Context, path, label string, build func() map[string]any) ([]byte, error) {
+	for attempt := 0; ; attempt++ {
+		body, err := json.Marshal(build())
+		if err != nil {
+			return nil, fmt.Errorf("marshal request: %w", err)
+		}
+		resp, err := o.postWithRetry(ctx, o.baseURL+path, body)
+		if err != nil {
+			return nil, fmt.Errorf("%s post: %w", label, err)
+		}
+		raw, err := readBody(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("openai read body: %w", err)
+		}
+		if resp.StatusCode < 400 {
+			return raw, nil
+		}
+		if attempt < maxSelfHeal && o.healAfterError(resp.StatusCode, raw) {
+			continue
+		}
+		err = fmt.Errorf("%s status %d: %s", label, resp.StatusCode, truncate(string(raw), 400))
+		if resp.StatusCode == http.StatusBadRequest && toolsUnsupportedRE.Match(raw) {
+			err = fmt.Errorf("%w: %v", ErrToolsUnsupported, err)
+		}
+		return nil, err
+	}
+}
+
 func (o *OpenAIChat) completeChatCompletions(ctx context.Context, messages []Message) (string, float64, error) {
 	t0 := time.Now()
 	mapped := o.mapMessages(messages)
-	var raw []byte
-	for attempt := 0; ; attempt++ {
+	raw, err := o.post(ctx, "/chat/completions", "openai", func() map[string]any {
 		payload := map[string]any{
 			"model":           o.Model(),
 			"messages":        mapped,
@@ -198,26 +230,10 @@ func (o *OpenAIChat) completeChatCompletions(ctx context.Context, messages []Mes
 		if t := o.temp(); t != nil {
 			payload["temperature"] = *t
 		}
-		body, err := json.Marshal(payload)
-		if err != nil {
-			return "", 0, fmt.Errorf("marshal request: %w", err)
-		}
-		resp, err := o.postWithRetry(ctx, o.baseURL+"/chat/completions", body)
-		if err != nil {
-			return "", time.Since(t0).Seconds(), fmt.Errorf("openai post: %w", err)
-		}
-		raw, err = readBody(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			return "", time.Since(t0).Seconds(), fmt.Errorf("openai read body: %w", err)
-		}
-		if resp.StatusCode < 400 {
-			break
-		}
-		if attempt < maxSelfHeal && o.healAfterError(resp.StatusCode, raw) {
-			continue
-		}
-		return "", time.Since(t0).Seconds(), fmt.Errorf("openai status %d: %s", resp.StatusCode, truncate(string(raw), 400))
+		return payload
+	})
+	if err != nil {
+		return "", time.Since(t0).Seconds(), err
 	}
 	var out struct {
 		Choices []struct {
@@ -238,8 +254,7 @@ func (o *OpenAIChat) completeChatCompletions(ctx context.Context, messages []Mes
 func (o *OpenAIChat) completeResponses(ctx context.Context, messages []Message) (string, float64, error) {
 	t0 := time.Now()
 	mapped := o.mapMessages(messages)
-	var raw []byte
-	for attempt := 0; ; attempt++ {
+	raw, err := o.post(ctx, "/responses", "openai responses", func() map[string]any {
 		payload := map[string]any{
 			"model": o.Model(),
 			"input": mapped,
@@ -251,54 +266,55 @@ func (o *OpenAIChat) completeResponses(ctx context.Context, messages []Message) 
 		if o.reasoning != "" {
 			payload["reasoning"] = map[string]string{"effort": o.reasoning}
 		}
-		body, err := json.Marshal(payload)
-		if err != nil {
-			return "", 0, fmt.Errorf("marshal request: %w", err)
-		}
-		resp, err := o.postWithRetry(ctx, o.baseURL+"/responses", body)
-		if err != nil {
-			return "", time.Since(t0).Seconds(), fmt.Errorf("openai responses post: %w", err)
-		}
-		raw, err = readBody(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			return "", time.Since(t0).Seconds(), fmt.Errorf("openai read body: %w", err)
-		}
-		if resp.StatusCode < 400 {
-			break
-		}
-		if attempt < maxSelfHeal && o.healAfterError(resp.StatusCode, raw) {
-			continue
-		}
-		return "", time.Since(t0).Seconds(), fmt.Errorf("openai responses status %d: %s", resp.StatusCode, truncate(string(raw), 400))
+		return payload
+	})
+	if err != nil {
+		return "", time.Since(t0).Seconds(), err
 	}
-	// The /responses endpoint returns either "output_text" directly or a
-	// structured "output" array with nested content blocks.  Try the simple
-	// path first, then fall back to walking the array.
+	text, _, err := decodeResponsesOutput(raw)
+	if err != nil {
+		return "", time.Since(t0).Seconds(), err
+	}
+	if text == "" {
+		text = "{}"
+	}
+	return text, time.Since(t0).Seconds(), nil
+}
+
+// decodeResponsesOutput reads a /responses body: either "output_text"
+// directly or a structured "output" array of message blocks and
+// function_call items.
+func decodeResponsesOutput(raw []byte) (string, []ToolCall, error) {
 	var out struct {
 		OutputText string `json:"output_text"`
 		Output     []struct {
-			Content []struct {
+			Type      string `json:"type"`
+			CallID    string `json:"call_id"`
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+			Content   []struct {
 				Text string `json:"text"`
 			} `json:"content"`
 		} `json:"output"`
 	}
 	if err := json.Unmarshal(raw, &out); err != nil {
-		return "", time.Since(t0).Seconds(), fmt.Errorf("openai responses decode: %w", err)
+		return "", nil, fmt.Errorf("openai responses decode: %w", err)
 	}
-	if out.OutputText != "" {
-		return out.OutputText, time.Since(t0).Seconds(), nil
-	}
+	var calls []ToolCall
 	var sb strings.Builder
 	for _, item := range out.Output {
+		if item.Type == "function_call" {
+			calls = append(calls, ToolCall{ID: item.CallID, Name: item.Name, Args: decodeArgs(item.Arguments)})
+			continue
+		}
 		for _, block := range item.Content {
 			sb.WriteString(block.Text)
 		}
 	}
-	if sb.Len() == 0 {
-		return "{}", time.Since(t0).Seconds(), nil
+	if out.OutputText != "" {
+		return out.OutputText, calls, nil
 	}
-	return sb.String(), time.Since(t0).Seconds(), nil
+	return sb.String(), calls, nil
 }
 
 // deprecatedModelHint matches the replacement named in a ModelDeprecated

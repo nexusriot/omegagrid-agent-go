@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/nexusriot/omegagrid-agent-go/internal/version"
 )
 
 // Client speaks MCP to a single remote server over streamable HTTP. It is the
@@ -30,7 +32,16 @@ type Client struct {
 	mu        sync.Mutex
 	sessionID string
 	nextID    int
+
+	// listChanged is signalled (non-blocking) when the server sends
+	// notifications/tools/list_changed inside an SSE response, so the owner
+	// can re-list tools without waiting for its next periodic refresh.
+	listChanged chan struct{}
 }
+
+// ListChanged returns a channel that receives a value whenever the server
+// announced that its tool list changed.
+func (c *Client) ListChanged() <-chan struct{} { return c.listChanged }
 
 // NewClient builds an MCP client for url. headers are sent on every request
 // (e.g. an Authorization bearer token). The server's local namespace is the
@@ -40,9 +51,10 @@ func NewClient(url string, headers map[string]string, timeout time.Duration) *Cl
 		timeout = 30 * time.Second
 	}
 	return &Client{
-		url:     url,
-		headers: headers,
-		http:    &http.Client{Timeout: timeout},
+		url:         url,
+		headers:     headers,
+		http:        &http.Client{Timeout: timeout},
+		listChanged: make(chan struct{}, 1),
 	}
 }
 
@@ -52,7 +64,7 @@ func (c *Client) Initialize(ctx context.Context) error {
 	params := map[string]any{
 		"protocolVersion": ProtocolVersion,
 		"capabilities":    map[string]any{},
-		"clientInfo":      map[string]any{"name": "omegagrid-agent-go", "version": "1.0.0"},
+		"clientInfo":      map[string]any{"name": "omegagrid-agent-go", "version": version.Version},
 	}
 	if _, err := c.call(ctx, "initialize", params); err != nil {
 		return err
@@ -195,6 +207,7 @@ const maxResponseBytes = 16 << 20
 // raw so an absent result is distinguishable from an empty one.
 type clientResponse struct {
 	ID     json.RawMessage `json:"id"`
+	Method string          `json:"method"`
 	Result json.RawMessage `json:"result"`
 	Error  *rpcError       `json:"error"`
 }
@@ -226,7 +239,18 @@ func (c *Client) post(ctx context.Context, body rpcRequest) (*clientResponse, er
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
 	}
 
-	return readResponse(resp, body.ID)
+	return readResponse(resp, body.ID, c.noteNotification)
+}
+
+// noteNotification handles server notifications interleaved in an SSE
+// response.
+func (c *Client) noteNotification(method string) {
+	if method == "notifications/tools/list_changed" {
+		select {
+		case c.listChanged <- struct{}{}:
+		default:
+		}
+	}
 }
 
 func (c *Client) setHeaders(req *http.Request) {
@@ -265,7 +289,7 @@ func (c *Client) setSessionID(sid string) {
 // notifications (progress, log messages) or its own requests before the
 // response, and one event's JSON may span several data: lines, so events are
 // reassembled and the first message whose id matches is returned.
-func readResponse(resp *http.Response, wantID json.RawMessage) (*clientResponse, error) {
+func readResponse(resp *http.Response, wantID json.RawMessage, onNotify func(method string)) (*clientResponse, error) {
 	body := io.LimitReader(resp.Body, maxResponseBytes)
 	if !strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
 		payload, err := io.ReadAll(body)
@@ -293,6 +317,9 @@ func readResponse(resp *http.Response, wantID json.RawMessage) (*clientResponse,
 			return nil, false
 		}
 		if !bytes.Equal(bytes.TrimSpace(out.ID), bytes.TrimSpace(wantID)) {
+			if len(out.ID) == 0 && out.Method != "" && onNotify != nil {
+				onNotify(out.Method)
+			}
 			return nil, false // a notification or server-initiated request
 		}
 		return &out, true
@@ -318,6 +345,27 @@ func readResponse(resp *http.Response, wantID json.RawMessage) (*clientResponse,
 	return nil, fmt.Errorf("no response with id %s in SSE stream", wantID)
 }
 
+// schemaType reads a JSON Schema "type", which may be a single name or a
+// union such as ["string","null"] (Pydantic and Zod emit that for optional
+// fields). A plain string field used to make the whole schema fail to decode,
+// so the tool registered with no parameters at all and the model never
+// learned about the required ones. The first non-null member wins.
+func schemaType(raw json.RawMessage) string {
+	var one string
+	if json.Unmarshal(raw, &one) == nil && one != "" {
+		return one
+	}
+	var many []string
+	if json.Unmarshal(raw, &many) == nil {
+		for _, t := range many {
+			if t != "" && t != "null" {
+				return t
+			}
+		}
+	}
+	return "string"
+}
+
 // paramsFromSchema converts a tool's inputSchema JSON Schema into a Param map.
 func paramsFromSchema(raw json.RawMessage) map[string]Param {
 	if len(raw) == 0 {
@@ -325,8 +373,8 @@ func paramsFromSchema(raw json.RawMessage) map[string]Param {
 	}
 	var schema struct {
 		Properties map[string]struct {
-			Type        string `json:"type"`
-			Description string `json:"description"`
+			Type        json.RawMessage `json:"type"`
+			Description string          `json:"description"`
 		} `json:"properties"`
 		Required []string `json:"required"`
 	}
@@ -339,10 +387,7 @@ func paramsFromSchema(raw json.RawMessage) map[string]Param {
 	}
 	out := make(map[string]Param, len(schema.Properties))
 	for name, p := range schema.Properties {
-		typ := p.Type
-		if typ == "" {
-			typ = "string"
-		}
+		typ := schemaType(p.Type)
 		out[name] = Param{Type: typ, Description: p.Description, Required: reqSet[name]}
 	}
 	return out

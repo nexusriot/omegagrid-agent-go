@@ -1,6 +1,7 @@
 package skills
 
 import (
+	"context"
 	"errors"
 	"testing"
 )
@@ -8,10 +9,10 @@ import (
 func TestRegistryExecute(t *testing.T) {
 	t.Run("success returns executor value", func(t *testing.T) {
 		r := newRegistry()
-		r.register(Skill{Name: "echo", Description: "echoes"}, func(args map[string]any) (any, error) {
+		r.register(Skill{Name: "echo", Description: "echoes"}, func(_ context.Context, args map[string]any) (any, error) {
 			return args["v"], nil
 		})
-		got, err := r.execute("echo", map[string]any{"v": "hi"})
+		got, err := r.execute(context.Background(), "echo", map[string]any{"v": "hi"})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -23,10 +24,10 @@ func TestRegistryExecute(t *testing.T) {
 	t.Run("propagates executor error", func(t *testing.T) {
 		r := newRegistry()
 		wantErr := errors.New("boom")
-		r.register(Skill{Name: "fail"}, func(map[string]any) (any, error) {
+		r.register(Skill{Name: "fail"}, func(context.Context, map[string]any) (any, error) {
 			return nil, wantErr
 		})
-		_, err := r.execute("fail", nil)
+		_, err := r.execute(context.Background(), "fail", nil)
 		if !errors.Is(err, wantErr) {
 			t.Fatalf("got %v, want %v", err, wantErr)
 		}
@@ -34,7 +35,7 @@ func TestRegistryExecute(t *testing.T) {
 
 	t.Run("missing skill returns errNotFound", func(t *testing.T) {
 		r := newRegistry()
-		_, err := r.execute("ghost", nil)
+		_, err := r.execute(context.Background(), "ghost", nil)
 		if err == nil {
 			t.Fatal("expected error, got nil")
 		}
@@ -53,14 +54,14 @@ func TestRegistryExecute(t *testing.T) {
 
 func TestRegistryRegisterUpsert(t *testing.T) {
 	r := newRegistry()
-	r.register(Skill{Name: "foo", Description: "first"}, func(map[string]any) (any, error) {
+	r.register(Skill{Name: "foo", Description: "first"}, func(context.Context, map[string]any) (any, error) {
 		return "v1", nil
 	})
 	if n := len(r.list()); n != 1 {
 		t.Fatalf("list len = %d, want 1", n)
 	}
 
-	r.register(Skill{Name: "foo", Description: "second"}, func(map[string]any) (any, error) {
+	r.register(Skill{Name: "foo", Description: "second"}, func(context.Context, map[string]any) (any, error) {
 		return "v2", nil
 	})
 
@@ -71,7 +72,7 @@ func TestRegistryRegisterUpsert(t *testing.T) {
 	if got[0].Description != "second" {
 		t.Fatalf("schema not replaced: Description = %q, want second", got[0].Description)
 	}
-	res, err := r.execute("foo", nil)
+	res, err := r.execute(context.Background(), "foo", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -82,8 +83,8 @@ func TestRegistryRegisterUpsert(t *testing.T) {
 
 func TestRegistryUnregister(t *testing.T) {
 	r := newRegistry()
-	r.register(Skill{Name: "foo"}, func(map[string]any) (any, error) { return 1, nil })
-	r.register(Skill{Name: "bar"}, func(map[string]any) (any, error) { return 2, nil })
+	r.register(Skill{Name: "foo"}, func(context.Context, map[string]any) (any, error) { return 1, nil })
+	r.register(Skill{Name: "bar"}, func(context.Context, map[string]any) (any, error) { return 2, nil })
 
 	r.unregister("foo")
 
@@ -94,7 +95,7 @@ func TestRegistryUnregister(t *testing.T) {
 	if got[0].Name != "bar" {
 		t.Fatalf("remaining skill = %q, want bar", got[0].Name)
 	}
-	if _, err := r.execute("foo", nil); err == nil {
+	if _, err := r.execute(context.Background(), "foo", nil); err == nil {
 		t.Fatal("expected errNotFound after unregister, got nil")
 	}
 
@@ -112,7 +113,7 @@ func TestRegistryList(t *testing.T) {
 
 	names := []string{"a", "b", "c"}
 	for _, n := range names {
-		r.register(Skill{Name: n}, func(map[string]any) (any, error) { return nil, nil })
+		r.register(Skill{Name: n}, func(context.Context, map[string]any) (any, error) { return nil, nil })
 	}
 
 	got := r.list()

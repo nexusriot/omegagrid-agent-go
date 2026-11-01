@@ -2,11 +2,13 @@ package httpapi
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/nexusriot/omegagrid-agent-go/internal/agent"
+	"github.com/nexusriot/omegagrid-agent-go/internal/skills"
 )
 
 // handleListSkills returns all skills registered in the in-process skill registry.
@@ -39,7 +41,7 @@ func (d *Deps) handleSkillInvoke(w http.ResponseWriter, r *http.Request) {
 	}
 
 	t0 := time.Now()
-	result, execErr := d.Skills.Execute(name, body.Args)
+	result, execErr := d.Skills.ExecuteContext(r.Context(), name, body.Args)
 	elapsed := time.Since(t0).Seconds()
 
 	var errMsg *string
@@ -83,4 +85,79 @@ func (d *Deps) handleListTools(w http.ResponseWriter, _ *http.Request) {
 			},
 		},
 	})
+}
+
+// handleSkillSource returns a markdown skill's file content.
+func (d *Deps) handleSkillSource(w http.ResponseWriter, r *http.Request) {
+	name := chi.URLParam(r, "name")
+	content, err := d.Skills.SkillSource(name)
+	if errors.Is(err, skills.ErrNotMarkdown) {
+		writeError(w, http.StatusNotFound, "no markdown skill named "+name)
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"name": name, "content": content})
+}
+
+type skillSourceRequest struct {
+	Content string `json:"content"`
+}
+
+// handleSkillValidate parses a markdown skill without saving it — the
+// editor's live check.
+func (d *Deps) handleSkillValidate(w http.ResponseWriter, r *http.Request) {
+	var req skillSourceRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	sch, err := d.Skills.ValidateSkillSource(req.Content)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "skill": sch})
+}
+
+// handleSkillSave writes a markdown skill and hot-registers it. Like the
+// playground (and skill_creator through it) this adds code paths the agent
+// can call, so it shares the PLAYGROUND_DISABLED switch.
+func (d *Deps) handleSkillSave(w http.ResponseWriter, r *http.Request) {
+	if !d.Cfg.PlaygroundEnabled {
+		writeError(w, http.StatusForbidden, "skill editing is disabled with the playground (PLAYGROUND_DISABLED)")
+		return
+	}
+	var req skillSourceRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	sch, created, err := d.Skills.SaveSkillSource(req.Content)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "skill": sch, "created": created})
+}
+
+// handleSkillDelete removes a markdown skill.
+func (d *Deps) handleSkillDelete(w http.ResponseWriter, r *http.Request) {
+	if !d.Cfg.PlaygroundEnabled {
+		writeError(w, http.StatusForbidden, "skill editing is disabled with the playground (PLAYGROUND_DISABLED)")
+		return
+	}
+	name := chi.URLParam(r, "name")
+	err := d.Skills.DeleteMarkdownSkill(name)
+	if errors.Is(err, skills.ErrNotMarkdown) {
+		writeError(w, http.StatusNotFound, "no markdown skill named "+name)
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "deleted": name})
 }

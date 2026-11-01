@@ -93,7 +93,7 @@ func (d *Deps) handleReplayInvocation(w http.ResponseWriter, r *http.Request) {
 	}
 
 	t0 := time.Now()
-	result, execErr := d.Skills.Execute(rec.Skill, args)
+	result, execErr := d.Skills.ExecuteContext(r.Context(), rec.Skill, args)
 	elapsed := time.Since(t0)
 
 	errMsg := ""

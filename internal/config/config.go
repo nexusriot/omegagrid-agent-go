@@ -61,25 +61,46 @@ type Config struct {
 	OpenCodeTimeoutSec float64
 
 	// Memory / vector store
-	AgentDB          string
-	VectorDir        string
-	VectorCollection string
-	DedupDistance    float64
-	OllamaEmbedModel string
-	OpenAIEmbedModel string
+	AgentDB              string
+	VectorDir            string
+	VectorCollection     string
+	MemoryDefaultTTLDays float64 // 0 = memories never expire unless asked to
+	DedupDistance        float64
+	OllamaEmbedModel     string
+	OpenAIEmbedModel     string
 	// EmbedProvider selects the embeddings backend independently of Provider.
 	// Defaults to Provider; set EMBED_PROVIDER when the chat provider has no
 	// embeddings endpoint of its own (opencode) or you want a cheaper one.
 	EmbedProvider string
 
 	// Skills
-	SkillsDir           string
-	SkillHTTPTimeout    float64
-	SkillShellEnabled   bool
-	SkillSSHEnabled     bool
-	SkillSSHPrivKey     string // PEM or base64-encoded PEM
-	SkillSSHDefaultUser string
-	SkillSSHIdentFile   string
+	SkillsDir                 string
+	SkillHTTPTimeout          float64
+	SkillShellEnabled         bool
+	SkillShellSandbox         string // none | bwrap
+	SkillShellSandboxNetwork  bool
+	SkillShellSandboxWritable string
+	SkillSSHKnownHosts        string
+	SkillWorkspaceDir         string  // file_* / pdf_text root
+	SkillWorkspaceMaxMB       float64 // total size cap for file_write
+	SkillGitHubToken          string  // optional, raises the github skill's rate limit
+
+	// notify skill: every channel is off until configured, and recipients are
+	// allowlisted — the model picks among them, never an arbitrary address.
+	NotifyTelegramChats       []string // allowed chat ids
+	NotifyTelegramDefaultChat string
+	NotifyEmailTo             []string // allowed addresses, or "@domain"
+	NotifySMTPHost            string
+	NotifySMTPPort            int
+	NotifySMTPUser            string
+	NotifySMTPPassword        string
+	NotifySMTPFrom            string
+	NotifyWebhooks            []string // "name=url" entries
+	SkillSSHHostKeyPolicy     string   // accept-new | strict | insecure
+	SkillSSHEnabled           bool
+	SkillSSHPrivKey           string // PEM or base64-encoded PEM
+	SkillSSHDefaultUser       string
+	SkillSSHIdentFile         string
 	// SkillBlockPrivateNetworks stops outbound skills (http_request,
 	// port_scan, markdown endpoints, ...) from reaching loopback, RFC1918/ULA
 	// and CGNAT addresses. It is the inverse of SKILL_ALLOW_PRIVATE_NETWORKS,
@@ -94,6 +115,7 @@ type Config struct {
 	AgentMaxSteps      int
 	AgentParallelTools bool
 	AgentMaxParallel   int
+	AgentToolMode      string // auto | native | envelope
 
 	// Auto-memory extraction (post-turn fact distillation into vector memory)
 	AutoMemoryExtract      bool
@@ -114,10 +136,13 @@ type Config struct {
 	// MCP (Model Context Protocol)
 	MCPServerEnabled bool     // expose skills as MCP tools at /mcp
 	MCPServers       []string // remote MCP servers to consume: "name=url" entries
+	MCPConnectWait   float64  // seconds startup waits for MCP_SERVERS to connect
+	MCPRefreshSec    float64  // re-list remote tools this often; 0 = never
 
 	// HTTP API access control
 	APIToken           string   // when set, /api/* and /mcp require "Authorization: Bearer <token>"
 	CORSAllowedOrigins []string // cross-origin callers allowed to use the API; empty = same-origin only
+	AllowedHosts       []string // extra dotted Host names accepted while APIToken is empty (DNS-rebinding guard)
 }
 
 func Load() Config {
@@ -137,6 +162,7 @@ func Load() Config {
 		OpenAIReasoning:           strings.ToLower(strings.TrimSpace(os.Getenv("OPENAI_REASONING_EFFORT"))),
 		VectorCollection:          getOr(os.Getenv("AGENT_VECTOR_COLLECTION"), "memories"),
 		DedupDistance:             atofOr(os.Getenv("AGENT_DEDUP_DISTANCE"), 0.08),
+		MemoryDefaultTTLDays:      atofOr(os.Getenv("MEMORY_DEFAULT_TTL_DAYS"), 0),
 		OllamaEmbedModel:          getOr(os.Getenv("OLLAMA_EMBED_MODEL"), "nomic-embed-text"),
 		OpenAIEmbedModel:          getOr(os.Getenv("OPENAI_EMBED_MODEL"), "text-embedding-3-small"),
 		DigitalOceanAPIKey:        os.Getenv("DIGITALOCEAN_API_KEY"),
@@ -151,6 +177,10 @@ func Load() Config {
 		EmbedProvider:             strings.ToLower(strings.TrimSpace(os.Getenv("EMBED_PROVIDER"))),
 		SkillHTTPTimeout:          atofOr(os.Getenv("SKILL_HTTP_TIMEOUT"), 30),
 		SkillShellEnabled:         isTruthy(os.Getenv("SKILL_SHELL_ENABLED")),
+		SkillShellSandbox:         strings.ToLower(getOr(strings.TrimSpace(os.Getenv("SKILL_SHELL_SANDBOX")), "none")),
+		SkillShellSandboxNetwork:  isTruthy(os.Getenv("SKILL_SHELL_SANDBOX_NETWORK")),
+		SkillShellSandboxWritable: strings.TrimSpace(os.Getenv("SKILL_SHELL_SANDBOX_WRITABLE")),
+		SkillSSHHostKeyPolicy:     strings.ToLower(getOr(strings.TrimSpace(os.Getenv("SKILL_SSH_HOST_KEY_POLICY")), "accept-new")),
 		SkillSSHEnabled:           isTruthy(os.Getenv("SKILL_SSH_ENABLED")),
 		SkillSSHPrivKey:           os.Getenv("SKILL_SSH_PRIVATE_KEY"),
 		SkillSSHDefaultUser:       getOr(os.Getenv("SKILL_SSH_DEFAULT_USER"), "root"),
@@ -161,6 +191,7 @@ func Load() Config {
 		AgentMaxSteps:             atoiOr(os.Getenv("AGENT_MAX_STEPS"), 25),
 		AgentParallelTools:        isTruthy(os.Getenv("AGENT_PARALLEL_TOOLS")),
 		AgentMaxParallel:          atoiOr(os.Getenv("AGENT_MAX_PARALLEL"), 4),
+		AgentToolMode:             strings.ToLower(getOr(strings.TrimSpace(os.Getenv("AGENT_TOOL_MODE")), "auto")),
 		AutoMemoryExtract:         isTruthy(os.Getenv("AUTO_MEMORY_EXTRACT")),
 		AutoMemoryMaxFacts:        atoiOr(os.Getenv("AUTO_MEMORY_MAX_FACTS"), 5),
 		AutoMemoryMinAnswerLen:    atoiOr(os.Getenv("AUTO_MEMORY_MIN_ANSWER_LEN"), 80),
@@ -170,13 +201,29 @@ func Load() Config {
 		AuditMaxBlobBytes:         atoiOr(os.Getenv("AUDIT_MAX_BLOB_BYTES"), 65536),
 		MCPServerEnabled:          !isTruthy(os.Getenv("MCP_SERVER_DISABLED")),
 		MCPServers:                splitCSV(os.Getenv("MCP_SERVERS")),
+		MCPConnectWait:            atofOr(os.Getenv("MCP_CONNECT_WAIT_SEC"), 10),
+		MCPRefreshSec:             atofOr(os.Getenv("MCP_REFRESH_SEC"), 300),
 		APIToken:                  strings.TrimSpace(os.Getenv("GATEWAY_API_TOKEN")),
 		CORSAllowedOrigins:        splitCSV(os.Getenv("CORS_ALLOWED_ORIGINS")),
+		AllowedHosts:              splitCSV(os.Getenv("GATEWAY_ALLOWED_HOSTS")),
 	}
 	c.AgentDB = getOr(os.Getenv("AGENT_DB"), dataDir+"/agent_memory.sqlite3")
 	c.VectorDir = getOr(os.Getenv("AGENT_VECTOR_DIR"), dataDir+"/chromem")
 	c.SkillsDir = getOr(os.Getenv("SKILLS_DIR"), dataDir+"/skills")
 	c.SchedulerDB = getOr(os.Getenv("SCHEDULER_DB"), dataDir+"/scheduler.sqlite3")
+	c.SkillSSHKnownHosts = getOr(os.Getenv("SKILL_SSH_KNOWN_HOSTS"), dataDir+"/ssh_known_hosts")
+	c.SkillWorkspaceDir = getOr(os.Getenv("SKILL_WORKSPACE_DIR"), dataDir+"/workspace")
+	c.SkillWorkspaceMaxMB = atofOr(os.Getenv("SKILL_WORKSPACE_MAX_MB"), 100)
+	c.SkillGitHubToken = strings.TrimSpace(firstOf(os.Getenv("SKILL_GITHUB_TOKEN"), os.Getenv("GITHUB_TOKEN")))
+	c.NotifyTelegramChats = splitCSV(os.Getenv("NOTIFY_TELEGRAM_CHATS"))
+	c.NotifyTelegramDefaultChat = strings.TrimSpace(os.Getenv("NOTIFY_TELEGRAM_DEFAULT_CHAT"))
+	c.NotifyEmailTo = splitCSV(os.Getenv("NOTIFY_EMAIL_TO"))
+	c.NotifySMTPHost = strings.TrimSpace(os.Getenv("NOTIFY_SMTP_HOST"))
+	c.NotifySMTPPort = atoiOr(os.Getenv("NOTIFY_SMTP_PORT"), 587)
+	c.NotifySMTPUser = os.Getenv("NOTIFY_SMTP_USER")
+	c.NotifySMTPPassword = os.Getenv("NOTIFY_SMTP_PASSWORD")
+	c.NotifySMTPFrom = strings.TrimSpace(os.Getenv("NOTIFY_SMTP_FROM"))
+	c.NotifyWebhooks = splitCSV(os.Getenv("NOTIFY_WEBHOOKS"))
 	c.OpenAITemperature = parseTemperature(os.Getenv("OPENAI_TEMPERATURE"))
 
 	// Default chat model + api mode resolution
@@ -281,9 +328,11 @@ func firstOf(vals ...string) string {
 	return ""
 }
 
+// isTruthy accepts the same spellings isFalsy rejects. "on" was missing, so
+// PLAYGROUND_DISABLED=on / MCP_SERVER_DISABLED=on left those surfaces enabled.
 func isTruthy(v string) bool {
 	v = strings.ToLower(strings.TrimSpace(v))
-	return v == "true" || v == "1" || v == "yes"
+	return v == "true" || v == "1" || v == "yes" || v == "on"
 }
 
 // isFalsy is isTruthy's counterpart for settings that default to on: only an

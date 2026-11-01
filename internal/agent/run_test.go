@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"encoding/base64"
 	"sort"
 	"strings"
@@ -27,7 +28,7 @@ func (r *recordingSkill) native(name string) Skill {
 			Description: "test skill",
 			Parameters:  map[string]skills.Param{"x": {Type: "string", Required: true}},
 		},
-		Execute: func(args map[string]any) (any, error) {
+		Execute: func(_ context.Context, args map[string]any) (any, error) {
 			r.mu.Lock()
 			r.calls = append(r.calls, args)
 			r.mu.Unlock()

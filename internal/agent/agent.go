@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -33,6 +34,7 @@ const systemPromptTemplate = `You are a compact tool-using agent.
 You have tools:
 - vector_add(text, meta={...})  -- store a durable fact / decision / preference
 - vector_search(query, k=5)      -- semantic search over stored memories
+- session_search(query)          -- keyword search over earlier conversations
 %s
 
 You must ALWAYS output STRICT JSON, in one of the two forms:
@@ -106,8 +108,11 @@ type Attachment struct {
 // Skill is the tool-table entry.  Built-ins (vector_add, vector_search,
 // schedule_task) and Python sidecar skills are merged into one map.
 type Skill struct {
-	Schema  skills.Skill                           // schema for the system prompt
-	Execute func(args map[string]any) (any, error) // dispatch
+	Schema skills.Skill // schema for the system prompt
+	// Execute runs the tool. ctx is the run's context: it is cancelled when
+	// the caller goes away (SSE client disconnect, HTTP request end, gateway
+	// shutdown), and skills that wait on the network or a process stop.
+	Execute func(ctx context.Context, args map[string]any) (any, error)
 }
 
 // Service is the agent.  It has no per-request state — all dependencies are
@@ -122,6 +127,14 @@ type Service struct {
 	ParallelEnabled bool
 	MaxParallel     int
 
+	// ToolMode selects how the model calls tools: "envelope" (it writes the
+	// JSON envelope as text), "native" (the provider's function-calling API)
+	// or "auto" / "" (native when the chat client supports it; the first
+	// "tools unsupported" rejection switches the process to envelope mode).
+	ToolMode string
+	// nativeOff latches auto mode to envelope after the backend refused tools.
+	nativeOff atomic.Bool
+
 	// Auto-memory extraction: when enabled, a background goroutine distils
 	// each successful final answer into durable facts stored in vector memory.
 	AutoMemoryExtract      bool
@@ -135,6 +148,10 @@ type RunRequest struct {
 	SessionID      int
 	MaxSteps       int
 	TelegramChatID *int64
+	// Namespace scopes the run's memory: memories it stores go into this
+	// namespace, and it recalls from this namespace plus the shared default
+	// one. "" is the shared namespace.
+	Namespace string
 }
 
 // RunResult is what Run returns (mirrors the Python dict).
@@ -172,7 +189,7 @@ func (s *Service) Run(req RunRequest) (*RunResult, error) {
 // disconnected, the gateway is shutting down) the in-flight LLM call is
 // aborted and no further steps or tool calls are started.
 func (s *Service) RunContext(ctx context.Context, req RunRequest) (*RunResult, error) {
-	state, err := s.startSession(req)
+	state, err := s.startSession(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -182,7 +199,7 @@ func (s *Service) RunContext(ctx context.Context, req RunRequest) (*RunResult, e
 			return nil, err
 		}
 		state.debug = append(state.debug, fmt.Sprintf("[agent] step=%d", step))
-		raw, llmS, err := llm.Complete(ctx, s.Chat, state.messages)
+		data, raw, llmS, err := s.nextMove(ctx, state)
 		if err != nil {
 			return nil, fmt.Errorf("llm complete: %w", err)
 		}
@@ -190,8 +207,7 @@ func (s *Service) RunContext(ctx context.Context, req RunRequest) (*RunResult, e
 		state.debug = append(state.debug, fmt.Sprintf("[llm] chat_s=%.4f", llmS))
 		state.debug = append(state.debug, fmt.Sprintf("[llm] raw=%s", truncate(raw, 300)))
 
-		data, err := parseJSONSafely(raw)
-		if err != nil {
+		if data == nil {
 			// Treat parse failure as "fallback final answer".
 			answer := "I had trouble processing that request. Please try rephrasing."
 			_ = s.Memory.AddMessage(state.sid, "assistant", answer)
@@ -203,7 +219,7 @@ func (s *Service) RunContext(ctx context.Context, req RunRequest) (*RunResult, e
 		if respType == "final" {
 			answer := finalAnswer(data)
 			_ = s.Memory.AddMessage(state.sid, "assistant", answer)
-			s.maybeExtractMemories(state.sid, req.Query, answer)
+			s.maybeExtractMemories(state.sid, state.namespace, req.Query, answer)
 			return s.fallbackResult(state, answer, step, false), nil
 		}
 
@@ -225,7 +241,7 @@ func (s *Service) RunContext(ctx context.Context, req RunRequest) (*RunResult, e
 			results := s.executeBatch(state, calls)
 			for _, r := range results {
 				state.attachments = append(state.attachments, r.Atts...)
-				_ = s.Memory.AddMessage(state.sid, "tool", r.Result)
+				_ = s.Memory.AddMessage(state.sid, "tool", historyResult(r.Call.Name, r.Result))
 				if state.skillNames[r.Call.Name] {
 					state.timings["skill_s_total"] += r.Elapsed
 				} else {
@@ -233,20 +249,8 @@ func (s *Service) RunContext(ctx context.Context, req RunRequest) (*RunResult, e
 				}
 				state.debug = append(state.debug, fmt.Sprintf("[batch] %s (%.3fs): %s", r.Call.Name, r.Elapsed, debugResult(r.Call.Name, r.Result, 200)))
 			}
-			batchJSON, _ := json.Marshal(data)
-			var allResults []any
-			for _, r := range results {
-				allResults = append(allResults, r.Result)
-			}
-			allJSON, err := json.Marshal(allResults)
-			if err != nil {
-				allJSON = []byte(`{"error":"marshal failed"}`)
-			}
-			state.messages = append(state.messages,
-				llm.Message{Role: "assistant", Content: string(batchJSON)},
-				llm.Message{Role: "tool", Content: capToolContent(string(allJSON))},
-				llm.Message{Role: "user", Content: batchFollowup(results, dropped)},
-			)
+			state.messages = append(state.messages, toolTurn(state, data, results)...)
+			state.messages = append(state.messages, llm.Message{Role: "user", Content: batchFollowup(results, dropped)})
 			continue
 		}
 
@@ -264,6 +268,7 @@ func (s *Service) RunContext(ctx context.Context, req RunRequest) (*RunResult, e
 			args = map[string]any{}
 		}
 		why, _ := data["why"].(string)
+		callID, _ := data["id"].(string)
 
 		isSkill := state.skillNames[toolName]
 		kind := "tool"
@@ -274,7 +279,7 @@ func (s *Service) RunContext(ctx context.Context, req RunRequest) (*RunResult, e
 			fmt.Sprintf("[%s] >>> CALL %s(%s) reason=%s", kind, toolName, truncateJSON(eventArgs(toolName, args), 200), nonempty(why, "-")),
 		)
 
-		br := s.runOne(state, batchCall{Name: toolName, Args: args, Why: why, Step: step})
+		br := s.runOne(state, batchCall{ID: callID, Name: toolName, Args: args, Why: why, Step: step})
 		result := br.Result
 		elapsed := br.Elapsed
 		state.attachments = append(state.attachments, br.Atts...)
@@ -286,21 +291,9 @@ func (s *Service) RunContext(ctx context.Context, req RunRequest) (*RunResult, e
 		state.timings[key] += elapsed
 		state.debug = append(state.debug, fmt.Sprintf("[%s] <<< RESULT (%.3fs): %s", kind, elapsed, debugResult(toolName, result, 300)))
 
-		_ = s.Memory.AddMessage(state.sid, "tool", result)
-		var assistantJSON, toolJSON []byte
-		if assistantJSON, err = json.Marshal(data); err != nil {
-			assistantJSON = []byte(`{"type":"tool_call"}`)
-			state.debug = append(state.debug, fmt.Sprintf("[agent] marshal tool_call: %v", err))
-		}
-		if toolJSON, err = json.Marshal(result); err != nil {
-			toolJSON = []byte(`{"error":"marshal failed"}`)
-			state.debug = append(state.debug, fmt.Sprintf("[agent] marshal tool_result: %v", err))
-		}
-		state.messages = append(state.messages,
-			llm.Message{Role: "assistant", Content: string(assistantJSON)},
-			llm.Message{Role: "tool", Content: capToolContent(string(toolJSON))},
-			llm.Message{Role: "user", Content: toolFollowup(toolName, result)},
-		)
+		_ = s.Memory.AddMessage(state.sid, "tool", historyResult(toolName, result))
+		state.messages = append(state.messages, toolTurn(state, data, []batchResult{br})...)
+		state.messages = append(state.messages, llm.Message{Role: "user", Content: toolFollowup(toolName, result)})
 	}
 
 	answer := "I could not finish within max_steps. Please refine the goal or increase max_steps."
@@ -332,7 +325,7 @@ func (s *Service) RunStream(ctx context.Context, req RunRequest, out chan<- Even
 		}
 	}
 
-	state, err := s.startSession(req)
+	state, err := s.startSession(ctx, req)
 	if err != nil {
 		send(Event{Event: "error", Error: err.Error()})
 		return
@@ -347,15 +340,14 @@ func (s *Service) RunStream(ctx context.Context, req RunRequest, out chan<- Even
 			return
 		}
 
-		raw, llmS, err := llm.Complete(ctx, s.Chat, state.messages)
+		data, _, llmS, err := s.nextMove(ctx, state)
 		if err != nil {
 			send(Event{Event: "error", Error: err.Error()})
 			return
 		}
 		state.timings["llm_chat_s_total"] += llmS
 
-		data, err := parseJSONSafely(raw)
-		if err != nil {
+		if data == nil {
 			// Same graceful recovery as Run: a model that emits non-JSON is a
 			// bad reply, not a broken agent. Emitting "error" here instead left
 			// the web UI and the Telegram bot showing a raw parser message
@@ -379,7 +371,7 @@ func (s *Service) RunStream(ctx context.Context, req RunRequest, out chan<- Even
 		if respType == "final" {
 			answer := finalAnswer(data)
 			_ = s.Memory.AddMessage(state.sid, "assistant", answer)
-			s.maybeExtractMemories(state.sid, req.Query, answer)
+			s.maybeExtractMemories(state.sid, state.namespace, req.Query, answer)
 			send(Event{
 				Event:       "final",
 				SessionID:   state.sid,
@@ -413,30 +405,18 @@ func (s *Service) RunStream(ctx context.Context, req RunRequest, out chan<- Even
 			results := s.executeBatch(state, calls)
 			for _, r := range results {
 				state.attachments = append(state.attachments, r.Atts...)
-				_ = s.Memory.AddMessage(state.sid, "tool", r.Result)
+				_ = s.Memory.AddMessage(state.sid, "tool", historyResult(r.Call.Name, r.Result))
 				if state.skillNames[r.Call.Name] {
 					state.timings["skill_s_total"] += r.Elapsed
 				} else {
 					state.timings["tool_s_total"] += r.Elapsed
 				}
-				if !send(Event{Event: "tool_result", Step: step, Tool: r.Call.Name, Result: truncate(fmt.Sprint(r.Result), 300), ElapsedS: round3(r.Elapsed)}) {
+				if !send(Event{Event: "tool_result", Step: step, Tool: r.Call.Name, Result: debugResult(r.Call.Name, r.Result, 300), ElapsedS: round3(r.Elapsed)}) {
 					return
 				}
 			}
-			batchJSON, _ := json.Marshal(data)
-			var allResults []any
-			for _, r := range results {
-				allResults = append(allResults, r.Result)
-			}
-			allJSON, err := json.Marshal(allResults)
-			if err != nil {
-				allJSON = []byte(`{"error":"marshal failed"}`)
-			}
-			state.messages = append(state.messages,
-				llm.Message{Role: "assistant", Content: string(batchJSON)},
-				llm.Message{Role: "tool", Content: capToolContent(string(allJSON))},
-				llm.Message{Role: "user", Content: batchFollowup(results, dropped)},
-			)
+			state.messages = append(state.messages, toolTurn(state, data, results)...)
+			state.messages = append(state.messages, llm.Message{Role: "user", Content: batchFollowup(results, dropped)})
 			continue
 		}
 
@@ -462,11 +442,12 @@ func (s *Service) RunStream(ctx context.Context, req RunRequest, out chan<- Even
 			args = map[string]any{}
 		}
 		why, _ := data["why"].(string)
+		callID, _ := data["id"].(string)
 		if !send(Event{Event: "tool_call", Step: step, Tool: toolName, Args: eventArgs(toolName, args), Why: why}) {
 			return
 		}
 
-		br := s.runOne(state, batchCall{Name: toolName, Args: args, Why: why, Step: step})
+		br := s.runOne(state, batchCall{ID: callID, Name: toolName, Args: args, Why: why, Step: step})
 		result := br.Result
 		elapsed := br.Elapsed
 		state.attachments = append(state.attachments, br.Atts...)
@@ -477,23 +458,13 @@ func (s *Service) RunStream(ctx context.Context, req RunRequest, out chan<- Even
 		}
 		state.timings[key] += elapsed
 
-		if !send(Event{Event: "tool_result", Step: step, Tool: toolName, Result: truncate(fmt.Sprint(result), 300), ElapsedS: round3(elapsed)}) {
+		if !send(Event{Event: "tool_result", Step: step, Tool: toolName, Result: debugResult(toolName, result, 300), ElapsedS: round3(elapsed)}) {
 			return
 		}
 
-		_ = s.Memory.AddMessage(state.sid, "tool", result)
-		var assistantJSON, toolJSON []byte
-		if assistantJSON, err = json.Marshal(data); err != nil {
-			assistantJSON = []byte(`{"type":"tool_call"}`)
-		}
-		if toolJSON, err = json.Marshal(result); err != nil {
-			toolJSON = []byte(`{"error":"marshal failed"}`)
-		}
-		state.messages = append(state.messages,
-			llm.Message{Role: "assistant", Content: string(assistantJSON)},
-			llm.Message{Role: "tool", Content: capToolContent(string(toolJSON))},
-			llm.Message{Role: "user", Content: toolFollowup(toolName, result)},
-		)
+		_ = s.Memory.AddMessage(state.sid, "tool", historyResult(toolName, result))
+		state.messages = append(state.messages, toolTurn(state, data, []batchResult{br})...)
+		state.messages = append(state.messages, llm.Message{Role: "user", Content: toolFollowup(toolName, result)})
 	}
 
 	answer := "I could not finish within max_steps. Please refine the goal or increase max_steps."
@@ -504,6 +475,8 @@ func (s *Service) RunStream(ctx context.Context, req RunRequest, out chan<- Even
 }
 
 type runState struct {
+	ctx         context.Context
+	namespace   string
 	sid         int
 	timings     map[string]float64
 	timer       *observability.Timer
@@ -514,9 +487,13 @@ type runState struct {
 	tools       map[string]Skill
 	skillNames  map[string]bool
 	toolNames   map[string]bool // includes built-in tools, used by normalizeToolCall
+	// native is set when this run talks to the model through its native
+	// tool-calling API; toolSpecs is the tool table in that API's shape.
+	native    bool
+	toolSpecs []llm.ToolSpec
 }
 
-func (s *Service) startSession(req RunRequest) (*runState, error) {
+func (s *Service) startSession(ctx context.Context, req RunRequest) (*runState, error) {
 	timer := observability.NewTimer()
 	sid := req.SessionID
 	if sid == 0 {
@@ -527,10 +504,12 @@ func (s *Service) startSession(req RunRequest) (*runState, error) {
 		sid = newSid
 	}
 	st := &runState{
-		sid:     sid,
-		timer:   timer,
-		timings: map[string]float64{},
-		debug:   []string{},
+		ctx:       ctx,
+		namespace: req.Namespace,
+		sid:       sid,
+		timer:     timer,
+		timings:   map[string]float64{},
+		debug:     []string{},
 	}
 
 	// Tail of prior conversation — loaded BEFORE the current query is stored,
@@ -547,8 +526,11 @@ func (s *Service) startSession(req RunRequest) (*runState, error) {
 	}
 	timer.Mark("sqlite_add_user_s")
 
-	// Initial vector search
-	if search, err := s.Memory.SearchMemory(req.Query, s.MemoryHits); err == nil {
+	// Initial vector search. AGENT_MEMORY_HITS=0 turns injection off; the
+	// store's own default (5) would otherwise quietly apply.
+	if s.MemoryHits <= 0 {
+		st.debug = append(st.debug, "[memory] injection disabled (AGENT_MEMORY_HITS<=0)")
+	} else if search, err := s.Memory.SearchMemoryIn(req.Query, s.MemoryHits, recallNamespaces(req.Namespace)); err == nil {
 		st.memories = search.Hits
 		for k, v := range search.Timings {
 			st.timings["vector_search_"+k] = v
@@ -569,8 +551,13 @@ func (s *Service) startSession(req RunRequest) (*runState, error) {
 		"vector_search": true,
 	}
 	st.tools["vector_add"] = Skill{
-		Schema: skills.Skill{Name: "vector_add", Description: "Store a durable fact / decision / preference"},
-		Execute: func(args map[string]any) (any, error) {
+		Schema: skills.Skill{Name: "vector_add", Description: "Store a durable fact / decision / preference",
+			Parameters: map[string]skills.Param{
+				"text":     {Type: "string", Description: "The fact to remember", Required: true},
+				"meta":     {Type: "object", Description: "Optional metadata (tags, source)"},
+				"ttl_days": {Type: "number", Description: "Forget it after this many days (omit for the default lifetime)"},
+			}},
+		Execute: func(_ context.Context, args map[string]any) (any, error) {
 			text, _ := args["text"].(string)
 			// Copy rather than mutate: args is the model's envelope, which the
 			// stream handler may be JSON-encoding concurrently (tool_call event).
@@ -580,7 +567,11 @@ func (s *Service) startSession(req RunRequest) (*runState, error) {
 			if _, ok := meta["session_id"]; !ok {
 				meta["session_id"] = sid
 			}
-			res, err := s.Memory.AddMemory(text, meta)
+			opts := memory.AddOptions{Namespace: req.Namespace}
+			if d := asFloat(args["ttl_days"]); d > 0 {
+				opts.TTL = time.Duration(d * float64(24*time.Hour))
+			}
+			res, err := s.Memory.AddMemoryOpts(text, meta, opts)
 			if err != nil {
 				return nil, err
 			}
@@ -588,8 +579,12 @@ func (s *Service) startSession(req RunRequest) (*runState, error) {
 		},
 	}
 	st.tools["vector_search"] = Skill{
-		Schema: skills.Skill{Name: "vector_search", Description: "Semantic search over stored memories"},
-		Execute: func(args map[string]any) (any, error) {
+		Schema: skills.Skill{Name: "vector_search", Description: "Semantic search over stored memories",
+			Parameters: map[string]skills.Param{
+				"query": {Type: "string", Description: "What to look for", Required: true},
+				"k":     {Type: "number", Description: "Number of results (default 5)"},
+			}},
+		Execute: func(_ context.Context, args map[string]any) (any, error) {
 			query, _ := args["query"].(string)
 			if query == "" {
 				query, _ = args["q"].(string)
@@ -604,13 +599,37 @@ func (s *Service) startSession(req RunRequest) (*runState, error) {
 					k = 5
 				}
 			}
-			res, err := s.Memory.SearchMemory(query, k)
+			res, err := s.Memory.SearchMemoryIn(query, k, recallNamespaces(req.Namespace))
 			if err != nil {
 				return nil, err
 			}
 			return map[string]any{"hits": res.Hits}, nil
 		},
 	}
+
+	st.tools["session_search"] = Skill{
+		Schema: skills.Skill{Name: "session_search", Description: "Search earlier conversations (not this one) for messages containing all the given words; " +
+			"use it when the user refers to something discussed before that was not stored with vector_add",
+			Parameters: map[string]skills.Param{
+				"query": {Type: "string", Description: "Words to look for", Required: true},
+				"limit": {Type: "number", Description: "Max messages (default 10, max 50)"},
+			}},
+		Execute: func(_ context.Context, args map[string]any) (any, error) {
+			query, _ := args["query"].(string)
+			if strings.TrimSpace(query) == "" {
+				return map[string]any{"hits": []any{}, "error": "query is required"}, nil
+			}
+			hits, err := s.Memory.SearchMessages(query, int(asFloat(args["limit"])), sid)
+			if err != nil {
+				return nil, err
+			}
+			if hits == nil {
+				hits = []memory.MessageHit{}
+			}
+			return map[string]any{"count": len(hits), "hits": hits}, nil
+		},
+	}
+	st.toolNames["session_search"] = true
 
 	// Sidecar (Python) skills
 	for _, sk := range skillList {
@@ -622,8 +641,8 @@ func (s *Service) startSession(req RunRequest) (*runState, error) {
 		skCopy := sk
 		st.tools[name] = Skill{
 			Schema: skCopy,
-			Execute: func(args map[string]any) (any, error) {
-				return s.Skills.Execute(skCopy.Name, args)
+			Execute: func(ctx context.Context, args map[string]any) (any, error) {
+				return s.Skills.ExecuteContext(ctx, skCopy.Name, args)
 			},
 		}
 		st.skillNames[name] = true
@@ -640,6 +659,11 @@ func (s *Service) startSession(req RunRequest) (*runState, error) {
 	st.debug = append(st.debug, fmt.Sprintf("[init] skills_count=%d", len(st.skillNames)))
 
 	systemPrompt := s.buildSystemPrompt(st.tools, st.skillNames)
+	if _, ok := s.Chat.(llm.ToolChatClient); ok && s.nativeWanted() {
+		st.native = true
+		st.toolSpecs = toolSpecs(st.tools)
+		systemPrompt += nativeAddendum
+	}
 	// Current time lets the LLM convert relative/local times ("at 3pm",
 	// "in 20 minutes") into UTC cron expressions for schedule_task without
 	// a datetime_skill round-trip. The scheduler evaluates cron in UTC.
@@ -681,11 +705,24 @@ func (s *Service) buildMeta(st *runState, step int, fallback bool) map[string]an
 		"timings":    st.timings,
 		"step_count": step,
 		"model":      s.Chat.Model(),
+		"tool_mode":  "envelope",
+	}
+	if st.native {
+		out["tool_mode"] = "native"
 	}
 	if fallback {
 		out["fallback"] = true
 	}
 	return out
+}
+
+// recallNamespaces is what a run in namespace ns may read: its own memories
+// plus the shared default namespace.
+func recallNamespaces(ns string) []string {
+	if ns == "" {
+		return []string{""}
+	}
+	return []string{ns, ""}
 }
 
 // sensitiveSkills have their args and result redacted in the audit log. The
@@ -702,8 +739,10 @@ var sensitiveSkills = map[string]bool{
 // eventArgs returns the args to publish in a tool_call event or debug line.
 // It is a deep copy: the live map is handed to the tool, which may run while
 // the SSE handler is still encoding the event, and concurrent map access is
-// a fatal runtime error that recover() cannot catch. Sensitive skills (whose
-// args can be a bearer token or a command line with credentials) are redacted.
+// a fatal runtime error that recover() cannot catch. Sensitive skills are
+// redacted, except shell_command and ssh_command: the command line is what an
+// operator watching the stream most needs to see before trusting the answer,
+// so it stays visible here and is redacted only in the audit log.
 func eventArgs(name string, args map[string]any) map[string]any {
 	if sensitiveSkills[name] && name != "shell_command" && name != "ssh_command" {
 		return map[string]any{"redacted": true}
@@ -719,13 +758,30 @@ func eventArgs(name string, args map[string]any) map[string]any {
 	return out
 }
 
-// debugResult renders a tool result for the debug log, which /api/query
-// returns to the caller — so a password_gen result must not appear there.
+// secretResult reports whether a skill's result is itself a secret (a
+// generated password, a decoded live token). Such a result reaches the model
+// in-band for the current run only; the debug log, the stream's tool_result
+// event and the persisted session history all get a redacted stand-in.
+func secretResult(name string) bool {
+	return name == "password_gen" || name == "jwt_inspect"
+}
+
+// debugResult renders a tool result for the debug log and the stream's
+// tool_result event, both of which reach the caller.
 func debugResult(name string, result any, n int) string {
-	if name == "password_gen" || name == "jwt_inspect" {
+	if secretResult(name) {
 		return "[redacted]"
 	}
 	return truncate(fmt.Sprint(result), n)
+}
+
+// historyResult is what a tool result is stored as in the session history,
+// which /api/sessions/{sid}/messages serves and every later turn replays.
+func historyResult(name string, result any) any {
+	if secretResult(name) {
+		return map[string]any{"redacted": true, "tool": name}
+	}
+	return result
 }
 
 // maxToolContentBytes caps a single tool message in the LLM context. Every
@@ -847,8 +903,28 @@ func stripReasoningPreamble(text string) string {
 // the order they appear.  Braces inside string literals are ignored, so a value
 // like {"answer":"}"} scans correctly.  Unlike a greedy `\{.*\}` match this
 // never welds a stray brace in surrounding prose onto the real envelope.
+//
+// A `{` in prose that never closes ("pick one of {a, b. Final: {...}") keeps
+// the depth above zero to the end, hiding every object after it; the scan
+// then restarts just past that brace. The restarts are capped so a reply made
+// of thousands of unmatched braces cannot turn the scan quadratic.
 func jsonObjectCandidates(text string) []string {
 	var out []string
+	for restarts := 0; ; restarts++ {
+		found, unclosed := scanJSONObjects(text)
+		out = append(out, found...)
+		if unclosed < 0 || restarts >= maxUnclosedBraceRestarts {
+			return out
+		}
+		text = text[unclosed+1:]
+	}
+}
+
+const maxUnclosedBraceRestarts = 16
+
+// scanJSONObjects is one pass of jsonObjectCandidates. unclosed is the offset
+// of a top-level `{` that was still open when the text ran out, or -1.
+func scanJSONObjects(text string) (out []string, unclosed int) {
 	depth, start := 0, -1
 	inString, escaped := false, false
 	for i := 0; i < len(text); i++ {
@@ -885,7 +961,10 @@ func jsonObjectCandidates(text string) []string {
 			}
 		}
 	}
-	return out
+	if depth > 0 && start >= 0 {
+		return out, start
+	}
+	return out, -1
 }
 
 // unwrapRawModelJSON unwraps the legacy "raw_model_json" envelope so old
@@ -1106,6 +1185,7 @@ func toolFollowup(toolName string, result any) string {
 
 // batchCall is one entry in a tool_calls batch.
 type batchCall struct {
+	ID   string // native tool-call id; empty in envelope mode
 	Name string
 	Args map[string]any
 	Why  string
@@ -1159,7 +1239,7 @@ func (s *Service) executeBatch(state *runState, calls []batchCall) []batchResult
 // on any goroutine other than the one the middleware wraps is fatal for the
 // entire gateway, not just the request. A failed tool must degrade to a tool
 // error the model can read, exactly like a returned error.
-func safeExecute(exec func(map[string]any) (any, error), name string, args map[string]any) (result any, err error) {
+func safeExecute(ctx context.Context, exec func(context.Context, map[string]any) (any, error), name string, args map[string]any) (result any, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("agent: tool %q panicked: %v\n%s", name, r, debug.Stack())
@@ -1167,7 +1247,7 @@ func safeExecute(exec func(map[string]any) (any, error), name string, args map[s
 			err = fmt.Errorf("tool %q crashed: %v", name, r)
 		}
 	}()
-	return exec(args)
+	return exec(ctx, args)
 }
 
 // runOne executes a single tool/skill call, writes a best-effort audit
@@ -1188,7 +1268,7 @@ func (s *Service) runOne(state *runState, c batchCall) batchResult {
 	var dur time.Duration
 	if ok {
 		t0 := time.Now()
-		r, err := safeExecute(entry.Execute, c.Name, c.Args)
+		r, err := safeExecute(state.ctx, entry.Execute, c.Name, c.Args)
 		dur = time.Since(t0)
 		if err != nil {
 			execErr = err
@@ -1272,7 +1352,8 @@ func parseBatchCalls(data map[string]any) ([]batchCall, bool) {
 			args = map[string]any{}
 		}
 		why, _ := m["why"].(string)
-		out = append(out, batchCall{Name: name, Args: args, Why: why})
+		id, _ := m["id"].(string)
+		out = append(out, batchCall{ID: id, Name: name, Args: args, Why: why})
 	}
 	return out, len(out) > 0
 }

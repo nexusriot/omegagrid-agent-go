@@ -1,6 +1,7 @@
 package builtin
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -26,6 +27,29 @@ type Param struct {
 
 // Executor is the function signature for skill execution.
 type Executor = func(map[string]any) (any, error)
+
+// ContextExecutor is a skill that stops when ctx is cancelled: the agent run
+// it belongs to ended (client disconnected, gateway shutting down) or a
+// scheduler stop. Every skill that waits on the network or a process has one;
+// the registry runs those, so cancelling a run really stops its tools.
+type ContextExecutor = func(ctx context.Context, args map[string]any) (any, error)
+
+// withoutContext adapts a ContextExecutor to the plain Executor signature.
+func withoutContext(e ContextExecutor) Executor {
+	return func(args map[string]any) (any, error) { return e(context.Background(), args) }
+}
+
+// Lift adapts a skill that never blocks (pure computation) to a
+// ContextExecutor; ctx is checked once up front so a cancelled run does not
+// start new work.
+func Lift(e Executor) ContextExecutor {
+	return func(ctx context.Context, args map[string]any) (any, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return e(args)
+	}
+}
 
 // The accessors below deliberately accept the wrong JSON type for a parameter.
 // Every arg map originates from an LLM, which routinely quotes numbers
@@ -55,6 +79,34 @@ func str(args map[string]any, key string) string {
 	default:
 		return ""
 	}
+}
+
+// strList reads a list argument. Models send a JSON array, a single string,
+// or a comma-separated string; all three are accepted. Empty items drop out.
+func strList(args map[string]any, key string) []string {
+	var raw []string
+	switch x := args[key].(type) {
+	case []any:
+		for _, v := range x {
+			switch s := v.(type) {
+			case string:
+				raw = append(raw, s)
+			case float64:
+				raw = append(raw, strconv.FormatFloat(s, 'f', -1, 64))
+			}
+		}
+	case []string:
+		raw = x
+	case string:
+		raw = strings.Split(x, ",")
+	}
+	out := make([]string, 0, len(raw))
+	for _, s := range raw {
+		if s = strings.TrimSpace(s); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func intOr(args map[string]any, key string, def int) int {

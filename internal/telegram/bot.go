@@ -40,6 +40,27 @@ type Bot struct {
 	sem       chan struct{}
 	locksMu   sync.Mutex
 	chatLocks map[int64]*chatLock
+
+	// memoryScope picks the memory namespace a query runs in: "shared"
+	// (default — every user sees every memory), "user" (one namespace per
+	// Telegram user, shared across their chats) or "chat" (one per chat).
+	memoryScope string
+}
+
+// SetMemoryScope sets BOT_MEMORY_SCOPE; unknown values mean "shared".
+func (b *Bot) SetMemoryScope(scope string) { b.memoryScope = strings.ToLower(strings.TrimSpace(scope)) }
+
+// memoryNamespace is the namespace msg's query runs in.
+func (b *Bot) memoryNamespace(msg *tgbotapi.Message) string {
+	switch b.memoryScope {
+	case "user":
+		if id, ok := senderID(msg); ok {
+			return fmt.Sprintf("telegram:user:%d", id)
+		}
+	case "chat":
+		return fmt.Sprintf("telegram:chat:%d", msg.Chat.ID)
+	}
+	return ""
 }
 
 // chatLock is a per-chat mutex, reference-counted so idle chats don't
@@ -193,10 +214,17 @@ func (b *Bot) isAdmin(msg *tgbotapi.Message) bool {
 }
 
 func (b *Bot) handleStart(msg *tgbotapi.Message) {
-	b.setSession(msg.Chat.ID, 0)
+	// /start must keep working for strangers so they can learn their ID, but
+	// only an authorized sender may reset the chat's session: in a group the
+	// session is shared, and any member could wipe everyone's context.
+	id, ok := senderID(msg)
+	if !b.auth.IsEnabled() || (ok && b.auth.IsAuthorized(id)) {
+		b.setSession(msg.Chat.ID, 0)
+	}
 	extra := ""
-	if id, ok := senderID(msg); ok && b.auth.IsEnabled() {
-		extra = fmt.Sprintf("\n\nYour Telegram ID: `%d`", id)
+	if ok && b.auth.IsEnabled() {
+		// Plain text: no ParseMode is set, so Markdown backticks would show.
+		extra = fmt.Sprintf("\n\nYour Telegram ID: %d", id)
 	}
 	b.send(msg.Chat.ID,
 		"Hello! I'm the OmegaGrid Agent bot.\n\n"+
@@ -219,7 +247,7 @@ func (b *Bot) handleAsk(msg *tgbotapi.Message) {
 		b.send(msg.Chat.ID, "Usage: /ask <your question>")
 		return
 	}
-	b.processAgentText(msg.Chat.ID, text, true)
+	b.processAgentText(msg.Chat.ID, b.memoryNamespace(msg), text, true)
 }
 
 func (b *Bot) handleNew(msg *tgbotapi.Message) {
@@ -322,13 +350,13 @@ func (b *Bot) handleText(msg *tgbotapi.Message) {
 	if text == "" {
 		return
 	}
-	b.processAgentText(msg.Chat.ID, text, false)
+	b.processAgentText(msg.Chat.ID, b.memoryNamespace(msg), text, false)
 }
 
 // processAgentText runs an agent query with progressive status updates.  When
 // askMode is true, the final message is suffixed with the model + step count
 // (matching /ask in the Python bot).
-func (b *Bot) processAgentText(chatID int64, text string, askMode bool) {
+func (b *Bot) processAgentText(chatID int64, namespace, text string, askMode bool) {
 	statusMsg := tgbotapi.NewMessage(chatID, "⚙️ Processing...")
 	sent, err := b.api.Send(statusMsg)
 	if err != nil {
@@ -339,7 +367,7 @@ func (b *Bot) processAgentText(chatID int64, text string, askMode bool) {
 	events := make(chan Event, 16)
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- b.agent.QueryStream(text, chatID, b.getSession(chatID), events)
+		errCh <- b.agent.QueryStreamIn(text, chatID, b.getSession(chatID), namespace, events)
 	}()
 
 	var (
@@ -392,7 +420,7 @@ func (b *Bot) processAgentText(chatID int64, text string, askMode bool) {
 		// without this edit the message keeps showing a stale "Thinking
 		// (step N)..." and looks frozen.
 		b.editStatus(chatID, sent.MessageID, "⚠️ Stream interrupted — retrying...")
-		resp, err := b.agent.Query(text, chatID, b.getSession(chatID))
+		resp, err := b.agent.QueryIn(text, chatID, b.getSession(chatID), namespace)
 		if err != nil {
 			b.editStatus(chatID, sent.MessageID, "Error: "+err.Error())
 			return
@@ -423,7 +451,8 @@ func (b *Bot) processAgentText(chatID int64, text string, askMode bool) {
 		if v, ok := final.Meta["step_count"]; ok {
 			steps = v
 		}
-		out = fmt.Sprintf("%s\n\n_model: %s | steps: %v_", out, model, steps)
+		// Plain text: no ParseMode is set, so Markdown underscores would show.
+		out = fmt.Sprintf("%s\n\nmodel: %s | steps: %v", out, model, steps)
 	}
 	// Telegram rejects messages over telegramMaxLen with a 400, which
 	// editStatus silently swallows — leaving the user staring at a stale
@@ -470,18 +499,34 @@ func renderStatus(events []Event) string {
 	return strings.Join(lines, "\n")
 }
 
-// telegramMaxLen is Telegram's per-message hard limit. We chunk on a slightly
-// smaller bound to stay clear of the UTF-16 code-unit counting Telegram uses.
+// telegramMaxLen is the chunk size, in UTF-16 code units (Telegram's unit),
+// kept below the 4096 hard limit for headroom.
 const telegramMaxLen = 4000
 
-// splitForTelegram breaks text into pieces that each fit within telegramMaxLen,
-// preferring to split on line boundaries and never splitting a multi-byte rune.
+// utf16Len is a string's length the way Telegram counts it: in UTF-16 code
+// units, so a character outside the BMP (most emoji) counts twice.
+func utf16Len(s string) int {
+	n := 0
+	for _, r := range s {
+		if r >= 0x10000 {
+			n += 2
+		} else {
+			n++
+		}
+	}
+	return n
+}
+
+// splitForTelegram breaks text into pieces that each fit within telegramMaxLen
+// UTF-16 code units, preferring to split on line boundaries and never splitting
+// a rune. Counting runes instead let an emoji-heavy answer produce a chunk
+// Telegram rejects with 400, leaving the user staring at the status message.
 // A single line longer than the limit is hard-split by runes.
 func splitForTelegram(text string) []string {
 	if text == "" {
 		return nil
 	}
-	if len([]rune(text)) <= telegramMaxLen {
+	if utf16Len(text) <= telegramMaxLen {
 		return []string{text}
 	}
 
@@ -497,18 +542,24 @@ func splitForTelegram(text string) []string {
 	}
 
 	for _, line := range strings.Split(text, "\n") {
-		lineLen := len([]rune(line))
+		lineLen := utf16Len(line)
 		// A line that is itself too long must be hard-split by runes.
 		if lineLen > telegramMaxLen {
 			flush()
-			runes := []rune(line)
-			for len(runes) > 0 {
-				n := telegramMaxLen
-				if n > len(runes) {
-					n = len(runes)
+			var piece strings.Builder
+			pieceLen := 0
+			for _, r := range line {
+				w := utf16Len(string(r))
+				if pieceLen+w > telegramMaxLen {
+					chunks = append(chunks, piece.String())
+					piece.Reset()
+					pieceLen = 0
 				}
-				chunks = append(chunks, string(runes[:n]))
-				runes = runes[n:]
+				piece.WriteRune(r)
+				pieceLen += w
+			}
+			if pieceLen > 0 {
+				chunks = append(chunks, piece.String())
 			}
 			continue
 		}

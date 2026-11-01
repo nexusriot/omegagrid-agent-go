@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 	"time"
@@ -53,7 +54,7 @@ func TestRunnerDisablesOneShotAfterRun(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 
-	exec := func(name string, args map[string]any) (any, error) {
+	exec := func(_ context.Context, name string, args map[string]any) (any, error) {
 		return map[string]any{"reminder": args["message"]}, nil
 	}
 	r := NewRunner(store, exec, "", time.Minute)
@@ -81,7 +82,7 @@ func TestRunnerKeepsRecurringEnabled(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 
-	exec := func(name string, args map[string]any) (any, error) {
+	exec := func(_ context.Context, name string, args map[string]any) (any, error) {
 		return map[string]any{"ok": true}, nil
 	}
 	r := NewRunner(store, exec, "", time.Minute)

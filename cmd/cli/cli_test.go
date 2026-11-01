@@ -2,11 +2,15 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/nexusriot/omegagrid-agent-go/internal/scheduler"
 )
 
 // --arg / --meta are how every value reaches a skill from the command line.
@@ -208,7 +212,7 @@ func TestRemoteHelpersDecodePayloads(t *testing.T) {
 		t.Fatalf("listSkills = %v", skills)
 	}
 
-	hits, total, err := listMemories(10, 0)
+	hits, total, err := listMemories(10, 0, nil)
 	if err != nil {
 		t.Fatalf("listMemories: %v", err)
 	}
@@ -216,7 +220,7 @@ func TestRemoteHelpersDecodePayloads(t *testing.T) {
 		t.Fatalf("listMemories = %v, total %d", hits, total)
 	}
 
-	hits, err = searchMemory("q", 5)
+	hits, err = searchMemory("q", 5, nil)
 	if err != nil {
 		t.Fatalf("searchMemory: %v", err)
 	}
@@ -252,8 +256,64 @@ func TestRemoteHelpersDecodePayloads(t *testing.T) {
 	if err != nil {
 		t.Fatalf("invokeSkill: %v", err)
 	}
-	if result["name"] != "weather" {
-		t.Fatalf("invokeSkill = %v", result)
+	if m, _ := result.(map[string]any); m["temperature_c"] != float64(15) {
+		t.Fatalf("invokeSkill = %v, want the unwrapped result", result)
+	}
+}
+
+// The playground answers 200 with {"error":...} for a failed or unknown
+// skill; remote `omega skills run` printed `null` and exited 0.
+func TestRemoteInvokeSkillSurfacesError(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.EscapedPath()
+		_, _ = w.Write([]byte(`{"name":"x","result":null,"error":"boom"}`))
+	}))
+	defer srv.Close()
+	t.Setenv("OMEGA_REMOTE", srv.URL)
+	if _, err := invokeSkill("we/ird", nil); err == nil || err.Error() != "boom" {
+		t.Fatalf("invokeSkill err = %v, want boom", err)
+	}
+	if gotPath != "/api/skills/we%2Fird/invoke" {
+		t.Fatalf("path = %q, want the skill name escaped", gotPath)
+	}
+}
+
+// Go's flag package stops at the first positional, so the documented
+// `omega ask "q" --session 7` and `omega skills run NAME --arg k=v` dropped
+// every trailing flag.
+func TestParseArgsAcceptsInterspersedFlags(t *testing.T) {
+	fs := flag.NewFlagSet("t", flag.ContinueOnError)
+	session := fs.Int("session", 0, "")
+	var kv multiFlag
+	fs.Var(&kv, "arg", "")
+	pos := parseArgs(fs, []string{"hello", "--session", "7", "--arg", "a=b", "tail", "--arg=c=d"})
+	if *session != 7 || len(kv) != 2 || kv[0] != "a=b" || kv[1] != "c=d" {
+		t.Fatalf("session=%d args=%v, want 7 [a=b c=d]", *session, kv)
+	}
+	if len(pos) != 2 || pos[0] != "hello" || pos[1] != "tail" {
+		t.Fatalf("positionals = %q", pos)
+	}
+
+	fs = flag.NewFlagSet("t", flag.ContinueOnError)
+	session = fs.Int("session", 0, "")
+	pos = parseArgs(fs, []string{"--session", "3", "--", "-not-a-flag", "--session", "9"})
+	if *session != 3 || len(pos) != 3 || pos[0] != "-not-a-flag" {
+		t.Fatalf("after --: session=%d pos=%q, want 3 and everything literal", *session, pos)
+	}
+	if argAt(pos, 5) != "" {
+		t.Fatal("argAt past the end must be empty")
+	}
+}
+
+func TestRequestTimeoutCoversAgentRuns(t *testing.T) {
+	for _, p := range []string{"/api/query", "/api/query/stream", "/api/skills/x/invoke"} {
+		if requestTimeout(p) < 10*time.Minute {
+			t.Errorf("requestTimeout(%q) = %v, too short for a multi-step agent run", p, requestTimeout(p))
+		}
+	}
+	if requestTimeout("/api/skills") != 120*time.Second {
+		t.Error("store lookups keep the short timeout")
 	}
 }
 
@@ -270,13 +330,13 @@ func TestRemoteWriteHelpers(t *testing.T) {
 	defer srv.Close()
 	t.Setenv("OMEGA_REMOTE", srv.URL)
 
-	if err := addMemory("a durable fact", map[string]any{"tag": "note"}); err != nil {
+	if _, err := addMemory("a durable fact", map[string]any{"tag": "note"}, "", 0); err != nil {
 		t.Fatalf("addMemory: %v", err)
 	}
 	if err := deleteMemory("m1"); err != nil {
 		t.Fatalf("deleteMemory: %v", err)
 	}
-	if err := createScheduleTask("nightly", "0 3 * * *", "reminder", map[string]any{"message": "x"}, true); err != nil {
+	if err := createScheduleTask(scheduler.TaskSpec{Name: "nightly", CronExpr: "0 3 * * *", Skill: "reminder", Args: map[string]any{"message": "x"}, OneShot: true}); err != nil {
 		t.Fatalf("createScheduleTask: %v", err)
 	}
 	if err := deleteScheduleTask(9); err != nil {
@@ -410,5 +470,19 @@ func TestRemoteRequestsSendBearerToken(t *testing.T) {
 	t.Setenv("GATEWAY_API_TOKEN", "")
 	if err := httpStream("/api/query/stream", map[string]any{"query": "q"}, func(string, string) {}); err == nil || !strings.Contains(err.Error(), "401") {
 		t.Fatalf("httpStream without a token: err = %v, want HTTP 401", err)
+	}
+}
+
+func TestTaskDetail(t *testing.T) {
+	at := 1.7e9
+	got := taskDetail(&scheduler.Task{CronExpr: "0 9 * * *", Timezone: "Europe/Berlin", OneShot: true,
+		MaxRetries: 2, RetryDelaySec: 60, RetryAttempt: 1, NextRetryAt: &at})
+	for _, want := range []string{"0 9 * * * (Europe/Berlin)", "one-shot", "retries: 2", "retry #1 at "} {
+		if !strings.Contains(got, want) {
+			t.Errorf("taskDetail = %q, missing %q", got, want)
+		}
+	}
+	if got := taskDetail(&scheduler.Task{CronExpr: "* * * * *"}); got != "cron: * * * * * (UTC)" {
+		t.Errorf("plain task = %q", got)
 	}
 }

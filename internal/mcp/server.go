@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -46,7 +47,7 @@ func (s *Server) Handler() http.HandlerFunc {
 			return
 		}
 
-		resp := s.dispatch(&req)
+		resp := s.dispatch(r.Context(), &req)
 		if resp == nil { // notification — no response body
 			w.WriteHeader(http.StatusAccepted)
 			return
@@ -55,7 +56,7 @@ func (s *Server) Handler() http.HandlerFunc {
 	}
 }
 
-func (s *Server) dispatch(req *rpcRequest) *rpcResponse {
+func (s *Server) dispatch(ctx context.Context, req *rpcRequest) *rpcResponse {
 	ok := func(result any) *rpcResponse {
 		return &rpcResponse{JSONRPC: "2.0", ID: req.ID, Result: result}
 	}
@@ -63,12 +64,18 @@ func (s *Server) dispatch(req *rpcRequest) *rpcResponse {
 		return &rpcResponse{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: code, Message: msg}}
 	}
 
+	// A notification never gets a response, whatever its method — answering
+	// one (initialize/ping/tools/list used to be) is a protocol violation.
+	if req.isNotification() {
+		return nil
+	}
+
 	switch req.Method {
 	case "initialize":
 		return ok(s.initializeResult(req.Params))
 
 	case "notifications/initialized", "notifications/cancelled":
-		return nil // notifications get no response
+		return nil // sent with an id by a non-conforming client; still no reply
 
 	case "ping":
 		return ok(map[string]any{})
@@ -77,15 +84,9 @@ func (s *Server) dispatch(req *rpcRequest) *rpcResponse {
 		return ok(map[string]any{"tools": s.toolList()})
 
 	case "tools/call":
-		if req.isNotification() {
-			return nil
-		}
-		return s.toolsCall(req, ok, fail)
+		return s.toolsCall(ctx, req, ok, fail)
 
 	default:
-		if req.isNotification() {
-			return nil
-		}
 		return fail(codeMethodNotFound, "method not found: "+req.Method)
 	}
 }
@@ -120,22 +121,22 @@ func (s *Server) toolList() []map[string]any {
 	return out
 }
 
-func (s *Server) toolsCall(req *rpcRequest, ok func(any) *rpcResponse, fail func(int, string) *rpcResponse) *rpcResponse {
+func (s *Server) toolsCall(ctx context.Context, req *rpcRequest, ok func(any) *rpcResponse, fail func(int, string) *rpcResponse) *rpcResponse {
 	var p struct {
 		Name      string         `json:"name"`
 		Arguments map[string]any `json:"arguments"`
 	}
 	if err := json.Unmarshal(req.Params, &p); err != nil {
-		return fail(codeInvalidRequest, "invalid params: "+err.Error())
+		return fail(codeInvalidParams, "invalid params: "+err.Error())
 	}
 	if p.Name == "" {
-		return fail(codeInvalidRequest, "tool name is required")
+		return fail(codeInvalidParams, "tool name is required")
 	}
 	if p.Arguments == nil {
 		p.Arguments = map[string]any{}
 	}
 
-	result, err := s.provider.Call(p.Name, p.Arguments)
+	result, err := s.provider.Call(ctx, p.Name, p.Arguments)
 	if err != nil {
 		// Tool execution errors are reported in-band (isError) so the calling
 		// model can read and react to them, per MCP convention.

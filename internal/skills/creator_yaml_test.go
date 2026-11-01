@@ -1,10 +1,17 @@
 package skills
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
+
+	"gopkg.in/yaml.v3"
 
 	"github.com/nexusriot/omegagrid-agent-go/internal/config"
 	"github.com/nexusriot/omegagrid-agent-go/internal/skills/markdown"
@@ -385,7 +392,7 @@ func TestRegisterAddsRuntimeSkill(t *testing.T) {
 	c, _ := newCreator(t)
 	c.Register("remote_echo", "[MCP:remote] echo", map[string]Param{
 		"text": {Type: "string", Description: "what to echo", Required: true},
-	}, func(args map[string]any) (any, error) {
+	}, func(_ context.Context, args map[string]any) (any, error) {
 		return map[string]any{"echoed": args["text"]}, nil
 	})
 
@@ -482,10 +489,132 @@ func TestCreatedSkillPreservesListValues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if !strings.Contains(string(raw), `["fast","slow"]`) {
+	var fm struct {
+		Parameters map[string]map[string]any `yaml:"parameters"`
+	}
+	header := strings.SplitN(strings.TrimPrefix(string(raw), "---\n"), "\n---\n", 2)[0]
+	if err := yaml.Unmarshal([]byte(header), &fm); err != nil {
+		t.Fatalf("frontmatter: %v\n%s", err, raw)
+	}
+	if !reflect.DeepEqual(fm.Parameters["mode"]["enum"], []any{"fast", "slow"}) {
 		t.Errorf("enum list not preserved in frontmatter:\n%s", raw)
 	}
 	if _, err := markdown.Load(filepath.Join(dir, "enum_helper.md")); err != nil {
 		t.Fatalf("generated frontmatter does not parse: %v\n%s", err, raw)
+	}
+}
+
+// Parameter names were written into the YAML unquoted, so one crafted name
+// injected top-level fields: the "prompt-only" skill skill_creator reported
+// actually loaded as an HTTP endpoint skill with a ~28 h timeout.
+func TestCreatorKeysCannotInjectFrontmatter(t *testing.T) {
+	c, dir := newCreator(t)
+	got := create(t, c, map[string]any{
+		"name":        "inj",
+		"description": "d",
+		"parameters_schema": map[string]any{
+			"x:\n  type: string\nendpoint: http://127.0.0.1:9/\ntimeout: 100000\nzz": "string",
+		},
+	})
+	if got["type"] != "prompt-only" {
+		t.Fatalf("type = %v", got["type"])
+	}
+	raw, _ := os.ReadFile(filepath.Join(dir, "inj.md"))
+	sk, err := markdown.Load(filepath.Join(dir, "inj.md"))
+	if err != nil {
+		t.Fatalf("load: %v\n%s", err, raw)
+	}
+	res, err := sk.Execute(map[string]any{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m, _ := res.(map[string]any); m["skill_type"] != "prompt_only" {
+		t.Fatalf("crafted parameter name changed the skill kind: %v\n%s", res, raw)
+	}
+	if len(sk.Schema.Parameters) != 1 {
+		t.Fatalf("parameters = %v, want the one (oddly named) parameter", sk.Schema.Parameters)
+	}
+}
+
+// The file was written in place before being validated, so an overwrite that
+// failed to parse destroyed the working skill on disk.
+func TestCreatorFailedOverwriteKeepsWorkingFile(t *testing.T) {
+	c, dir := newCreator(t)
+	create(t, c, map[string]any{"name": "ow", "description": "good"})
+	before, _ := os.ReadFile(filepath.Join(dir, "ow.md"))
+
+	steps := make([]any, markdown.MaxPipelineSteps+1)
+	for i := range steps {
+		steps[i] = map[string]any{"skill": "uuid_gen"}
+	}
+	res, _ := c.Execute("skill_creator", map[string]any{
+		"action": "create", "name": "ow", "description": "bad", "steps": steps,
+	})
+	if m, _ := res.(map[string]any); m["error"] == nil {
+		t.Fatalf("an over-long pipeline was accepted: %v", res)
+	}
+	after, _ := os.ReadFile(filepath.Join(dir, "ow.md"))
+	if string(after) != string(before) {
+		t.Fatalf("failed overwrite replaced the working file:\n%s", after)
+	}
+	entries, _ := os.ReadDir(dir)
+	if len(entries) != 1 {
+		t.Fatalf("temp files left behind: %v", entries)
+	}
+}
+
+// Two pipelines calling each other fan out to N^depth leaf calls; depth alone
+// let N=20 run 3.2M calls. The shared per-execution budget stops it.
+func TestPipelineFanOutIsBudgeted(t *testing.T) {
+	c, _ := newCreator(t)
+	mk := func(name, callee string) {
+		steps := make([]any, markdown.MaxPipelineSteps)
+		for i := range steps {
+			steps[i] = map[string]any{"name": fmt.Sprintf("s%d", i), "skill": callee}
+		}
+		create(t, c, map[string]any{"name": name, "description": "fan", "steps": steps})
+	}
+	mk("fb", "fa") // fb's steps resolve at run time, after fa exists
+	mk("fa", "fb")
+
+	t0 := time.Now()
+	res, err := c.Execute("fa", map[string]any{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := time.Since(t0); d > 5*time.Second {
+		t.Fatalf("fan-out ran for %v", d)
+	}
+	b, _ := json.Marshal(res)
+	if !strings.Contains(string(b), "budget") {
+		t.Fatalf("fan-out was not cut off by the call budget: %.300s", b)
+	}
+	if len(b) > 4<<20 {
+		t.Fatalf("result is %d bytes; the budget should keep it small", len(b))
+	}
+}
+
+// ExecuteContext must carry cancellation into nested pipeline steps.
+func TestExecuteContextReachesPipelineSteps(t *testing.T) {
+	c, _ := newCreator(t)
+	var sawCancel bool
+	if err := c.Register("probe_tool", "probe", nil, func(ctx context.Context, _ map[string]any) (any, error) {
+		sawCancel = ctx.Err() != nil
+		return "ok", nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	create(t, c, map[string]any{"name": "wrap", "description": "d",
+		"steps": []any{map[string]any{"name": "a", "skill": "probe_tool"}}})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := c.ExecuteContext(ctx, "wrap", map[string]any{}); err == nil {
+		t.Fatal("a cancelled pipeline ran")
+	}
+	if sawCancel {
+		t.Fatal("nested step started under a cancelled context")
+	}
+	if _, err := c.ExecuteContext(context.Background(), "wrap", map[string]any{}); err != nil {
+		t.Fatal(err)
 	}
 }

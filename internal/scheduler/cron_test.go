@@ -275,3 +275,59 @@ func TestValidateField(t *testing.T) {
 		})
 	}
 }
+
+// "5/15" validated but matched only :05 — the step was dropped for a plain
+// start value. Vixie cron and croniter read it as 5-59/15.
+func TestStartValueWithStep(t *testing.T) {
+	at := func(min int) time.Time { return time.Date(2026, 7, 15, 10, min, 0, 0, time.UTC) }
+	for _, m := range []int{5, 20, 35, 50} {
+		if !Matches("5/15 * * * *", at(m)) {
+			t.Errorf("5/15 must match minute %d", m)
+		}
+	}
+	for _, m := range []int{0, 4, 15, 21} {
+		if Matches("5/15 * * * *", at(m)) {
+			t.Errorf("5/15 must not match minute %d", m)
+		}
+	}
+	// Day-of-week too: 1/2 = Mon, Wed, Fri.
+	if !Matches("0 0 * * 1/2", time.Date(2026, 7, 15, 0, 0, 0, 0, time.UTC)) { // Wednesday
+		t.Error("1/2 weekday must match Wednesday")
+	}
+}
+
+// Vixie treats a day field that starts with "*" as unrestricted, so "*/2"
+// combined with a weekday ANDs. Only a literal "*" counted before, so the
+// expression fired on every odd day plus every Monday.
+func TestStarStepDayFieldIsUnrestricted(t *testing.T) {
+	wed7 := time.Date(2026, 1, 7, 0, 0, 0, 0, time.UTC)   // odd day, Wednesday
+	mon5 := time.Date(2026, 1, 5, 0, 0, 0, 0, time.UTC)   // odd day, Monday
+	mon12 := time.Date(2026, 1, 12, 0, 0, 0, 0, time.UTC) // even day, Monday
+	if Matches("0 0 */2 * 1", wed7) {
+		t.Error("*/2 dom + Monday must not fire on a Wednesday")
+	}
+	if !Matches("0 0 */2 * 1", mon5) {
+		t.Error("*/2 dom + Monday must fire on an odd Monday")
+	}
+	if Matches("0 0 */2 * 1", mon12) {
+		t.Error("*/2 dom + Monday must not fire on an even Monday")
+	}
+	if Matches("0 0 */1 * 1", wed7) {
+		t.Error("*/1 dom + Monday must mean Mondays only")
+	}
+}
+
+// Feb 30 / Apr 31 passed validation and then never fired.
+func TestValidateRejectsImpossibleDates(t *testing.T) {
+	for _, expr := range []string{"0 0 30 2 *", "0 0 31 4,6,9,11 *", "0 0 31 feb *"} {
+		if err := ValidateCron(expr); err == nil {
+			t.Errorf("ValidateCron(%q) accepted a date no calendar has", expr)
+		}
+	}
+	// Feb 29 exists in leap years; a weekday rescues the day-of-month via OR.
+	for _, expr := range []string{"0 0 29 2 *", "0 0 31 * *", "0 0 30 2 1", "0 0 */2 * *"} {
+		if err := ValidateCron(expr); err != nil {
+			t.Errorf("ValidateCron(%q) = %v, want nil", expr, err)
+		}
+	}
+}

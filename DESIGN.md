@@ -3,7 +3,7 @@
 ## 1. Overview
 
 OmegaGrid Agent Go is a pure Go rewrite of the omegagrid-agent platform.
-The gateway, agent loop, scheduler, Telegram bot, all 28 skills, vector memory,
+The gateway, agent loop, scheduler, Telegram bot, all 51 built-in skills, vector memory,
 and conversation history are compiled into static Go binaries — no Python sidecar.
 A React web UI is served by a dedicated **frontend** nginx service.
 All source is self-contained in this repository, making
@@ -58,17 +58,22 @@ omegagrid-agent-go/
 │       ├── main.go              #   Go importer (reads JSONL → writes chromem-go)
 │       └── export.py            #   Python exporter (reads ChromaDB → writes JSONL)
 ├── internal/
-│   ├── agent/agent.go           # Tool-calling loop (Run / RunStream); tool_calls batches + audit
-│   ├── bootstrap/bootstrap.go   # Single New(cfg) wires every service (gateway + cli)
+│   ├── agent/
+│   │   ├── agent.go             #   Tool-calling loop (Run / RunStream); tool_calls batches + audit
+│   │   ├── native.go            #   Tool modes: native tool calling ↔ envelope mapping, auto fallback
+│   │   └── extract.go           #   Opt-in auto-memory extraction
+│   ├── bootstrap/
+│   │   ├── bootstrap.go         #   Single New(cfg) wires every service (gateway + cli)
+│   │   └── mcpclients.go        #   Remote MCP connection manager (parallel, retry, refresh)
 │   ├── config/config.go         # Env-driven configuration
 │   ├── httpapi/                 # chi router + REST handlers
 │   │   ├── server.go            #   router, CORS, middleware
 │   │   ├── chat.go              #   POST /api/query, /api/query/stream
 │   │   ├── health.go            #   GET /health
-│   │   ├── history.go           #   sessions CRUD
-│   │   ├── memory.go            #   POST /api/memory/{add,search}; GET /api/memory[/{id}]; DELETE /api/memory/{id}
-│   │   ├── scheduler.go         #   scheduler task CRUD
-│   │   ├── skills.go            #   GET /api/skills, /api/tools, POST /api/skills/{name}/invoke
+│   │   ├── history.go           #   sessions list/search/rename/delete, messages, usage stats
+│   │   ├── memory.go            #   memory add/search/list/get/update/delete, namespaces, export/import
+│   │   ├── scheduler.go         #   scheduler task CRUD, run-now, run history
+│   │   ├── skills.go            #   skills list, playground invoke, markdown source get/validate/save/delete
 │   │   └── audit.go             #   GET /api/invocations, /invocations/{id}, /invocations/{id}/replay
 │   ├── mcp/                     # Model Context Protocol (hand-rolled JSON-RPC 2.0, no SDK)
 │   │   ├── mcp.go               #   Shared envelope, Tool/Param types, ToolProvider interface
@@ -76,26 +81,29 @@ omegagrid-agent-go/
 │   │   └── client.go            #   MCP client — consumes remote servers, proxies tools/call
 │   ├── llm/
 │   │   ├── llm.go               #   ChatClient interface + Message type
+│   │   ├── tools.go             #   Native tool calling (ToolChatClient) for Ollama + OpenAI
 │   │   ├── ollama.go            #   Ollama /api/chat client
 │   │   ├── openai.go            #   OpenAI chat_completions + responses client
 │   │   └── opencode.go          #   opencode Zen relay — OpenAIChat + session header
 │   ├── memory/
 │   │   ├── client.go            #   Public API — CreateSession / AddMemory / SearchMemory / ListMemories / GetMemory / DeleteMemory / AddInvocation / …
-│   │   ├── history.go           #   SQLite sessions + messages (modernc.org/sqlite, no CGO)
+│   │   ├── history.go           #   SQLite sessions + messages + usage aggregation (modernc.org/sqlite, no CGO)
 │   │   ├── audit.go             #   SQLite skill_invocations — AuditRecord / AuditFilter / record / list
-│   │   ├── vector.go            #   chromem-go vector store + SHA256 + cosine dedup pipeline
+│   │   ├── vector.go            #   chromem-go store: dedup, namespaces, expiry, edit, export/import, index rebuild
 │   │   └── embeddings.go        #   Ollama (3-endpoint fallback) + OpenAI embeddings clients
 │   ├── observability/timing.go  # Mark-based timer (surfaces in RunResult.Meta)
+│   ├── version/version.go       # Release version (single source; -ldflags -X can override)
 │   ├── scheduler/
 │   │   ├── cron.go              #   5-field cron matcher
-│   │   ├── runner.go            #   Background goroutine executing due tasks
+│   │   ├── runner.go            #   Ticker: due tasks + retries, prompt tasks, run-now
 │   │   ├── skill.go             #   Native schedule_task skill
-│   │   └── store.go             #   SQLite task CRUD
+│   │   └── store.go             #   SQLite tasks + task_runs history, retries, ValidateSpec
 │   ├── search/skill.go          # Native web_search skill (DuckDuckGo HTML scrape)
 │   ├── skills/
 │   │   ├── client.go            #   Public API — List() / Execute() / Register(); wires registry
-│   │   ├── registry.go          #   Thread-safe sync.RWMutex skill map
-│   │   ├── builtin/             #   Go implementations of 27 of the 28 built-in skills
+│   │   ├── registry.go          #   Thread-safe sync.RWMutex skill map (context-aware executors, pipeline budget)
+│   │   ├── source.go            #   Markdown skill source: read / validate / save / delete
+│   │   ├── builtin/             #   Go implementations of 50 of the 51 built-in skills
 │   │   │   ├── helpers.go       #     Local types (Skill/Param/Executor) + arg helpers
 │   │   │   ├── web.go           #     weather, http_request, web_scrape, http_health, ip_info
 │   │   │   ├── network.go       #     dns_lookup, ping_check, port_scan, whois_lookup
@@ -104,7 +112,18 @@ omegagrid-agent-go/
 │   │   │   ├── eval.go          #     datetime_skill, math_eval (safe AST parser), cron_schedule
 │   │   │   ├── reminder.go      #     reminder (echo message for one-shot scheduled tasks)
 │   │   │   ├── exec.go          #     shell_command, ssh_command
-│   │   │   └── qr.go            #     qr_generate
+│   │   │   ├── exec_unix.go     #     Process-group kill on cancel, SO_BROADCAST (+ exec_other.go stub)
+│   │   │   ├── qr.go            #     qr_generate
+│   │   │   ├── rss.go           #     rss_fetch
+│   │   │   ├── notify.go        #     notify (telegram / email / webhook, allowlisted)
+│   │   │   ├── network2.go      #     http_timing, dns_compare, rdap_lookup, smtp_check, wake_on_lan, subnet_sweep
+│   │   │   ├── traceroute*.go   #     traceroute (Linux error-queue implementation + stub)
+│   │   │   ├── jsonquery.go     #     json_query
+│   │   │   ├── textutil.go      #     time_convert, regex_test, text_diff, unit_convert
+│   │   │   ├── csvquery.go      #     csv_query
+│   │   │   ├── markdown.go      #     html_to_markdown
+│   │   │   ├── knowledge.go     #     wikipedia, currency_convert, github
+│   │   │   └── workspace.go     #     file_list, file_read, file_write, pdf_text
 │   │   ├── markdown/            #   Markdown skill loader + pipeline executor
 │   │   │   └── loader.go        #     YAML frontmatter parser, {{placeholder}} resolution
 │   │   └── netguard/            #   SSRF guard — vets every outbound skill dial after DNS
@@ -132,16 +151,26 @@ omegagrid-agent-go/
 │       │   └── chat.ts          #   Zustand: session ID + live stream steps
 │       ├── components/
 │       │   ├── Layout.tsx       #   Icon rail nav sidebar
-│       │   ├── SessionList.tsx  #   Scrollable session list + New button
+│       │   ├── SessionList.tsx  #   Session list: search, inline rename, delete, New button
 │       │   ├── ChatBubble.tsx   #   Markdown-rendered message bubbles + copy
-│       │   └── ToolCard.tsx     #   Collapsible tool call card (args + result)
+│       │   ├── ToolCard.tsx     #   Collapsible tool call card (args + result)
+│       │   ├── MemoryEditModal.tsx #  Edit a memory's text, metadata and expiry
+│       │   ├── SkillEditor.tsx  #   Markdown skill editor with live validation
+│       │   ├── TaskCreateModal.tsx #  New scheduler task (skill or prompt, time zone, retries) + cron preview
+│       │   ├── TaskRunHistory.tsx #  Per-task run history
+│       │   └── UsagePanel.tsx   #   Usage chart + top skills (Health page)
+│       ├── lib/
+│       │   ├── cron.ts          #   Next-run preview in a time zone (mirrors scheduler/cron.go)
+│       │   ├── time.ts          #   Date / relative-time formatting
+│       │   ├── download.ts      #   Save a Blob (memory export)
+│       │   └── useDebounced.ts  #   Debounce hook (session search)
 │       └── pages/
 │           ├── Chat.tsx         #   Streaming chat, session sidebar, abort
-│           ├── Memory.tsx       #   Vector search + manual add + list/delete
-│           ├── Skills.tsx       #   Skill catalog with param schemas
-│           ├── Scheduler.tsx    #   Cron task CRUD
+│           ├── Memory.tsx       #   Search, add, namespace filter, edit, delete, export/import
+│           ├── Skills.tsx       #   Skill catalog, playground, markdown skill editor
+│           ├── Scheduler.tsx    #   Tasks: create, enable/disable, run now, history, retries
 │           ├── Activity.tsx     #   Skill invocation audit log + replay
-│           └── Health.tsx       #   Gateway status, auto-refresh
+│           └── Health.tsx       #   Gateway status + version, usage panel, auto-refresh
 ├── docker/
 │   ├── frontend.Dockerfile      # node:20-alpine build → nginx:1.27-alpine
 │   ├── gateway.Dockerfile       # golang:1.25-bookworm → distroless (~16 MB)
@@ -150,6 +179,7 @@ omegagrid-agent-go/
 │   ├── e2e.Dockerfile           # mockllm + the compiled e2e test binary
 │   └── nginx.conf               # SPA fallback + /api proxy + SSE tuning
 ├── scripts/e2e.sh               # Runs the e2e suite (docker or --host mode)
+├── .github/workflows/ci.yml     # CI: gofmt, vet, staticcheck, race suite, web build, e2e
 ├── run_tests.sh                 # Runs the unit suite (local -race, or --docker)
 ├── Dockerfile.test              # Image `make test` runs the unit suite in
 ├── docker-compose.yml           # 3-service stack (frontend, gateway, telegram-bot)
@@ -158,6 +188,7 @@ omegagrid-agent-go/
 ├── Makefile                     # init / web / build / build-all / cli / migrate-vector / vet / test / e2e / e2e-host / dev-web / vector-*
 ├── .dockerignore
 ├── .env.example
+├── CHANGELOG.md                 # Release notes (one entry per version)
 └── go.mod
 ```
 
@@ -176,18 +207,28 @@ All configuration is environment-driven, matching the original `.env` pattern.
 | LLM | `LLM_PROVIDER`, `CHAT_MODEL`, `OLLAMA_URL`, `OLLAMA_MODEL`, `OLLAMA_TIMEOUT`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_CHAT_MODEL`, `OPENAI_TIMEOUT`, `OPENAI_API_MODE`, `OPENAI_REASONING_EFFORT`, `OPENAI_TEMPERATURE` | ollama, —, `http://127.0.0.1:11434`, `llama3:latest`, 120s, —, `https://api.openai.com/v1`, `gpt-4o-mini` (`gpt-5.3-codex` for `openai-codex`), 120s, auto, — (omitted), 0.2 |
 | LLM (DigitalOcean) | `DIGITALOCEAN_API_KEY`, `DIGITALOCEAN_BASE_URL`, `DIGITALOCEAN_CHAT_MODEL`, `DIGITALOCEAN_EMBED_MODEL`, `DIGITALOCEAN_TIMEOUT` | —, `https://inference.do-ai.run/v1`, `meta-llama/Llama-3.3-70B-Instruct`, `qwen3-embedding-0.6b`, 120s |
 | LLM (opencode) | `OPENCODE_API_KEY` (fallbacks `OPENCODE_GO_API_KEY`, `OPENCODE_ZEN_API_KEY`), `OPENCODE_BASE_URL`, `OPENCODE_CHAT_MODEL`, `OPENCODE_SESSION_ID`, `OPENCODE_TIMEOUT` | —, tier-dependent, tier-dependent, random per process, 120s |
-| Agent | `AGENT_DB`, `AGENT_CONTEXT_TAIL`, `AGENT_MEMORY_HITS`, `AGENT_MAX_STEPS`, `AGENT_PARALLEL_TOOLS`, `AGENT_MAX_PARALLEL` | `{DATA_DIR}/agent_memory.sqlite3`, 30, 5, 25, false, 4 |
+| Agent | `AGENT_DB`, `AGENT_CONTEXT_TAIL`, `AGENT_MEMORY_HITS`, `AGENT_MAX_STEPS`, `AGENT_PARALLEL_TOOLS`, `AGENT_MAX_PARALLEL`, `AGENT_TOOL_MODE` | `{DATA_DIR}/agent_memory.sqlite3`, 30, 5, 25, false, 4, auto |
 | Auto-memory | `AUTO_MEMORY_EXTRACT`, `AUTO_MEMORY_MAX_FACTS`, `AUTO_MEMORY_MIN_ANSWER_LEN` | false, 5, 80 |
 | Playground | `PLAYGROUND_DISABLED` | false (playground enabled) |
 | CLI | `OMEGA_REMOTE`, `GATEWAY_API_TOKEN` | unset (local mode); set to gateway URL for remote mode; — (sent as bearer token in remote mode) |
-| Vector memory | `AGENT_VECTOR_DIR`, `AGENT_VECTOR_COLLECTION`, `AGENT_DEDUP_DISTANCE` | `{DATA_DIR}/chromem`, `memories`, 0.08 |
+| Vector memory | `AGENT_VECTOR_DIR`, `AGENT_VECTOR_COLLECTION`, `AGENT_DEDUP_DISTANCE`, `MEMORY_DEFAULT_TTL_DAYS` | `{DATA_DIR}/chromem`, `memories`, 0.08, 0 (never expire) |
 | Embeddings | `EMBED_PROVIDER`, `OLLAMA_EMBED_MODEL`, `OPENAI_EMBED_MODEL` | `{LLM_PROVIDER}`, `nomic-embed-text`, `text-embedding-3-small` |
 | Scheduler | `SCHEDULER_DB`, `SCHEDULER_TICK_SEC` | `{DATA_DIR}/scheduler.sqlite3`, 60 |
-| Telegram | `TELEGRAM_BOT_TOKEN`, `BOT_AUTH_ENABLED`, `BOT_ADMIN_ID`, `BOT_AUTH_DB`, `GATEWAY_URL` | —, true, 0 (required while auth is on), `/app/data/telegram_auth.sqlite3`, `http://127.0.0.1:8000` |
+| Telegram | `TELEGRAM_BOT_TOKEN`, `BOT_AUTH_ENABLED`, `BOT_ADMIN_ID`, `BOT_AUTH_DB`, `GATEWAY_URL`, `BOT_MEMORY_SCOPE` | —, true, 0 (required while auth is on), `/app/data/telegram_auth.sqlite3`, `http://127.0.0.1:8000`, shared |
 | Skills | `SKILLS_DIR`, `SKILL_HTTP_TIMEOUT`, `SKILL_SHELL_ENABLED`, `SKILL_SSH_ENABLED`, `SKILL_SSH_IDENTITY_FILE`, `SKILL_SSH_DEFAULT_USER`, `SKILL_SSH_PRIVATE_KEY`, `SKILL_ALLOW_PRIVATE_NETWORKS` | `{DATA_DIR}/skills`, 30, false, false, —, root, —, true |
+| Shell sandbox | `SKILL_SHELL_SANDBOX`, `SKILL_SHELL_SANDBOX_NETWORK`, `SKILL_SHELL_SANDBOX_WRITABLE` | none, false, — |
+| SSH host keys | `SKILL_SSH_KNOWN_HOSTS`, `SKILL_SSH_HOST_KEY_POLICY` | `{DATA_DIR}/ssh_known_hosts`, accept-new |
+| Workspace / GitHub | `SKILL_WORKSPACE_DIR`, `SKILL_WORKSPACE_MAX_MB`, `SKILL_GITHUB_TOKEN` (fallback `GITHUB_TOKEN`) | `{DATA_DIR}/workspace`, 100, — |
+| notify | `NOTIFY_TELEGRAM_CHATS`, `NOTIFY_TELEGRAM_DEFAULT_CHAT`, `NOTIFY_EMAIL_TO`, `NOTIFY_SMTP_HOST`, `NOTIFY_SMTP_PORT`, `NOTIFY_SMTP_USER`, `NOTIFY_SMTP_PASSWORD`, `NOTIFY_SMTP_FROM`, `NOTIFY_WEBHOOKS` | all empty (channels off), port 587 |
 | Audit log | `AUDIT_MAX_BLOB_BYTES` | `65536` (0 = disabled) |
-| MCP | `MCP_SERVER_DISABLED`, `MCP_SERVERS` | false (server enabled); — (no remote servers) |
-| API access | `GATEWAY_API_TOKEN`, `CORS_ALLOWED_ORIGINS` | — (API open), — (same-origin only) |
+| MCP | `MCP_SERVER_DISABLED`, `MCP_SERVERS`, `MCP_CONNECT_WAIT_SEC`, `MCP_REFRESH_SEC` | false (server enabled); — (no remote servers); 10; 300 |
+| API access | `GATEWAY_API_TOKEN`, `CORS_ALLOWED_ORIGINS`, `GATEWAY_ALLOWED_HOSTS` | — (API open), — (same-origin only), — (only IP / single-label / `*.localhost` Host values while no token is set) |
+
+Boolean switches read through `isTruthy` / `isFalsy` (and the bot's own
+`boolEnv`) share one vocabulary: `true`/`1`/`yes`/`on` and
+`false`/`0`/`no`/`off`, case-insensitive.  `isTruthy` used to miss `on`, so
+`PLAYGROUND_DISABLED=on` or `MCP_SERVER_DISABLED=on` left the surface enabled
+— a disable switch that fails open.
 
 `LLM_PROVIDER` determines both the chat client and the embeddings backend.
 When `OPENAI_API_MODE` is unset and the chat model name contains `codex`, the
@@ -246,8 +287,13 @@ without a preceding tool-use turn.  (Ollama accepts the tool role verbatim, so
 three attempts, backing off 2s then 4s.  Client **timeouts** are deliberately
 not retried: each attempt already waited the full configured timeout, and
 stacking two more multi-minute waits makes the agent look frozen.  The backoff
-call goes through an injectable `sleep` field so tests can assert the schedule
-without actually waiting — the only reason that field exists.
+honours the request context: `sleepFor` waits on a timer *or* `ctx.Done()`, so
+a cancelled request (client gone, gateway shutting down) returns at once
+instead of sitting out 2 s / 4 s.  Tests replace the wait with the `sleep`
+field to assert the schedule without waiting; production leaves it nil —
+`NewOpenAIChat` used to install `time.Sleep` there, which made the
+context-aware branch unreachable.  Provider error bodies are cut to 400 bytes
+on a rune boundary.
 
 #### DigitalOcean
 
@@ -346,6 +392,36 @@ addendum is appended to the system prompt:
 }
 ```
 
+#### Tool modes (`native.go`)
+
+`AGENT_TOOL_MODE` (`Service.ToolMode`) selects how the model calls tools:
+
+- **native** — when the chat client implements `llm.ToolChatClient`
+  (`OllamaChat`, `OpenAIChat` in both API modes), `startSession` renders the
+  tool table as JSON-Schema function definitions (`toolSpecs`, name-sorted,
+  `vector_add` / `vector_search` included with their parameters) and appends
+  `nativeAddendum` to the system prompt. `nextMove` calls
+  `CompleteTools(ctx, messages, specs)` and maps the reply onto the envelope
+  vocabulary the rest of the loop speaks (`envelopeFromCompletion`): one tool
+  call → `tool_call`, several → `tool_calls` (each with its provider call id),
+  text that parses as an envelope → that envelope, any other non-empty text →
+  `final`. `toolTurn` then records the step the way the API demands: an
+  assistant message carrying `ToolCalls` and one `role:"tool"` message per
+  result tied by `ToolCallID` (ids are generated for Ollama, which issues none).
+- **envelope** — the original protocol: the reply is text, parsed by
+  `parseJSONSafely` below; `toolTurn` replays the envelope JSON plus one tool
+  message.
+- **auto** (default) — native when supported. The first
+  `llm.ErrToolsUnsupported` (a 400 whose body says tools are unsupported —
+  `toolsUnsupportedRE`) latches `Service.nativeOff`, strips the addendum and
+  retries the same step through the envelope; every later run starts in
+  envelope mode. `envelopeMessages` flattens any native turns already in the
+  history into envelope text first.
+
+`meta.tool_mode` reports the mode a run used. JSON mode (`format=json`,
+`response_format: json_object`) is not sent with tools: it forces a text reply
+and suppresses tool calls on several models.
+
 #### Envelope recovery (`parseJSONSafely`)
 
 Not every model returns the bare object the prompt asks for, so the parser is
@@ -357,7 +433,11 @@ deliberately tolerant:
 2. The remaining text is scanned for *balanced* top-level `{...}` spans, with
    braces inside string literals ignored.  Markdown ```json fences need no
    special handling: they contribute no braces, so the scan finds the object
-   inside them.
+   inside them.  A `{` in prose that never closes ("pick one of {a, b. Final:
+   {...}") would keep the depth above zero to the end and hide the real
+   envelope, so the scan restarts just past such a brace (at most 16 restarts,
+   which keeps a reply made of thousands of stray braces from going
+   quadratic).
 3. Each span is unmarshalled in order; the first that parses **and** carries a
    `type` field wins, with the first otherwise-valid object as a fallback.
 4. A single-key `{"raw_model_json": "..."}` wrapper (legacy history rows) is
@@ -390,7 +470,8 @@ as each completes (potentially out of order).
 ```
 startSession()
   ├─ create or load session (via memory.Client)
-  ├─ semantic search for relevant memories (vector store)
+  ├─ semantic search for relevant memories (vector store; skipped when
+  │     AGENT_MEMORY_HITS <= 0 — the store's own default of 5 used to apply)
   ├─ load message tail (last N turns from history store)
   ├─ inject context block: relevant memories + current UTC datetime
   │     (+ Telegram chat_id when called from the bot)
@@ -419,6 +500,7 @@ for step = 1..MaxSteps:
           ├─ write AuditRecord to skill_invocations (best-effort, redacted
           │    for sensitive skills)
           └─ return batchResult{result, elapsed, attachments}
+        persist historyResult(result) — redacted for secret-bearing skills
         update timings + debug log
         append tool result to messages (capped at 32 KiB — maxToolContentBytes)
         continue
@@ -433,6 +515,7 @@ if MaxSteps exceeded:
 |---|---|---|
 | `vector_add` | Store a durable fact or preference | `memory.Client.AddMemory()` → in-process vector store |
 | `vector_search` | Semantic search over stored memories | `memory.Client.SearchMemory()` → in-process vector store |
+| `session_search` | Keyword search over earlier conversations (all words must match; the current session is excluded) | `memory.Client.SearchMessages()` → SQLite `LIKE` over user/assistant messages, snippet around the first word |
 | `schedule_task` | Create/list/delete/delete_all/enable/disable cron tasks | Native Go via `scheduler.ScheduleTaskSkill` |
 | `web_search` | DuckDuckGo HTML search (no API key); returns title/url/snippet | Native Go via `search.WebSearchSkill` |
 
@@ -492,7 +575,7 @@ best-effort.
 |---|---|
 | `thinking` | Step number |
 | `tool_call` | Tool name, args, why |
-| `tool_result` | Tool name, result text, elapsed seconds |
+| `tool_result` | Tool name, result text (first 300 bytes; `[redacted]` for `password_gen` / `jwt_inspect`), elapsed seconds |
 | `final` | Session ID, answer, metadata (`meta.fallback = true` when the answer is a recovery, not a real model answer) |
 | `error` | Error message — the run could not proceed (session creation or LLM transport failure). A model reply the parser cannot use is *not* an error; it arrives as a `final` with `meta.fallback = true` |
 
@@ -537,7 +620,7 @@ All memory operations run in-process — no HTTP round-trip to a sidecar.
 SQLite with WAL journal mode and a single connection (`SetMaxOpenConns(1)`):
 
 ```sql
-sessions (id INTEGER PK, created_at REAL)
+sessions (id INTEGER PK, created_at REAL, title TEXT DEFAULT '')
 messages (id INTEGER PK, session_id FK, ts REAL, role TEXT, content_json TEXT)
   INDEX ON messages(session_id, ts)
 ```
@@ -551,7 +634,9 @@ Public methods:
 | Method | Purpose |
 |---|---|
 | `CreateSession()` | Insert a new session row, return ID |
-| `ListSessions(limit)` | Most-recent sessions + message count |
+| `ListSessions(limit)` / `SearchSessions(limit, q)` | Most-recent sessions with message count, title, first-user-message preview and last activity; `q` matches titles or message text (`LIKE … ESCAPE`, wildcards escaped) |
+| `RenameSession(id, title)` / `DeleteSession(id)` | Title a session; delete it with its messages in one transaction (audit rows are kept: the record of what ran outlives the chat) |
+| `Usage(days)` | Queries (user messages) and audited tool calls per hour (≤ 2 days) or day, with error counts and mean duration, plus per-skill totals — the Health page charts |
 | `ListMessages(sid, limit, offset)` | Paginated message list |
 | `LoadTail(sid, limit)` | Last N messages for LLM context (skips `raw_model_json`) |
 | `AddMessage(sid, role, content)` | Persist one message |
@@ -585,6 +670,17 @@ INDEX ON skill_invocations(skill, ts)
 store `{"redacted": true}` for both args and result — raw values are never
 written to the database.
 
+The audit log is not the only place a result is persisted or echoed.  For the
+two skills whose *result* is itself a secret (`password_gen`, `jwt_inspect` —
+`secretResult()` in agent.go) the model gets the real value in-band for the
+current run, while the session history row (served by
+`/api/sessions/{sid}/messages` and replayed into every later turn), the
+stream's `tool_result` event and the debug log all get a redacted stand-in.
+That includes a *failed* call, whose error result echoes its args — for
+`jwt_inspect`, the token.  Shell and SSH command lines are redacted in the
+audit log only: the stream and debug log show them so an operator can see what
+ran (`eventArgs`).
+
 **Blob truncation** — args and result JSON blobs are truncated to
 `AUDIT_MAX_BLOB_BYTES` (default 64 KB) before storage.  Set to `0` to disable
 audit logging entirely (`AddInvocation` becomes a no-op).
@@ -605,20 +701,71 @@ opened with `NewPersistentDB(vectorDir, false)`.
 Deduplication pipeline:
 
 ```
-addText(text, meta)
-  ├─ SHA256(text) → hashes.Load (sync.Map) → skip if exact duplicate
+addText(text, meta)                       # whole pipeline under v.mu
+  ├─ SHA256(text) → hashes[sha] (plain map) → skip if exact duplicate
   ├─ embed(text) via embeddings client
-  ├─ collection.QueryEmbedding(embedding, 1)
+  ├─ queryClamped(embedding, 1)
   │     └─ if (1.0 - similarity) ≤ dedupDistance (0.08) → skip semantic duplicate
   └─ collection.AddDocument(chromem.Document{...})
-        └─ hashes.Store(sha, memoryID)
+        └─ hashes[sha] = memoryID
 ```
+
+`v.mu` serialises adds, so two identical `vector_add` calls in one parallel
+batch cannot both pass the hash check.  A second lock, `v.shrink`
+(`sync.RWMutex`), covers the other race: chromem refuses a query for more
+results than the collection holds, and every query sizes `k` from `Count()`
+first.  A delete landing between the two failed the search or list ("nResults
+must be <= the number of documents") — measured at ~10% of searches while a
+bulk delete ran.  Queries (`queryClamped`) take the read side around
+Count+Query, `deleteByID` takes the write side around `Delete`.  `deleteByID`
+also evicts a hash entry only while it still names the document being
+deleted.
 
 Metadata is stored as `map[string]string`; `coerceMeta()` converts any
 numeric, bool, or nil values from the caller-supplied `map[string]any`.
 
-`SearchMemory(query, k)` calls `collection.QueryEmbedding(embed(query), k)` and
-returns `(id, text, metadata, distance)` tuples sorted by ascending distance.
+`SearchMemory(query, k)` embeds the query and runs `queryClamped(emb, k)`
+(k ≤ 0 means 5; the agent skips the call entirely when `AGENT_MEMORY_HITS` ≤ 0),
+returning `(id, text, metadata, distance)` tuples sorted by ascending distance.
+
+**Namespaces.** `metadata.namespace` scopes a memory (absent = the shared
+namespace `""`). `SearchMemoryIn(query, k, namespaces)` runs one filtered
+query per namespace (chromem's `where` is an exact-match AND) and merges by
+similarity; `AddMemoryOpts` stores into one. The exact-dedup key is
+`sha256(text)` in the shared namespace — unchanged, so old documents still
+match — and `sha256(namespace + "\x00" + text)` elsewhere; the semantic
+check is filtered to the same namespace. An agent run's `RunRequest.Namespace`
+decides what `vector_add` writes and what injection / `vector_search` read
+(`recallNamespaces`: the run's namespace plus the shared one).
+
+**Expiry.** `metadata.expires_at` (unix seconds) comes from a TTL
+(`AddOptions.TTL`; 0 = `MEMORY_DEFAULT_TTL_DAYS`, < 0 = never) or the caller.
+Search, list and namespace counts skip expired documents (search asks for 2k
+candidates to leave room for them); `PurgeExpired` deletes them, and the
+gateway runs `RunJanitor` hourly.
+
+**Enumeration without embeddings.** chromem v0.7.0 has no list API, and
+listing used to embed a probe text, so it failed whenever the embeddings
+backend was down. The store now records the embedding width in
+`omegagrid-<collection>.dim.json` next to the chromem data (chromem skips
+non-directory entries) and enumerates with a fixed unit vector of that width.
+A collection written before the file existed is probed with common widths
+(768, 1024, 1536, …) and, failing that, the first add learns the width from
+its own embedding.
+
+**Index rebuild.** `newVectorStore` repopulates the SHA256 index from the
+stored documents (`rebuildIndexLocked`), so an exact re-add after a restart is
+caught without an embed call. When the width is still unknown at open, the
+first add rebuilds the index before its hash check.
+
+**Edit / export / import.** `UpdateMemory` rewrites a document in place
+(chromem's `AddDocument` overwrites by id) keeping `created_at`, adding
+`updated_at`, re-embedding a changed text, merging metadata (a `nil` value
+deletes a key) and moving the hash entry; it refuses a text that would
+duplicate a different memory. `ExportMemories` returns every document
+(expired included) oldest first, optionally with embeddings;
+`ImportMemories` adds each record through the normal dedup pipeline, keeping
+its id unless taken and reusing its embedding only when the width matches.
 
 #### Embeddings clients (`embeddings.go`)
 
@@ -639,7 +786,7 @@ in a single pass.  `openAIEmbeddings` uses Bearer authentication and parses
 
 ### 3.5 Skills (`internal/skills`)
 
-All 28 skills run in-process inside the gateway binary via a thread-safe
+All 51 built-in skills run in-process inside the gateway binary via a thread-safe
 `Registry`.  The `skills.Client` wraps the registry with the public `List()`
 and `Execute()` API consumed by the agent loop and HTTP handlers.
 
@@ -666,7 +813,7 @@ parameter list) for the same reason.
 
 #### Built-in skills (`builtin/`)
 
-28 skills compiled directly into the gateway binary: 27 in `builtin/`, plus
+51 skills compiled directly into the gateway binary: 50 in `builtin/`, plus
 `skill_creator` (defined in `client.go`).  Local `Skill`/`Param` types are
 defined in `builtin/helpers.go` to avoid import cycles; `client.go` converts
 them to the top-level `skills.Skill` type via `toSkill()`.
@@ -681,6 +828,16 @@ them to the top-level `skills.Skill` type via `toSkill()`.
 | `reminder.go` | `reminder` |
 | `exec.go` | `shell_command`, `ssh_command` |
 | `qr.go` | `qr_generate` |
+| `rss.go` | `rss_fetch` |
+| `notify.go` | `notify` |
+| `network2.go` | `http_timing`, `dns_compare`, `rdap_lookup`, `smtp_check`, `wake_on_lan`, `subnet_sweep` |
+| `traceroute.go` (+ `_linux` / `_other`) | `traceroute` |
+| `jsonquery.go` | `json_query` |
+| `textutil.go` | `time_convert`, `regex_test`, `text_diff`, `unit_convert` |
+| `csvquery.go` | `csv_query` |
+| `markdown.go` | `html_to_markdown` |
+| `knowledge.go` | `wikipedia`, `currency_convert`, `github` |
+| `workspace.go` | `file_list`, `file_read`, `file_write`, `pdf_text` |
 
 Shared hardening (skill arguments come from the LLM, so treat them as
 attacker-influenced):
@@ -752,7 +909,13 @@ Key implementation notes:
   `pi`, `e`, `inf`, `nan`).  No `eval()` — safe for untrusted input.
   Precedence follows Python: unary minus binds looser than `**` on its left
   (`-2**2` = `-4`), an exponent may itself be signed (`2**-1` = `0.5`), and
-  `**` is right-associative (`2**3**2` = `512`).  Exponent literals (`1e-5`,
+  `**` is right-associative (`2**3**2` = `512`).  So do the operators and
+  functions: `%` takes the divisor's sign (`-7 % 3` = `2`, where `math.Mod`
+  gives `-1`), `round` rounds half to even and takes optional digits,
+  `min`/`max` are variadic (two or more arguments), `factorial` rejects
+  non-integers instead of truncating them, call arguments must be separated by
+  commas (`pow(2 3)` is an error, a trailing comma is fine), and tabs/newlines
+  count as whitespace.  Exponent literals (`1e-5`,
   `1e+3`) lex as numbers.  Infinite or NaN results are returned as strings,
   since `encoding/json` cannot encode them.
 
@@ -762,21 +925,151 @@ Key implementation notes:
   `isHostname()` before either path runs: `dig` interprets leading `-` and `@`
   tokens as its own options (`-f <file>` reads a file, `@host` picks a server),
   so an unvalidated domain straight from the model could redirect the query.
+  `record_type` is an argv entry too, so it is checked against the six
+  supported types before `dig` runs; `@10.0.0.53` used to survive `ToUpper` and
+  send the query to that server directly, past netguard.
 
 - **`port_scan`** — bounded concurrency via semaphore channel (100 slots),
   `net.DialTimeout` with configurable timeout; returns sorted open port list.
-  `parsePorts` enforces the 1–65535 range while expanding, so an out-of-range
-  spec such as `1-1000000` is rejected instead of materialising a million-entry
-  slice that the caller then trims back to 1024.
+  `parsePorts` enforces the 1–65535 range while expanding, drops duplicates,
+  and stops expanding at `maxScanPorts` (1024) — so neither `1-1000000` nor
+  thousands of repeated `1-65535` parts materialise a huge slice first, and
+  `80,80,80` no longer lists an open port three times.
+
+- **`ping_check`** — TCP connect to `host:port`; `port` outside 1–65535 is an
+  error rather than a silent `reachable:false`.
+
+- **`uuid_gen`** — v1, v3, v4, v5, v7.  Any other version is an error; it used
+  to return v4 UUIDs labelled with the version requested.
 
 - **`whois_lookup`** — raw TCP port 43 to `whois.iana.org`, parses `refer:`
   line, re-queries the authoritative WHOIS server.
 
 - **`ssh_command`** — `loadSigner()` checks: identity_file arg → `SKILL_SSH_PRIVATE_KEY`
-  env (with base64 decode attempt) → `SKILL_SSH_IDENTITY_FILE` path.
+  env (with base64 decode attempt) → `SKILL_SSH_IDENTITY_FILE` path.  The
+  model-supplied `identity_file` goes through `readKeyFile`: regular files only,
+  at most 64 KiB.  `os.ReadFile("/dev/zero")` grew its buffer until the process
+  ran out of memory, and a FIFO or `/dev/stdin` blocked forever, before any
+  timeout applied.  Host keys are checked by `hostKeyCallback`
+  (`golang.org/x/crypto/ssh/knownhosts`) against `SKILL_SSH_KNOWN_HOSTS`:
+  `accept-new` (default) appends an unknown host's key under a mutex and
+  refuses a changed one, `strict` refuses unknown hosts, `insecure` is the old
+  `InsecureIgnoreHostKey`.
 
-- **`shell_command`** — blocked-pattern list, `context.WithTimeout`, captures
-  both stdout and stderr.  Disabled by default (`SKILL_SHELL_ENABLED=false`).
+- **`shell_command`** — blocked-pattern list, `context.WithTimeout` derived
+  from the run's context, captures both stdout and stderr.  Disabled by default
+  (`SKILL_SHELL_ENABLED=false`).  `ShellCommandWith(ShellConfig)` builds the
+  process through `shellCmd`: with `SKILL_SHELL_SANDBOX=bwrap` it is
+  `bwrap --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp --unshare-all
+  --die-with-parent --new-session [--share-net] [--bind DIR DIR] --chdir … sh
+  -c CMD` — read-only host filesystem, private `/tmp`, fresh namespaces, no
+  network. A missing bwrap fails closed (`bwrapPath` is the test seam). The
+  process-group kill on cancel covers bwrap and everything inside it.
+
+- **Context-aware skills** — `builtin.ContextExecutor` (`func(ctx, args)`) is
+  what the registry stores. Every skill that blocks on the network or a
+  process has a `XxxContext` constructor that threads ctx into
+  `http.NewRequestWithContext`, `Dialer.DialContext`,
+  `Resolver.Lookup*`, `exec.CommandContext` and retry backoffs; the plain
+  `Xxx()` constructors stay as `context.Background()` wrappers for callers and
+  tests. Pure-computation skills are wrapped with `builtin.Lift`, which checks
+  ctx once before running.
+
+- **`rss_fetch`** — RSS 2.0, RSS 1.0 (RDF) and Atom through one `encoding/xml`
+  struct; items from all feeds are merged and sorted newest first. `since`
+  takes RFC3339, a date or a duration ago (`parseLongDuration` adds `d` and `w`
+  units to `time.ParseDuration`). An undated item is never filtered out — it
+  cannot be shown to be old. Besides UTF-8 the decoder accepts ISO-8859-1 and
+  Windows-1252 (`feedCharsetReader`) rather than pulling in `x/text`.
+
+- **`notify`** — the model chooses among recipients the operator configured,
+  never an arbitrary one: Telegram chats in `NOTIFY_TELEGRAM_CHATS` (plus the
+  default chat), email addresses or `@domain`s in `NOTIFY_EMAIL_TO`, webhooks by
+  name from `NOTIFY_WEBHOOKS`. Email goes through `net/smtp` over a netguard
+  dial (STARTTLS when offered, implicit TLS on 465, PLAIN auth when a user is
+  set); CR/LF in the subject and recipient are neutralised, so a title cannot
+  add headers. Webhooks get `{"title","text","content"}` — `text` for Slack and
+  generic receivers, `content` for Discord. Transport errors are unwrapped from
+  `*url.Error` so the bot token or a secret webhook URL never reaches the model.
+
+- **`http_timing`** — `httptrace.ClientTrace` hooks on a netguard transport with
+  keep-alives off, so every sample pays DNS, connect and TLS. Redirects are not
+  followed (`http.ErrUseLastResponse`); the Location is reported instead.
+
+- **`dns_compare`** — one `net.Resolver{PreferGo: true}` per server whose
+  `Dial` targets that server through the netguard dialer; the authoritative
+  servers are found with `lookupNS` on the registrable-looking suffix. Answers
+  are sorted and grouped, so `consistent` is a plain comparison.
+
+- **`rdap_lookup`** — queries `rdap.org`, which redirects to the authoritative
+  registry, and summarises the response (events by action, nameservers,
+  entities with their jCard `fn`).
+
+- **`traceroute`** — no raw socket: one UDP socket per TTL with `IP_TTL` and
+  `IP_RECVERR`; the kernel queues the ICMP time-exceeded / port-unreachable on
+  the socket's error queue, read with `recvmsg(MSG_ERRQUEUE)` and parsed as
+  `sock_extended_err` + the offender's `sockaddr_in`. IPv4 and Linux only; the
+  `_other` build returns an explanatory error.
+
+- **`smtp_check`** — a hand-driven `textproto` session (the banner is needed,
+  and `net/smtp` hides it): banner, `EHLO`, `STARTTLS`, then a TLS handshake
+  with verification done separately so the result can say *why* a certificate
+  fails. MX hosts are tried in preference order; no MX means the domain itself
+  (RFC 5321 §5.1).
+
+- **`wake_on_lan`** — a 102-byte magic packet from a socket with `SO_BROADCAST`
+  (set in `exec_unix.go`'s `enableBroadcast`); only private, loopback or
+  limited-broadcast targets, and refused entirely when private networks are
+  blocked.
+
+- **`subnet_sweep`** — TCP connect to a few ports per address, 64 dials at a
+  time; `ECONNREFUSED` proves a host is up as well as an accept does. Capped at
+  256 addresses, network/broadcast skipped for IPv4, each address vetted by
+  netguard (refused ones are counted, not probed).
+
+- **`json_query`** — a small recursive-descent jq subset evaluated over value
+  streams: paths (`.a`, `."k"`, `[n]`, `[a:b]`, `[]`), pipes, `select` with
+  comparisons and `contains`, `map`, `sort_by`, and the common built-ins.
+  Ordering follows jq (null < false < true < numbers < strings < arrays <
+  objects).
+
+- **`time_convert`** — reads `now`, RFC3339, `YYYY-MM-DD[ HH:MM[:SS]]`, `15:04`,
+  `3pm` and unix seconds in the source zone, relying on the embedded tzdata;
+  business days skip Saturday and Sunday (no holiday calendars).
+
+- **`regex_test`** — Go's RE2: no backreferences or lookaround, which the error
+  message makes visible; inputs are capped (2000-byte pattern, 100 KB text).
+
+- **`text_diff`** — LCS line diff with deletions ordered before insertions in a
+  change, rendered as unified-diff hunks; 3000 lines per side keeps the
+  quadratic table small.
+
+- **`csv_query`** — `encoding/csv` with delimiter detection on the header line;
+  values compare numerically when both parse as numbers (thousands commas
+  stripped), else case-insensitively; groups are sorted by their first
+  aggregate. Workspace files go through `file_read`, so they are confined the
+  same way.
+
+- **`html_to_markdown`** — walks the `x/net/html` tree from `<main>`,
+  `<article>` or `<body>`, skipping `nav`, `header`, `footer`, `aside`, forms,
+  scripts and hidden elements; relative links and images are resolved against
+  the final URL.
+
+- **`wikipedia`, `currency_convert`, `github`** — free APIs with no key
+  (`github` takes an optional token). Their roots are package variables
+  (`wikipediaBase`, `ecbURL`, `githubAPI`, `rdapBase`, `telegramAPIBase`) so
+  tests point them at `httptest`; ECB rates are cached for an hour; GitHub's
+  issues endpoint also returns pull requests, which are filtered out.
+
+- **Workspace (`file_*`, `pdf_text`)** — every path is resolved through
+  `os.Root` (Go 1.24+), which refuses `..`, absolute paths and symlinks leading
+  out at the system-call level; `relPath` additionally maps a leading `/` to
+  the workspace root. Writes are capped per call (1 MB) and in total
+  (`SKILL_WORKSPACE_MAX_MB`, checked before writing, counting only the growth
+  of an overwritten file). Reads return ≤ 256 KB chunks ending on a rune
+  boundary, with `next_offset`. `pdf_text` uses `github.com/ledongthuc/pdf`
+  (pure Go, the project's one PDF dependency) behind a `recover`, since a
+  malformed file can make a parser panic.
 
 - **`qr_generate`** — uses `github.com/skip2/go-qrcode` with
   `DisableBorder = true`, so the reported `modules` (from `len(qr.Bitmap())`) is
@@ -789,7 +1082,7 @@ Key implementation notes:
   alongside `size_bytes` so callers can check both.
 
 - **`skill_creator`** — writes `.md` files to `SKILLS_DIR` and calls
-  `reg.register()` directly on the live registry for instant hot-registration.
+  `reg.registerMarkdown()` directly on the live registry for instant hot-registration.
   Every action that turns the `name` argument into a path (`create`, `show`,
   `delete`) validates it with `safeNameChars` first — lowercase letters, digits
   and underscores, 2–49 chars, starting with a letter — so a name can only ever
@@ -797,17 +1090,23 @@ Key implementation notes:
   frontmatter `name`, which is the key the registry actually uses and need not
   match the filename, before unregistering.
 
-  The frontmatter is hand-written rather than marshalled (insertion order stays
-  readable), so `yamlQuote` has to decide quoting on its own. It quotes on any
-  YAML indicator character, on the ones that only matter in first position
-  (`-`, `?`, `*`, `,`), on leading/trailing whitespace, on the empty string, and
-  on values that would come back as a bool/null/number. Missing the
-  first-position set is what made a description or argument as ordinary as
-  `*/5 * * * *` produce frontmatter yaml.v3 rejects: the file was written, the
-  reload failed, and a permanently unloadable skill stayed in `SKILLS_DIR`
-  (`LoadDir` skips unparseable files silently). Values that are neither strings
-  nor maps go through `yamlScalar`, which encodes them as JSON — a subset of
-  YAML — so a list stays a list instead of collapsing into `[a b c]`.
+  The frontmatter is produced by yaml.v3 (`renderMarkdown` builds a
+  `yaml.Node` mapping so the top-level fields keep a readable fixed order;
+  nested maps come out key-sorted).  It used to be hand-written, which quoted
+  values but emitted every map key raw — and parameter names and step keys come
+  from the model, so a name such as `"x:\nendpoint: http://127.0.0.1:9/\nzz"`
+  injected top-level `endpoint` / `timeout` / `steps` fields, turning the
+  "prompt-only" skill `skill_creator` reported into an HTTP or self-calling
+  pipeline skill.  Multi-line values were single-quoted, which YAML folds
+  (`"a\nb"` came back as `"a b"`), and an embedded `\n---\n` ended the header
+  early.  The encoder quotes keys, block-indents multi-line strings and keeps
+  typed values typed.
+
+  The file is written to a hidden `.<name>-*.tmp` sibling, loaded back with
+  `markdown.Load` (and its declared name checked), and only then renamed over
+  `<name>.md`.  Writing in place first meant a definition that failed to parse
+  destroyed the working skill it overwrote — the old version stayed registered
+  until the next restart, when `LoadDir` silently skipped the broken file.
 
 - **Loose argument types** — `builtin/helpers.go` (`str`, `intOr`, `floatOr`,
   `boolOr`) coerces across JSON types on purpose. LLMs quote numbers
@@ -859,6 +1158,14 @@ Constraints enforced by the loader, the registry and `skill_creator`:
 - **Nesting.** A pipeline may not list itself as a step, and nested skill steps
   stop at `MaxPipelineDepth` (5) instead of recursing until the goroutine stack
   overflows.
+- **Width.** Depth alone does not bound the work: two 20-step pipelines that
+  call each other fan out to 20^5 = 3.2M leaf calls (measured 2.8 GB of heap;
+  30 steps runs the process out of memory).  A pipeline file may have at most
+  `MaxPipelineSteps` (20) steps — `Load` rejects more — and every top-level
+  execution carries one shared budget of `maxPipelineCalls` (200) skill steps
+  through `Registry.executorAt`; once it is spent each further step reports
+  "pipeline call budget … exhausted" as its result.
+- **Timeout.** A skill's `timeout` is clamped to `maxTimeoutSec` (300 s).
 - **Endpoint escaping (behaviour change).** Values substituted into `endpoint`
   are percent-encoded (`escapeURLValue`: `url.QueryEscape`, `+` → `%20`), so a
   placeholder value can no longer add `/` path segments, `@`/`:` userinfo, or
@@ -887,18 +1194,39 @@ CREATE TABLE IF NOT EXISTS scheduled_tasks (
     created_at              REAL NOT NULL,
     last_run_at             REAL,
     last_result             TEXT,
-    run_count               INTEGER NOT NULL DEFAULT 0
+    run_count               INTEGER NOT NULL DEFAULT 0,
+    timezone                TEXT NOT NULL DEFAULT '',   -- IANA zone; '' = UTC
+    prompt                  TEXT NOT NULL DEFAULT '',   -- agent task when set (skill = 'agent')
+    max_retries             INTEGER NOT NULL DEFAULT 0,
+    retry_delay_sec         INTEGER NOT NULL DEFAULT 60,
+    retry_attempt           INTEGER NOT NULL DEFAULT 0, -- pending retry's attempt number
+    next_retry_at           REAL                        -- when it is due; NULL = none
+);
+CREATE TABLE IF NOT EXISTS task_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER NOT NULL,
+    trigger TEXT NOT NULL,            -- cron | retry | manual
+    attempt INTEGER NOT NULL DEFAULT 0,
+    started_at REAL NOT NULL, finished_at REAL NOT NULL,
+    ok INTEGER NOT NULL, result TEXT
 );
 ```
 
 `one_shot` marks a task that should run exactly once and then auto-disable
-(used for one-time reminders).  Databases created before this column existed
-are migrated on startup with a tolerated `ALTER TABLE ... ADD COLUMN` (SQLite
-has no `ADD COLUMN IF NOT EXISTS`, so the duplicate-column error is ignored
-after the first run).
+(used for one-time reminders); the disable happens in the same statement that
+claims the run (see below).  Databases created before a column existed are
+migrated on startup with a tolerated `ALTER TABLE ... ADD COLUMN` per column
+(SQLite has no `ADD COLUMN IF NOT EXISTS`, so the duplicate-column error is
+ignored after the first run).  `task_runs` keeps the newest
+`maxRunsPerTask` (200) rows per task (`RecordRun` prunes) and is cleared with
+its task.
 
-Operations: `Create`, `Get`, `ListAll`, `ListEnabled`, `UpdateLastRun`,
-`SetEnabled`, `Delete`, `DeleteAll`.  `DeleteAll` truncates the table in a
+Operations: `Create` / `CreateTask(TaskSpec)`, `Get`, `ListAll`,
+`ListEnabled`, `ClaimRun`, `RecordResult`, `RecordRun`, `ListRuns`,
+`ScheduleRetry`, `DueRetries`, `ClaimRetry`, `ClearRetry`, `UpdateLastRun`,
+`SetEnabled` (disabling also cancels a pending retry), `Delete`, `DeleteAll`.
+`ValidateSpec` is the one validator every entry point uses (API, CLI local
+mode, `schedule_task`): cron, time zone, exactly one of skill / prompt,
+`max_retries` 0–10, `retry_delay_sec` 0–86400.  `DeleteAll` truncates the table in a
 single statement and returns the number of rows removed.  The directory for
 the database file is created automatically via `os.MkdirAll`.
 
@@ -908,17 +1236,35 @@ the database file is created automatically via `os.MkdirAll`.
 func Matches(cronExpr string, dt time.Time) bool
 ```
 
-5-field format: `minute hour dayOfMonth month dayOfWeek`.
+5-field format: `minute hour dayOfMonth month dayOfWeek`, evaluated on the
+wall clock of the task's `timezone` (UTC when empty; `Task.Location()`,
+`latestMatchIn`). Claims stay keyed on UTC instants, so a wall-clock minute
+that repeats at the end of DST fires twice and one skipped at its start never
+fires. The zone database is embedded (`time/tzdata`) so zones resolve in the
+distroless image.
 
 | Syntax | Meaning |
 |---|---|
 | `*` | Any value |
-| `*/N` | Every N-th value |
+| `*/S` | Every S-th value from the field minimum |
 | `N` | Exact match |
-| `N-M` | Range (inclusive) |
+| `N/S` | N, N+S, … up to the field maximum (Vixie / croniter: `5/15` = 5,20,35,50) |
+| `N-M`, `N-M/S` | Range (inclusive), optionally stepped |
 | `A,B,C` | Comma-separated list |
+| `jan`…`dec`, `sun`…`sat` | Month / weekday names (any case), usable in ranges |
 
-Day of week: 0 = Sunday.  Invalid expressions return `false` (safe default).
+Day of week: 0 = Sunday, 7 is also Sunday.  Day-of-month and day-of-week
+follow Vixie semantics: when **both** are restricted the expression fires when
+either matches; a field that *starts with* `*` (so `*/2` too) is unrestricted,
+and then the two are ANDed — `0 0 */2 * 1` means odd days that are Mondays,
+not "odd days plus Mondays".  Invalid expressions return `false` (safe default).
+
+`ValidateCron` checks syntax and ranges, and additionally rejects a
+day-of-month that none of the selected months has when day-of-week is
+unrestricted (`0 0 30 2 *`, `0 0 31 4,6,9,11 *`): such a task validated and
+then never fired.  Feb 29 is accepted.  The `cron_schedule` builtin
+(`builtin/eval.go`) and the web UI's "Next:" preview (`Scheduler.tsx`)
+implement the same rules and must be kept in step with `cron.go`.
 
 #### Runner (`runner.go`)
 
@@ -930,14 +1276,29 @@ so `omega` in local mode never executes due tasks:
 every SchedulerTickSec (default 60s):
   minutes = every whole minute not yet evaluated, oldest first (see below)
   for each enabled task:
-    if task.CronExpr matches ANY of those minutes AND not already run this minute:
-      execute task.Skill with task.Args
-      UpdateLastRun(task.ID, result)
-      if task.OneShot:
-        SetEnabled(task.ID, false)   # run once, then disable (not delete)
-      if task.NotifyTelegramChatID != nil:
-        send result via Telegram Bot API
+    slot = the LATEST of those minutes task.CronExpr matches on the task's
+           wall clock (task.Location()); skip if none
+    if ClaimRun(task.ID, slot):        # atomic; also disables a one-shot
+      execute(task, "cron", 0)
+  for each task with next_retry_at <= now:
+    if ClaimRetry(task.ID, next_retry_at):   # atomic
+      execute(task, "retry", task.RetryAttempt)
+
+execute(task, trigger, attempt):
+  run the prompt through the agent (prompt task) or the skill with its args,
+    under the runner's context (cancelled by Stop); panic → task error
+  RecordRun(...) ; RecordResult(task.ID, result)
+  if trigger != manual:
+    failed and attempt < MaxRetries → ScheduleRetry(attempt+1, now + delay·2^attempt)
+    otherwise                         → ClearRetry
+    notify Telegram unless a retry is pending
 ```
+
+`Runner.SetAgent(AgentFunc)` enables prompt tasks; `bootstrap.New` wires it
+to `agent.Service.RunContext` with `AGENT_MAX_STEPS`. `Runner.RunNow(ctx, id)`
+is the run-now path: it records a `manual` run and `last_result` but leaves
+`last_run_at`, one-shot state and retries alone, so testing a task does not
+shift or consume its schedule.
 
 **Missed-minute sweep.** Cron matching works on whole minutes, but a 60s ticker
 drifts: fire at `12:00:59.8` and the next fire lands at `12:02:00.1`, so `12:01`
@@ -952,19 +1313,33 @@ resumes with the last hour checked and logs how many minutes it skipped, rather
 than replaying a day of cron. A task matching several swept minutes still runs
 **once** — the sweep exists to avoid losing a run, not to replay a backlog.
 
-Deduplication: before executing, the runner calls `Store.ClaimRun(id, minute)`,
-an atomic `UPDATE … WHERE last_run_at IS NULL OR last_run_at < minute`.  Only
-the caller whose update hits a row runs the task, so several processes can
-share one scheduler DB without double-firing, and a tick period shorter than a
-minute cannot fire twice.  `last_run_at` is set to the **scheduled minute**
-(not the completion time); `RecordResult` later stores `last_result` and bumps
-`run_count`.
+Deduplication: before executing, the runner calls `Store.ClaimRun(id, slot)`,
+an atomic `UPDATE … WHERE enabled = 1 AND (last_run_at IS NULL OR last_run_at
+< slot)`.  Only the caller whose update hits a row runs the task, so several
+processes can share one scheduler DB without double-firing, and a tick period
+shorter than a minute cannot fire twice.  `last_run_at` is set to the
+**scheduled minute** (not the completion time); `RecordResult` later stores
+`last_result` and bumps `run_count`.
+
+The claimed minute is the one that *matched*, not the current one.  Claiming
+"now" let a process whose ticker had drifted past a slot win a claim for a slot
+another process had already run (its `last_run_at` was older than "now"), so
+the task ran twice.
+
+The same `UPDATE` sets `enabled = 0` for a one-shot task.  Disabling it only
+after the run left it armed while the skill executed: a crash, or a shutdown
+that abandons a slow task after `StopTimeout`, made "remind me at 3pm" fire
+again the next day.
+
+A clock that steps backwards (NTP correction) leaves every `last_run_at` in
+the future until wall time catches up, so tasks due in that window are
+skipped; the sweep does not try to detect this.
 
 Tasks run **sequentially inside the tick**, so one slow skill delays the rest of
 that tick's tasks; the missed-minute sweep is what stops that delay from turning
 into a lost run.
 
-One-shot tasks are **disabled** rather than deleted after firing, so their
+One-shot tasks are **disabled** rather than deleted when they fire, so their
 `last_result` / `run_count` audit trail survives.  When a one-shot task runs
 the `reminder` skill, the Telegram notification delivers the bare reminder
 text (`⏰ Reminder: <message>`) instead of the task's JSON result; all other
@@ -973,12 +1348,13 @@ reminder run also falls back to the JSON error so failures stay visible.
 
 #### Native skill (`skill.go`)
 
-`ScheduleTaskSkill` exposes six actions:
+`ScheduleTaskSkill` exposes seven actions:
 
 | Action | Parameters | Returns |
 |---|---|---|
-| `create` | `cron_expr` (UTC), `skill`, `name`, `args`, `notify_telegram_chat_id`, `one_shot` | `{created: true, task: {...}}` |
+| `create` | `cron_expr`, `timezone`, `skill` + `args` **or** `prompt`, `name`, `notify_telegram_chat_id`, `one_shot`, `max_retries`, `retry_delay_sec` | `{created: true, task: {...}}` |
 | `list` | — | `{count: N, tasks: [...]}` |
+| `history` (alias `runs`) | `task_id`, `limit` | `{task_id, count, runs: [...]}` |
 | `delete` | `task_id` | `{deleted: true, task_id: N}` |
 | `delete_all` | — | `{deleted_all: true, deleted_count: N}` |
 | `enable` | `task_id` | `{ok: true, task_id: N, enabled: true}` |
@@ -993,7 +1369,10 @@ CLI's local mode and the MCP tool provider all share one registration),
 operating directly on the `Store` struct — no HTTP round-trip required.
 
 `delete`, `enable` and `disable` return `{error: "Task N not found"}` for an
-unknown id rather than reporting success.
+unknown id rather than reporting success.  `create` accepts `args` as an
+object or as a string holding a JSON object (models often send the latter);
+anything else is an error rather than a silent `{}`, which used to make a
+reminder fire with no message.
 
 ### 3.7 HTTP gateway (`internal/httpapi`)
 
@@ -1004,22 +1383,35 @@ Built on [go-chi/chi v5](https://github.com/go-chi/chi).
 1. `middleware.Recoverer` — panic recovery
 2. `middleware.RequestID` — inject unique request ID
 3. `middleware.RealIP` — trust `X-Forwarded-For`
-4. `corsMiddleware` — no wildcard: CORS headers are sent only for origins in
+4. `hostGuard` — DNS-rebinding defence, active only while `GATEWAY_API_TOKEN`
+   is empty.  A page on `evil.example` can re-point its own name at
+   `127.0.0.1`; its requests then carry `Host: evil.example` and
+   `Origin: http://evil.example`, which `originGuard` rightly treats as
+   same-origin — full read/write API access, and through `/api/query` the
+   agent's tools.  Such a request always names the attacker's dotted DNS
+   name, so only Host values a public resolver cannot hand out are served: IP
+   literals, single-label names (`localhost`, the compose service `gateway`),
+   `*.localhost`, plus `GATEWAY_ALLOWED_HOSTS`.  Anything else gets 403 on
+   every route, reads included.  With a token the guard steps aside: the
+   rebinding page cannot read the token.
+5. `corsMiddleware` — no wildcard: CORS headers are sent only for origins in
    `CORS_ALLOWED_ORIGINS` (`*` allows any); empty means same-origin only, which
    is all the nginx-served UI needs.  `OPTIONS` answers 204.
-5. `originGuard` — rejects state-changing requests (anything but
+6. `originGuard` — rejects state-changing requests (anything but
    GET/HEAD/OPTIONS) whose `Origin` header is neither the request's own host nor
    an allowed origin, with 403.  A cross-site form post is a "simple" request
    that skips preflight, so withholding CORS headers alone would not stop it.
    Clients that send no `Origin` (curl, CLI, bot) pass.
-6. `limitBody` — `http.MaxBytesReader` caps every request body at 4 MiB.
-7. `requireToken` — on `/api/*` and `/mcp` only, when `GATEWAY_API_TOKEN` is
+7. `limitBody` — `http.MaxBytesReader` caps every request body at 4 MiB.
+8. `requireToken` — on `/api/*` and `/mcp` only, when `GATEWAY_API_TOKEN` is
    set: constant-time compare of `Authorization: Bearer <token>`, else 401 with
    `WWW-Authenticate`.  `/health` is never gated.
 
 Server settings (`cmd/gateway/main.go`): `ReadHeaderTimeout` 30 s,
 `ReadTimeout` 60 s, `IdleTimeout` 120 s, no `WriteTimeout` (SSE and long agent
-runs).  Request contexts derive from a base context cancelled on SIGTERM/SIGINT,
+runs).  The listener binds every interface (`:BACKEND_PORT`, required inside a
+container); with no token set the gateway logs a startup warning that the API
+is unauthenticated.  Request contexts derive from a base context cancelled on SIGTERM/SIGINT,
 so in-flight runs wind down before `Shutdown`'s 10 s deadline; `/api/query`
 passes `r.Context()` to `Agent.RunContext`, so a client disconnect aborts the run.
 
@@ -1027,30 +1419,43 @@ passes `r.Context()` to `Agent.RunContext`, so a client disconnect aborts the ru
 
 | Method | Path | Handler | Notes |
 |---|---|---|---|
-| `GET` | `/health` | `handleHealth` | Provider, model, skills dir, scheduler DB |
+| `GET` | `/health` | `handleHealth` | Release version, provider, model, skills dir, scheduler DB, embeddings probe |
 | `POST` | `/api/query` | `handleQuery` | Synchronous agent query |
 | `POST` | `/api/query/stream` | `handleQueryStream` | SSE agent query |
 | `POST` | `/api/sessions/new` | `handleNewSession` | In-process history store |
-| `GET` | `/api/sessions` | `handleListSessions` | In-process history store; `limit` (default 50, non-positive → default) |
+| `GET` | `/api/sessions` | `handleListSessions` | In-process history store; `limit` (default 50, non-positive → default); `q` searches titles and message text (LIKE wildcards escaped); rows carry `title`, `preview`, `last_at` |
 | `GET` | `/api/sessions/{sid}/messages` | `handleSessionMessages` | In-process history store; `limit` (default 200, non-positive → default), `offset` (clamped to ≥0) |
+| `PATCH` | `/api/sessions/{sid}` | `handleRenameSession` | `{title}` (≤ 200 chars); 404 when absent |
+| `DELETE` | `/api/sessions/{sid}` | `handleDeleteSession` | Deletes the session and its messages; the audit log keeps its rows |
+| `GET` | `/api/stats/usage` | `handleUsage` | `days` (default 7, max 90): queries and audited tool calls per hour (≤ 2 days) or day, plus per-skill totals |
 | `POST` | `/api/memory/add` | `handleMemoryAdd` | In-process vector store |
 | `POST` | `/api/memory/search` | `handleMemorySearch` | In-process vector store |
 | `GET` | `/api/memory` | `handleMemoryList` | List stored memories newest-first; `limit` (default 100, 0=all), `offset` |
 | `GET` | `/api/memory/{id}` | `handleMemoryGet` | Single memory by ID (404 if absent) |
 | `DELETE` | `/api/memory/{id}` | `handleMemoryDelete` | Delete a memory by ID (404 if absent) |
+| `PUT` | `/api/memory/{id}` | `handleMemoryUpdate` | Edit text/meta/expiry in place; 400 on a duplicate text, 404 when absent |
+| `GET` | `/api/memory/namespaces` | `handleMemoryNamespaces` | Namespaces with live memory counts |
+| `GET` | `/api/memory/export` | `handleMemoryExport` | JSON Lines; `embeddings=1` includes vectors |
+| `POST` | `/api/memory/import` | `handleMemoryImport` | JSON Lines or JSON array; exempt from the 4 MiB body cap, limited to 64 MiB itself |
 | `POST` | `/mcp` | `mcp.Server.Handler` | MCP server (JSON-RPC 2.0) exposing skills as tools. Gated by `MCP_SERVER_DISABLED`. |
-| `GET` | `/api/skills` | `handleListSkills` | In-process skill registry, sorted by name |
+| `GET` | `/api/skills` | `handleListSkills` | In-process skill registry, sorted by name; each skill has `kind` (`builtin`, `markdown`, `remote`) |
+| `POST` | `/api/skills/validate` | `handleSkillValidate` | Parse a markdown skill without saving it |
+| `POST` | `/api/skills/source` | `handleSkillSave` | Validate, write atomically, hot-register. Gated by `PLAYGROUND_DISABLED` |
+| `GET` | `/api/skills/{name}/source` | `handleSkillSource` | A markdown skill's file (404 otherwise) |
+| `DELETE` | `/api/skills/{name}` | `handleSkillDelete` | Markdown skills only. Gated by `PLAYGROUND_DISABLED` |
 | `POST` | `/api/skills/{name}/invoke` | `handleSkillInvoke` | **Skill playground** — direct skill execution, no agent loop. Gated by `PLAYGROUND_DISABLED`. |
 | `GET` | `/api/tools` | `handleListTools` | Built-in tool schemas |
 | `GET` | `/api/invocations` | `handleListInvocations` | Audit log — filter by skill, session, errors; paginated |
 | `GET` | `/api/invocations/{id}` | `handleGetInvocation` | Single audit record |
 | `POST` | `/api/invocations/{id}/replay` | `handleReplayInvocation` | Re-run skill with same args; writes a new `replay` row. Gated by `PLAYGROUND_DISABLED` and restricted to `kind=skill` rows |
-| `POST` | `/api/scheduler/tasks` | `handleSchedulerCreate` | In-process scheduler store; `cron_expr` validated up front (400 on a malformed expression) |
+| `POST` | `/api/scheduler/tasks` | `handleSchedulerCreate` | In-process scheduler store; the whole spec is validated up front by `scheduler.ValidateSpec` (cron, time zone, skill-or-prompt, retry bounds — 400 on any error) |
 | `GET` | `/api/scheduler/tasks` | `handleSchedulerList` | In-process scheduler store |
 | `GET` | `/api/scheduler/tasks/{id}` | `handleSchedulerGet` | In-process scheduler store |
 | `POST` | `/api/scheduler/tasks/{id}/enable` | `handleSchedulerEnable` | In-process scheduler store; 404 when the task is gone |
 | `POST` | `/api/scheduler/tasks/{id}/disable` | `handleSchedulerDisable` | In-process scheduler store; 404 when the task is gone |
 | `DELETE` | `/api/scheduler/tasks/{id}` | `handleSchedulerDelete` | In-process scheduler store; 404 when the task is gone |
+| `POST` | `/api/scheduler/tasks/{id}/run` | `handleSchedulerRun` | Run now through `Deps.Runner` (synchronous, bound to the request); 503 without a runner, 404 when absent |
+| `GET` | `/api/scheduler/tasks/{id}/runs` | `handleSchedulerRuns` | Run history, newest first; `limit` (default 50) |
 
 The gateway router serves `/health`, `/api/*`, and (unless disabled) `/mcp`.
 The gateway binary contains no static-file serving and no UI assets; all
@@ -1114,7 +1519,7 @@ Long-polling update handler.
 
 | Command | Handler | Description |
 |---|---|---|
-| `/start` | `handleStart` | Reset session, show help text |
+| `/start` | `handleStart` | Show help text (and the sender's ID while auth is on); resets the chat's session only for an authorized sender — in a group the session is shared, and any member could otherwise wipe it |
 | `/ask <query>` | `handleAsk` | Explicit query (shows model/steps in footer) |
 | `/new` | `handleNew` | Start fresh session |
 | `/skills` | `handleSkills` | List available skills |
@@ -1128,8 +1533,21 @@ message every 1500 ms with the current step.  Falls back to synchronous
 that breaks after the agent has started is reported as interrupted rather than
 re-run (which would duplicate tool calls and side effects).
 
+**Memory scope**: `BOT_MEMORY_SCOPE` (`Bot.SetMemoryScope`) maps each query to
+a memory namespace sent as `namespace` in the gateway request —
+`shared` (none), `user` (`telegram:user:<sender id>`) or `chat`
+(`telegram:chat:<chat id>`).
+
 **Concurrency**: at most 8 updates are handled at once (`maxConcurrentHandlers`),
 and a per-chat lock serializes messages within one chat.
+
+**Message length**: answers are split by `splitForTelegram` into chunks of at
+most `telegramMaxLen` (4000) **UTF-16 code units** — Telegram's unit, in which
+a non-BMP character such as most emoji counts twice — preferring line breaks
+and never splitting a rune.  Counting runes let 3000 emoji (6000 units) through
+as one chunk; Telegram answered 400 and the user was left with the stale
+status message.  No `ParseMode` is set, so replies are plain text (the `/ask`
+footer is `model: … | steps: N`, not Markdown).
 
 ### 3.9 Observability (`internal/observability`)
 
@@ -1222,12 +1640,12 @@ A single-page application built with **Vite + React 18 + TypeScript + Tailwind C
 
 | Route | Page | Key behaviour |
 |---|---|---|
-| `/ui/` | Chat | Streaming chat; SSE events rendered as tool-call cards; session sidebar; auto-scroll; abort button |
-| `/ui/memory` | Memory | Semantic search (configurable k); manual add with JSON metadata; browse-all list with per-memory delete |
-| `/ui/skills` | Skills | Collapsible skill cards with full parameter schemas; **inline playground panel** with auto-generated form, three-tab result view (Pretty / Raw / Timing), and a "Copy as `tool_call` JSON" button for prompt debugging |
-| `/ui/scheduler` | Scheduler | Task list with enable/disable toggle and delete; shows `last_result` and `run_count`; create-modal with skill picker; 30 s auto-refresh |
+| `/ui/` | Chat | Streaming chat; SSE events rendered as tool-call cards; session sidebar with debounced search (`?q=`), inline rename (PATCH) and delete; auto-scroll; abort button |
+| `/ui/memory` | Memory | Semantic search (configurable k); manual add with namespace and expiry; browse-all list with a namespace filter (`/api/memory/namespaces`); edit modal (`PUT`); delete; JSONL export (authenticated fetch → Blob download) and import |
+| `/ui/skills` | Skills | Collapsible skill cards with full parameter schemas and a `kind` badge; **inline playground panel** with auto-generated form, three-tab result view (Pretty / Raw / Timing), and a "Copy as `tool_call` JSON" button; markdown **skill editor** (`SkillEditor.tsx`) with a 400 ms debounced `/api/skills/validate` pane, Save disabled until valid |
+| `/ui/scheduler` | Scheduler | Task list with enable/disable toggle, delete, **Run now** and a run-history expander (`TaskRunHistory.tsx`); shows time zone, agent badge, retry settings and a pending retry; create modal (`TaskCreateModal.tsx`) for skill or agent tasks with time zone, retries, one-shot and Telegram chat, and a "Next:" preview (`lib/cron.ts`) evaluated in the chosen zone with the server's rules (§3.6), shown as local time + zone time; 30 s auto-refresh |
 | `/ui/activity` | Activity | Skill invocation audit log; filter by skill/session/errors; JSON drawer; Replay button; 10 s auto-refresh |
-| `/ui/health` | Health | Provider/model status card; 30 s auto-refresh |
+| `/ui/health` | Health | Provider/model status card (30 s auto-refresh) and a usage panel (`UsagePanel.tsx`, hand-drawn SVG — no chart library) over `/api/stats/usage` |
 
 #### SSE stream protocol
 
@@ -1248,7 +1666,11 @@ Stream events update Zustand state which React components observe:
 - `tool_call` → fill the slot's `toolCall` field
 - `tool_result` → fill the slot's `toolResult` field
 - `final` → set `finalData`, trigger history refetch, refresh session list
-- `error` → set `errorMsg`, show toast
+- `error` → set `errorMsg`, show toast, and put the question back in the input
+  box for a resend.  The gateway's payload is `{"error": "..."}`; errors raised
+  inside `stream.ts` itself (401, network failure) use `{"message": "..."}`, and
+  the handler reads either.  Reading only `.message` used to make every gateway
+  error `undefined`: the error box stayed hidden and the question vanished.
 
 #### API token
 
@@ -1262,7 +1684,9 @@ every REST and SSE request from then on.
 The gateway binary contains no UI assets and no static-file serving.  The
 React app is built and served exclusively by the nginx frontend container.
 For local UI development without Docker, run `make dev-web` (Vite dev
-server at `:5173/ui/`, proxying `/api` to the gateway on `:8000`).
+server at `:5173/ui/`, proxying `/api` to the gateway on `:8000`). The proxy
+keeps the browser's Host (`changeOrigin: false`): with it rewritten to
+`:8000` while Origin says `:5173`, the origin guard rejected every write.
 
 ### 3.12 Bootstrap (`internal/bootstrap`)
 
@@ -1289,11 +1713,24 @@ func New(cfg config.Config) (*Services, func(), error)
 
 This keeps `cmd/gateway/main.go` a thin wrapper and lets the CLI reuse the gateway's exact construction without duplication.
 
+`New` also starts the MCP connection manager (`startMCPServers`, waiting at
+most `MCP_CONNECT_WAIT_SEC`; cleanup cancels it) and wires the runner's agent
+(`Runner.SetAgent`) for prompt tasks. The gateway additionally starts the
+memory janitor (`Memory.RunJanitor`, hourly) and hands `svc.Runner` to the
+router for run-now.
+
 ### 3.13 CLI (`cmd/cli` — `omega` binary)
 
 A single static Go binary that exposes the agent's full surface without
 requiring a running HTTP gateway.  Built with stdlib only (no cobra) using
 manual subcommand dispatch + `flag.FlagSet` per subcommand.
+
+Every subcommand parses through `parseArgs`, which accepts flags on either
+side of the positionals (a literal `--` still ends flag parsing).  Go's `flag`
+package stops at the first non-flag, so the documented `omega ask "q"
+--session 7` and `omega skills run NAME --arg k=v` used to drop every flag
+after the positional — the skill ran with empty args, the session was lost —
+and still exit 0.
 
 ```
 omega <ask|skills|memory|schedule|session> [flags] [args]
@@ -1306,7 +1743,7 @@ The CLI checks the `OMEGA_REMOTE` env var to choose between two modes:
 | Mode | When | How |
 |---|---|---|
 | **local** (default) | `OMEGA_REMOTE` unset | `bootstrap.New(cfg)` constructs all services in-process — same wiring as the gateway. The `Skills`, `Memory`, `Sched`, and `Agent` services are then called directly. |
-| **remote** | `OMEGA_REMOTE=http://host:port` set | Each subcommand makes JSON HTTP calls to the gateway's REST endpoints, sending `Authorization: Bearer $GATEWAY_API_TOKEN` when set. SSE streaming is parsed by `bufio.Scanner`. |
+| **remote** | `OMEGA_REMOTE=http://host:port` set | Each subcommand makes JSON HTTP calls to the gateway's REST endpoints, sending `Authorization: Bearer $GATEWAY_API_TOKEN` when set. SSE streaming is parsed by `bufio.Scanner`. Agent calls (`/api/query*`, `/invoke`) get a 15-minute client timeout (`agentRunTimeout`, the bot's budget) — `http.Client.Timeout` covers the body too, so the old 120 s / 300 s cut off long runs and the disconnect cancelled them on the gateway; everything else keeps 120 s. Path segments (skill name, memory ID) are escaped. |
 
 Subcommands depend only on the typed wrappers in `cmd/cli/client.go`
 (`listSkills()`, `invokeSkill()`, `searchMemory()`, etc.); the wrappers
@@ -1316,15 +1753,19 @@ internally branch on `isRemote()` to pick the right path.
 
 | Command | Purpose |
 |---|---|
-| `omega ask [--stream] [--session N] [--max-steps N] "..."` | Run an agent query.  With `--stream` and a TTY stdout, renders thinking / tool_call / tool_result events with ANSI color; falls back to plain text when stdout is piped.  The step budget is `--max-steps`, else `AGENT_MAX_STEPS`, else 25 (`resolveMaxSteps`); local mode used to hardcode 25 and ignore the env var every other entry point honours. |
+| `omega version` | Print the release version (`internal/version`). |
+| `omega ask [--stream] [--session N] [--max-steps N] [--namespace NS] "..."` | Run an agent query.  With `--stream` and a TTY stdout, renders thinking / tool_call / tool_result events with ANSI color; falls back to plain text when stdout is piped.  The step budget is `--max-steps`, else `AGENT_MAX_STEPS`, else 25 (`resolveMaxSteps`); local mode used to hardcode 25 and ignore the env var every other entry point honours. |
 | `omega skills list` | List all registered skills with signatures. |
 | `omega skills describe NAME` | Show one skill's full schema. |
-| `omega skills run --arg k=v NAME` | Invoke a skill directly (uses the same execution path as the playground endpoint). |
+| `omega skills run NAME --arg k=v` | Invoke a skill directly (same execution path as the playground endpoint) and print its result as JSON. A failed or unknown skill exits 1 in both modes — remote mode used to print the playground's `null` result and exit 0. |
 | `omega memory search -k N "Q"` | Semantic search over vector memory. |
 | `omega memory add --meta k=v "TEXT"` | Manually add a memory. |
 | `omega memory list [-limit N] [-offset N]` | List stored memories newest-first. |
 | `omega memory delete ID` | Delete a memory by ID (alias `rm`). |
-| `omega schedule list / create / delete` | CRUD for scheduled cron tasks. |
+| `omega memory edit ID [--text] [--meta k=v] [--ttl D]` | Edit in place (`--meta k=` removes a key; `--ttl 0` removes the expiry). |
+| `omega memory namespaces` / `export [-o F] [--embeddings]` / `import F` | Namespace counts; JSON Lines export to stdout or a file; import from a file or `-` (stdin). `add`, `search` and `list` take `--namespace` (`search` repeatable; `""` = shared), `add` takes `--ttl`. |
+| `omega schedule list / create / delete` | CRUD for scheduled cron tasks. `create` takes `--skill` + `--arg` or `--prompt`, plus `--tz`, `--retries`, `--retry-delay`, `--one-shot`. Local `create` validates with `scheduler.ValidateSpec` like the API does, and local `delete` of a missing ID is an error. |
+| `omega schedule enable / disable / run / history ID` | Toggle a task, run it now (in-process in local mode; exits 1 when the run failed), or show its run history. |
 | `omega session list` | List sessions with message counts. |
 | `omega session export ID` | Dump a session's full message history as JSON (for piping to `jq`). |
 
@@ -1682,7 +2123,7 @@ POST /api/invocations/{id}/replay   → {"replayed_from":42,"skill":"weather","r
 #### Health
 
 ```
-GET /health → {"ok": true, "provider": "ollama",
+GET /health → {"ok": true, "version": "0.6.0", "provider": "ollama",
                "chat_base": "http://127.0.0.1:11434", "chat_model": "llama3:latest",
                "skills_dir": "/app/data/skills", "scheduler_db": "...",
                "embed_model": "nomic-embed-text", "embed_provider": "ollama",
@@ -1701,7 +2142,12 @@ The gateway is both an MCP **server** and an MCP **client**, implemented as a
 hand-rolled JSON-RPC 2.0 layer (`internal/mcp`) with no SDK dependency.
 
 Server — single endpoint, "streamable HTTP" style (one JSON request → one JSON
-response; notifications get `202 Accepted` with no body):
+response; notifications get `202 Accepted` with no body).  A notification is a
+message with **no `id` member**, whatever its method — `initialize`, `ping` and
+`tools/list` notifications used to be answered — while `"id": null` is an
+ordinary request (it used to be treated as a notification, so a `tools/call`
+with `id: null` was silently dropped).  Malformed `tools/call` params answer
+`-32602 Invalid params`; batch arrays are not supported:
 
 ```
 POST /mcp
@@ -1724,7 +2170,27 @@ endpoint is gated by `MCP_SERVER_DISABLED`.
 Client — `MCP_SERVERS` is a comma-separated list of `name=url` entries (append
 `|Header: Value` for a single auth header). At startup the gateway dials each
 server (`initialize` + `tools/list`), then registers every remote tool into the
-local skill registry namespaced as `<name>_<tool>`. Responses are accepted as
+local skill registry namespaced as `<name>_<tool>`.  `skills.Client.Register`
+refuses a name that is already taken (built-in, markdown, or an earlier
+server's tool) and `registerRemoteTool` refuses the native tool names
+(`schedule_task`, `web_search`, `vector_add`, `vector_search`) the registry
+cannot see; the tool is skipped and logged.  The remote server picks the tool
+half of the name, so before this a server named `http` offering `request`
+replaced the built-in `http_request` — and with it the private-network and
+enable gates the built-in enforces.  A remote `inputSchema` property whose
+`type` is a union (`["string","null"]`, as Pydantic and Zod emit for optional
+fields) maps to its first non-null type; a single such property used to fail
+the whole schema decode, registering the tool with no parameters at all.
+The connection manager (`bootstrap/mcpclients.go`, one goroutine per server)
+dials all servers in parallel and `bootstrap.New` waits at most
+`MCP_CONNECT_WAIT_SEC` for the first attempts; a server that failed retries
+with backoff (`mcpBackoffMin` 5 s doubling to 5 min) until it answers. Each
+connected server is re-listed every `MCP_REFRESH_SEC` and whenever the client
+sees `notifications/tools/list_changed` in an SSE response
+(`Client.ListChanged()`): tools are registered, replaced when their
+definition changed, and withdrawn (`skills.Client.Unregister`, which refuses
+built-ins and markdown skills) when gone. A failed refresh keeps the current
+tools. Cleanup cancels the manager.  Responses are accepted as
 either `application/json` or `text/event-stream`; in the SSE case the client
 skips server notifications and requests interleaved before the matching
 response. When a server answers 404 to a request that carried a session id
@@ -1754,7 +2220,7 @@ which could hand two in-flight requests the same JSON-RPC id.
 - **SQLite via pure Go** — `modernc.org/sqlite` needs no CGO, simplifying
   cross-compilation and distroless deployment.
 - **Fast startup** — sub-second cold start vs Python's multi-second import chain.
-- **Single deploy unit** — one binary contains the gateway, all 28 skills,
+- **Single deploy unit** — one binary contains the gateway, all 51 built-in skills,
   vector memory, history, and embeddings.  No sidecar to keep in sync.
 
 ### Why chromem-go instead of ChromaDB?
@@ -1776,7 +2242,7 @@ which could hand two in-flight requests the same JSON-RPC id.
 - **Single binary** — `docker build` produces one artifact; no multi-service
   versioning skew.
 - **Hot-registration still works** — `skill_creator` writes `.md` files and
-  calls `reg.register()` on the live in-process registry; skills are available
+  calls `reg.registerMarkdown()` on the live in-process registry; skills are available
   immediately without a restart.
 
 ### Why `schedule_task` is native Go
@@ -1827,7 +2293,15 @@ the only path that serves the UI in any deployment.
 | Scheduler tick drifts or the host sleeps | The next tick sweeps every whole minute since the last one it evaluated (bounded to 60), so a cron minute skipped by ticker drift still fires — once, not once per missed minute. |
 | Non-UTF-8 tool output | Truncation helpers trim only a trailing partial rune (and, on the Telegram path, drop stray invalid bytes). Trimming until the whole prefix validated returned an empty string, silently discarding binary-ish results from debug logs, audit previews and `last_result`. |
 | `final` envelope with no answer | `finalAnswer` falls back to the same lenient extraction the malformed-envelope path uses (`answer` → `text` → `result` → the "please rephrase" message), so a missing or empty `answer` never reaches the user as a blank reply. |
-| Telegram stream breaks | Bot falls back to synchronous `/api/query` endpoint. |
+| Telegram stream breaks | Before any event arrived: the bot falls back to synchronous `/api/query`. After the agent has started: it reports the interruption instead of re-running the query. |
+| Client disconnects mid-run | The run's context is cancelled: the loop stops, an LLM call (or its retry backoff) returns at once, and so does a running tool — every skill that waits on the network or a process takes the run's context (`agent.Skill.Execute(ctx, args)`, `skills.Client.ExecuteContext`), down to nested pipeline steps and the shell process group. |
+| Vector delete races a search or list | Both sides of chromem's `k ≤ Count()` check run under `vectorStore.shrink`, so the query never asks for more documents than exist. |
+| A dotted `Host` reaches a token-less gateway | `hostGuard` answers 403 (DNS-rebinding defence); add the name to `GATEWAY_ALLOWED_HOSTS` or set a token. |
+| Remote MCP server unreachable at boot | Startup waits at most `MCP_CONNECT_WAIT_SEC` for all servers together (they connect in parallel); the unreachable one keeps retrying in the background with backoff and registers its tools when it comes up. |
+| A scheduled run fails | With `max_retries`, a retry is persisted (`retry_attempt`, `next_retry_at`) and claimed atomically by a later tick, `retry_delay_sec` × 2^attempt later; the Telegram notification waits for the final outcome. |
+| The backend rejects native tools | In `AGENT_TOOL_MODE=auto` the process latches to the JSON envelope (one log line) and the same step is retried that way; `native` mode surfaces the error. |
+| An SSH host key changes | `ssh_command` refuses to connect (possible man-in-the-middle) unless `SKILL_SSH_HOST_KEY_POLICY=insecure`. |
+| System clock steps backwards | Tasks whose `last_run_at` is now in the future are not claimed until wall time passes it; nothing detects the step. |
 | MaxSteps exceeded | Agent returns "could not finish" with partial debug log. |
 | SQLite directory missing | `os.MkdirAll` creates it before opening the database. |
 | Browser aborts SSE | `fetch` AbortController cancels the request; gateway detects `r.Context().Done()` and stops writing. |
@@ -1844,18 +2318,34 @@ Two suites, answering different questions:
 | Unit / integration | `./run_tests.sh` (`-race`), `make test` (in `Dockerfile.test`) | Every package in isolation, with real SQLite and chromem stores in `t.TempDir()` |
 | End-to-end | `make e2e` (`scripts/e2e.sh`) | A **running gateway**, over HTTP, from outside the process |
 
+CI (`.github/workflows/ci.yml`) runs both on every push and pull request,
+plus gofmt, `go vet` (also with `-tags e2e`), staticcheck and the web build
+(`npm run build`, i.e. `tsc -b` — plain `tsc --noEmit` checks nothing here).
+The bwrap sandbox tests skip themselves where the runner forbids unprivileged
+user namespaces.
+
 Coverage per package is listed in the README.
 
 **No test touches the network.** The seams that make that possible:
 
 | Dependency | How tests replace it |
 |---|---|
-| LLM providers | `httptest` servers; `OpenAIChat.sleep` is injected so the retry backoff is asserted, not waited out, and `OPENCODE_SESSION_ID` pins the relay's session header so tests can assert it rides every attempt |
+| LLM providers | `httptest` servers; `OpenAIChat.sleep` is injected so the retry backoff is asserted, not waited out (one test leaves it nil and cancels during the real backoff), and `OPENCODE_SESSION_ID` pins the relay's session header so tests can assert it rides every attempt |
 | Embeddings | `mockEmbeddings` derives a deterministic vector from the text, so dedup distances are reproducible; `errEmbeddings` covers the backend-down paths |
-| The model, in agent/gateway tests | a scripted `ChatClient` that replays canned envelopes and records the message list it was handed |
+| The model, in agent/gateway tests | a scripted `ChatClient` that replays canned envelopes and records the message list it was handed; `nativeLLM` (agent) additionally implements `ToolChatClient` and can refuse tools to drive the auto-mode fallback |
+| Embeddings over HTTP, in gateway tests | `embedServer` — an `/api/embed` stand-in returning a hashed bag-of-words vector, for the namespace / edit / export routes |
+| Remote MCP servers, resilience | `fakeMCP` (bootstrap) whose latency, availability and tool list change mid-test; `mcpBackoffMin` is shortened so retries happen in milliseconds |
+| bubblewrap | the real binary when the host allows user namespaces (else skipped); `bwrapPath` simulates a missing one |
+| SSH host keys | `hostKeyCallback` is exercised directly with generated ed25519 keys — no SSH server needed |
+| Third-party APIs of the newer skills | `rdapBase`, `wikipediaBase`, `ecbURL`, `githubAPI`, `telegramAPIBase` point at `httptest` servers |
+| DNS for `dns_compare` / `smtp_check` | in-test UDP DNS servers built with `x/net/dns/dnsmessage`; `lookupNS` / `lookupMX` seams |
+| SMTP | in-test ESMTP servers (`textproto`): one records the `notify` envelope and data, one offers STARTTLS with a generated certificate |
+| `traceroute`, `wake_on_lan`, `subnet_sweep` | real sockets on loopback (traceroute reads the real ICMP error queue) |
+| PDFs | `minimalPDF` writes a valid multi-page PDF in the test |
 | DuckDuckGo | an injected `http.RoundTripper` on `WebSearchSkill.client` (the URL is hardcoded, so the transport is the seam) |
 | Telegram | `tgbotapi.NewBotAPIWithAPIEndpoint` pointed at an `httptest` server that answers `getMe` and records outgoing messages |
 | Remote MCP servers | an `httptest` JSON-RPC server; one test also serves the single-event SSE variant |
+| e2e native tool calls | `mockllm` serves a scripted `{"tool_calls":[…]}` reply as a native Ollama tool call when the request offered tools |
 | DNS, for `email_auth` | the package-level `lookupTXT` seam is swapped for a table of canned TXT records, which also covers the SPF/DMARC/DKIM filtering |
 | SQLite / chromem-go | real stores in `t.TempDir()` — they are pure Go and fast enough to use for real |
 
@@ -1880,8 +2370,10 @@ SQLite + chromem on a real filesystem, including surviving a restart
 `TestPersistenceSurvivesRestart`); the scheduler goroutine actually firing a
 task; SSE framing over a socket; an image attachment surviving the whole path
 from `qr_generate` to the final event with the base64 kept *out* of the model's
-context; the MCP endpoint as a separate protocol surface; and audit redaction
-for a credential-handling skill.
+context; the MCP endpoint as a separate protocol surface; audit redaction
+for a credential-handling skill; and the DNS-rebinding `hostGuard` on the real
+binary (a dotted `Host` is refused on reads and writes, the service name
+`gateway` is served).
 
 `TestNetworkIsolation` dials the public internet and requires it to fail — if
 the stack is ever given a route out, the suite says so instead of quietly
@@ -1913,8 +2405,8 @@ self-signed TLS listener, `banner_grab` against a raw TCP listener, and
 Things worth testing that are easy to get wrong here, and are covered:
 ordering guarantees (the skill list and system prompt must be byte-stable
 across runs), the UTF-8 truncation helpers, the scheduler's missed-minute
-sweep, `skill_creator`'s hand-written YAML (generated files are loaded back and
-compared), and concurrent access to the MCP client and the bot's session map
+sweep and cross-process claims, `skill_creator`'s YAML (hostile values are
+written, loaded back and compared), and concurrent access to the MCP client and the bot's session map
 (both are `-race` tests that fail without their mutexes).
 
 ---
@@ -1925,22 +2417,31 @@ compared), and concurrent access to the MCP client and the bot's session map
 
 1. Create (or add to) a file in `internal/skills/builtin/`, exporting two
    functions: `XSchema() Skill` returning the schema (local types from
-   `helpers.go`), and `X(...) Executor` returning the implementation. Read
-   arguments through `str` / `intOr` / `floatOr` / `boolOr` so the skill tolerates
-   the loose JSON types an LLM emits.
+   `helpers.go`), and the implementation. A skill that waits on the network or
+   a process exports `XContext(...) ContextExecutor` (threading `ctx` into its
+   requests, dials and commands) plus `X(...) Executor` as
+   `withoutContext(XContext(...))`; a pure-computation skill exports just
+   `X(...) Executor`. Read arguments through `str` / `strList` / `intOr` /
+   `floatOr` / `boolOr` so the skill tolerates the loose JSON types an LLM
+   emits; dial and fetch through `netguard` / `httpClient`; put a third-party
+   base URL in a package variable so tests can redirect it.
 2. Register it in `registerBuiltins()` in `internal/skills/client.go`:
-   `reg.register(toSkill(builtin.XSchema()), builtin.X(cfg.SkillHTTPTimeout))` —
-   pass whatever slice of `cfg` the executor needs (timeouts, enable flags).
+   `register(toSkill(builtin.XSchema()), builtin.XContext(t))`, or
+   `builtin.Lift(builtin.X(...))` for a pure one — pass whatever slice of `cfg`
+   the executor needs (timeouts, enable flags, allowlists).
 3. Return `map[string]any{"error": "..."}, nil` for user-facing failures rather
    than a Go error, so the agent sees the reason and can react to it.
 4. Add the schema to `allSchemas()` in `internal/skills/builtin/skills_test.go`
-   and bump the count in `TestEverySchemaIsWellFormed`; add the required
+   and bump the count in `TestEverySchemaIsWellFormed` (and the 51 in
+   `TestBuiltinInventory` in `internal/skills`); add the required
    parameter to the `want` map in `TestRequiredParametersAreDeclared`. The
    suite fails without this on purpose — it is what keeps the inventory honest.
 5. If the skill handles credentials, add it to `sensitiveSkills` in
    `internal/agent/agent.go` so its args and result are redacted in the audit
    log (`/api/invocations` is readable by any API caller — and by anyone who can
-   reach the gateway when `GATEWAY_API_TOKEN` is unset).
+   reach the gateway when `GATEWAY_API_TOKEN` is unset).  If its *result* is
+   itself a secret, also add it to `secretResult()` so the session history,
+   the stream's `tool_result` event and the debug log are redacted too.
 6. Update the counts and tables that name skills: the README skill table and
    its "(N total)" heading, and in this document §2's `builtin/` line, §3.5's
    file table, and the three "all N skills" mentions.

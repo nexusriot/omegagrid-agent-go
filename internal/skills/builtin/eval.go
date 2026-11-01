@@ -79,10 +79,25 @@ var mathFuncs = map[string]func([]float64) (float64, error){
 	"abs":     func1(math.Abs),
 	"degrees": func1(func(x float64) float64 { return x * 180.0 / math.Pi }),
 	"radians": func1(func(x float64) float64 { return x * math.Pi / 180.0 }),
-	"round":   func1(math.Round),
-	"atan2":   func2(math.Atan2),
-	"pow":     func2(math.Pow),
-	"hypot":   func2(math.Hypot),
+	// Python 3 rounds half to even (round(2.5) == 2) and takes an optional
+	// digit count; math.Round rounds half away from zero.
+	"round": func(args []float64) (float64, error) {
+		switch len(args) {
+		case 1:
+			return math.RoundToEven(args[0]), nil
+		case 2:
+			if args[1] != math.Trunc(args[1]) || math.Abs(args[1]) > 15 {
+				return 0, fmt.Errorf("round digits must be an integer between -15 and 15")
+			}
+			scale := math.Pow(10, args[1])
+			return math.RoundToEven(args[0]*scale) / scale, nil
+		default:
+			return 0, fmt.Errorf("round takes 1 or 2 arguments")
+		}
+	},
+	"atan2": func2(math.Atan2),
+	"pow":   func2(math.Pow),
+	"hypot": func2(math.Hypot),
 	"gcd": func(args []float64) (float64, error) {
 		if len(args) != 2 {
 			return 0, fmt.Errorf("expected 2 arguments")
@@ -97,11 +112,17 @@ var mathFuncs = map[string]func([]float64) (float64, error){
 		}
 		return float64(gcdInt(int64(args[0]), int64(args[1]))), nil
 	},
-	"min": func2(math.Min),
-	"max": func2(math.Max),
+	// Variadic like Python's: max(1,2,3) used to fail "expected 2 arguments".
+	"min": funcN(math.Min),
+	"max": funcN(math.Max),
 	"factorial": func(args []float64) (float64, error) {
 		if len(args) != 1 {
 			return 0, fmt.Errorf("factorial takes 1 argument")
+		}
+		// int64() truncated factorial(2.5) to 2! and factorial(-0.5) to 0!;
+		// Python refuses non-integers.
+		if args[0] != math.Trunc(args[0]) {
+			return 0, fmt.Errorf("factorial requires an integer argument")
 		}
 		n := int64(args[0])
 		if n < 0 || n > 20 {
@@ -128,6 +149,19 @@ func func1(f func(float64) float64) func([]float64) (float64, error) {
 			return 0, fmt.Errorf("expected 1 argument")
 		}
 		return f(args[0]), nil
+	}
+}
+
+func funcN(f func(float64, float64) float64) func([]float64) (float64, error) {
+	return func(args []float64) (float64, error) {
+		if len(args) < 2 {
+			return 0, fmt.Errorf("expected at least 2 arguments")
+		}
+		acc := args[0]
+		for _, a := range args[1:] {
+			acc = f(acc, a)
+		}
+		return acc, nil
 	}
 }
 
@@ -169,7 +203,7 @@ func evalExpr(s string) (float64, error) {
 }
 
 func (p *parser) skipWS() {
-	for p.pos < len(p.s) && p.s[p.pos] == ' ' {
+	for p.pos < len(p.s) && strings.IndexByte(" \t\n\r", p.s[p.pos]) >= 0 {
 		p.pos++
 	}
 }
@@ -245,7 +279,13 @@ func (p *parser) parseMulDiv() (float64, error) {
 			if right == 0 {
 				return 0, fmt.Errorf("modulo by zero")
 			}
-			left = math.Mod(left, right)
+			// Python's % takes the divisor's sign (-7 % 3 == 2); math.Mod
+			// takes the dividend's (-1).
+			r := math.Mod(left, right)
+			if r != 0 && (r < 0) != (right < 0) {
+				r += right
+			}
+			left = r
 		}
 	}
 	return left, nil
@@ -381,8 +421,17 @@ func (p *parser) parseCall(name string) (float64, error) {
 		}
 		args = append(args, v)
 		p.skipWS()
-		if p.pos < len(p.s) && p.s[p.pos] == ',' {
+		// A separator is required: "pow(2 3)" used to evaluate as pow(2, 3).
+		// A trailing comma before ')' is fine, as in Python.
+		if p.pos >= len(p.s) {
+			return 0, fmt.Errorf("unterminated call to %s", name)
+		}
+		switch p.s[p.pos] {
+		case ',':
 			p.pos++
+		case ')':
+		default:
+			return 0, fmt.Errorf("expected ',' or ')' in call to %s at position %d", name, p.pos)
 		}
 	}
 	fn, ok := mathFuncs[name]
@@ -430,8 +479,10 @@ func CronSchedule() Executor {
 			parsed[i] = vs
 		}
 
-		domRestricted := strings.TrimSpace(parts[2]) != "*"
-		dowRestricted := strings.TrimSpace(parts[4]) != "*"
+		// Vixie: a day field starting with "*" (including "*/N") is
+		// unrestricted; must agree with internal/scheduler/cron.go.
+		domRestricted := !strings.HasPrefix(parts[2], "*")
+		dowRestricted := !strings.HasPrefix(parts[4], "*")
 		explanation := cronExplain(parts)
 		nextRuns := cronNextRuns(parsed, count, domRestricted, dowRestricted)
 		fields := make(map[string]string, 5)
@@ -518,6 +569,12 @@ func parseCronField(field string, lo, hi, idx int) (map[int]bool, error) {
 			}
 			if err := add(n); err != nil {
 				return nil, err
+			}
+			// "N/S" is N through the field maximum in steps of S.
+			if step > 1 {
+				for i := n + step; i <= hi; i += step {
+					out[i] = true
+				}
 			}
 		}
 	}

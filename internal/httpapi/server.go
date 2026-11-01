@@ -6,6 +6,7 @@ package httpapi
 import (
 	"crypto/subtle"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/url"
 	"slices"
@@ -22,6 +23,7 @@ import (
 	"github.com/nexusriot/omegagrid-agent-go/internal/memory"
 	"github.com/nexusriot/omegagrid-agent-go/internal/scheduler"
 	"github.com/nexusriot/omegagrid-agent-go/internal/skills"
+	"github.com/nexusriot/omegagrid-agent-go/internal/version"
 )
 
 // Deps bundles everything a request handler may need.  Constructed once at
@@ -33,20 +35,20 @@ type Deps struct {
 	Skills    *skills.Client
 	Chat      llm.ChatClient
 	Scheduler *scheduler.Store
+	// Runner executes run-now requests; nil disables that route (503).
+	Runner *scheduler.Runner
 
 	// ToolProvider backs the MCP server endpoint. When nil or disabled by
 	// config, the /mcp route is not mounted.
 	ToolProvider mcp.ToolProvider
 }
 
-// mcpServerVersion is reported in the MCP initialize serverInfo block.
-const mcpServerVersion = "1.0.0"
-
 func NewRouter(d Deps) http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
+	r.Use(hostGuard(d.Cfg.APIToken, d.Cfg.AllowedHosts))
 	r.Use(corsMiddleware(d.Cfg.CORSAllowedOrigins))
 	r.Use(originGuard(d.Cfg.CORSAllowedOrigins))
 	r.Use(limitBody(maxRequestBodyBytes))
@@ -54,7 +56,7 @@ func NewRouter(d Deps) http.Handler {
 	r.Get("/health", d.handleHealth)
 
 	if d.Cfg.MCPServerEnabled && d.ToolProvider != nil {
-		srv := mcp.NewServer(d.ToolProvider, "omegagrid-agent-go", mcpServerVersion)
+		srv := mcp.NewServer(d.ToolProvider, "omegagrid-agent-go", version.Version)
 		r.With(requireToken(d.Cfg.APIToken)).Handle("/mcp", srv.Handler())
 	}
 
@@ -66,14 +68,25 @@ func NewRouter(d Deps) http.Handler {
 		r.Post("/sessions/new", d.handleNewSession)
 		r.Get("/sessions", d.handleListSessions)
 		r.Get("/sessions/{sid}/messages", d.handleSessionMessages)
+		r.Patch("/sessions/{sid}", d.handleRenameSession)
+		r.Delete("/sessions/{sid}", d.handleDeleteSession)
+		r.Get("/stats/usage", d.handleUsage)
 
 		r.Post("/memory/add", d.handleMemoryAdd)
 		r.Post("/memory/search", d.handleMemorySearch)
 		r.Get("/memory", d.handleMemoryList)
+		r.Get("/memory/namespaces", d.handleMemoryNamespaces)
+		r.Get("/memory/export", d.handleMemoryExport)
+		r.Post("/memory/import", d.handleMemoryImport)
 		r.Get("/memory/{id}", d.handleMemoryGet)
+		r.Put("/memory/{id}", d.handleMemoryUpdate)
 		r.Delete("/memory/{id}", d.handleMemoryDelete)
 
 		r.Get("/skills", d.handleListSkills)
+		r.Post("/skills/validate", d.handleSkillValidate)
+		r.Post("/skills/source", d.handleSkillSave)
+		r.Get("/skills/{name}/source", d.handleSkillSource)
+		r.Delete("/skills/{name}", d.handleSkillDelete)
 		r.Post("/skills/{name}/invoke", d.handleSkillInvoke)
 		r.Get("/tools", d.handleListTools)
 
@@ -87,6 +100,8 @@ func NewRouter(d Deps) http.Handler {
 		r.Post("/scheduler/tasks/{id}/enable", d.handleSchedulerEnable)
 		r.Post("/scheduler/tasks/{id}/disable", d.handleSchedulerDisable)
 		r.Delete("/scheduler/tasks/{id}", d.handleSchedulerDelete)
+		r.Post("/scheduler/tasks/{id}/run", d.handleSchedulerRun)
+		r.Get("/scheduler/tasks/{id}/runs", d.handleSchedulerRuns)
 	})
 
 	return r
@@ -100,7 +115,9 @@ const maxRequestBodyBytes = 4 << 20
 func limitBody(n int64) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.Body != nil {
+			// The import route applies its own, larger cap (maxImportBytes);
+			// a MaxBytesReader cannot be widened once wrapped.
+			if r.Body != nil && r.URL.Path != "/api/memory/import" {
 				r.Body = http.MaxBytesReader(w, r.Body, n)
 			}
 			next.ServeHTTP(w, r)
@@ -118,7 +135,7 @@ func corsMiddleware(allowed []string) func(http.Handler) http.Handler {
 			origin := r.Header.Get("Origin")
 			if origin != "" && originAllowed(origin, allowed) {
 				w.Header().Set("Access-Control-Allow-Origin", origin)
-				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 				w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id")
 				w.Header().Add("Vary", "Origin")
 			}
@@ -160,6 +177,52 @@ func originGuard(allowed []string) func(http.Handler) http.Handler {
 			writeError(w, http.StatusForbidden, "cross-origin request rejected")
 		})
 	}
+}
+
+// hostGuard defends a token-less gateway against DNS rebinding. A page on
+// evil.example can re-point its own name at 127.0.0.1; the browser then sends
+// Host: evil.example and Origin: http://evil.example, which originGuard
+// rightly treats as same-origin, and the page gets full read/write access to
+// the API (and through /api/query to shell_command). Such a request always
+// carries the attacker's dotted DNS name, so while no token is configured
+// only Host values a public resolver cannot hand out are accepted: IP
+// literals, single-label names (localhost, the compose service name
+// "gateway") and *.localhost, plus whatever GATEWAY_ALLOWED_HOSTS lists. A
+// token makes the check unnecessary: the rebinding page cannot read it.
+func hostGuard(token string, allowed []string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		if token != "" {
+			return next
+		}
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if hostTrusted(r.Host, allowed) {
+				next.ServeHTTP(w, r)
+				return
+			}
+			writeError(w, http.StatusForbidden,
+				"untrusted Host header; set GATEWAY_API_TOKEN or add the host to GATEWAY_ALLOWED_HOSTS")
+		})
+	}
+}
+
+func hostTrusted(hostport string, allowed []string) bool {
+	host := hostport
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		host = h
+	}
+	host = strings.TrimSuffix(strings.ToLower(strings.Trim(host, "[]")), ".")
+	if host == "" {
+		return true
+	}
+	if net.ParseIP(host) != nil || !strings.Contains(host, ".") || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	for _, a := range allowed {
+		if a == "*" || strings.EqualFold(strings.TrimSuffix(a, "."), host) {
+			return true
+		}
+	}
+	return false
 }
 
 func originAllowed(origin string, allowed []string) bool {

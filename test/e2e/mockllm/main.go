@@ -5,6 +5,8 @@
 // It speaks the two Ollama endpoints the gateway actually calls:
 //
 //	POST /api/chat        → {"message":{"role":"assistant","content":"<reply>"}}
+//	                        (a reply {"tool_calls":[{"name":..,"arguments":{..}}]}
+//	                        becomes a native tool call when the request has tools)
 //	POST /api/embed       → {"embeddings":[[...]]}
 //	POST /v1/embeddings   → {"data":[{"embedding":[...]}]}     (fallback order
 //	POST /api/embeddings  → {"embedding":[...]}                 in memory/embeddings.go)
@@ -51,13 +53,16 @@ const embedDims = 64
 const defaultReply = `{"type":"final","answer":"mockllm: no scripted reply left"}`
 
 type chatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role      string           `json:"role"`
+	Content   string           `json:"content"`
+	ToolCalls []map[string]any `json:"tool_calls,omitempty"`
+	ToolName  string           `json:"tool_name,omitempty"`
 }
 
 type chatRequest struct {
-	Model    string        `json:"model"`
-	Messages []chatMessage `json:"messages"`
+	Model    string           `json:"model"`
+	Messages []chatMessage    `json:"messages"`
+	Tools    []map[string]any `json:"tools,omitempty"`
 }
 
 type server struct {
@@ -108,9 +113,26 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Unlock()
 
+	msg := map[string]any{"role": "assistant", "content": reply}
+	// A scripted reply of the form {"tool_calls":[{"name":..,"arguments":{..}}]}
+	// is served as a native Ollama tool call — but only when the request
+	// offered tools, as a real model would.
+	var native struct {
+		ToolCalls []struct {
+			Name      string         `json:"name"`
+			Arguments map[string]any `json:"arguments"`
+		} `json:"tool_calls"`
+	}
+	if len(req.Tools) > 0 && json.Unmarshal([]byte(reply), &native) == nil && len(native.ToolCalls) > 0 {
+		calls := make([]map[string]any, 0, len(native.ToolCalls))
+		for _, c := range native.ToolCalls {
+			calls = append(calls, map[string]any{"function": map[string]any{"name": c.Name, "arguments": c.Arguments}})
+		}
+		msg = map[string]any{"role": "assistant", "content": "", "tool_calls": calls}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"model":   req.Model,
-		"message": map[string]any{"role": "assistant", "content": reply},
+		"message": msg,
 		"done":    true,
 	})
 }

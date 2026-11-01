@@ -7,7 +7,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -70,7 +69,7 @@ type Services struct {
 type toolProvider struct {
 	skills *skills.Client
 	native map[string]agent.Skill
-	exec   func(string, map[string]any) (any, error)
+	exec   func(context.Context, string, map[string]any) (any, error)
 }
 
 // Tools returns the MCP tool table in a stable, name-sorted order. Registry
@@ -90,8 +89,8 @@ func (p *toolProvider) Tools() []mcp.Tool {
 	return out
 }
 
-func (p *toolProvider) Call(name string, args map[string]any) (any, error) {
-	return p.exec(name, args)
+func (p *toolProvider) Call(ctx context.Context, name string, args map[string]any) (any, error) {
+	return p.exec(ctx, name, args)
 }
 
 func skillToMCPTool(s skills.Skill) mcp.Tool {
@@ -125,11 +124,15 @@ func New(cfg config.Config) (*Services, func(), error) {
 	}
 
 	// Best-effort: connect to remote MCP servers and register their tools as
-	// skills. A failing server is logged and skipped — it must not block startup.
-	connectMCPServers(cfg, sk)
+	// skills. Servers are dialled in parallel and startup waits at most
+	// MCP_CONNECT_WAIT_SEC for them; one still unreachable keeps retrying in
+	// the background, and every connected one is re-listed periodically.
+	mcpCtx, stopMCP := context.WithCancel(context.Background())
+	startMCPServers(mcpCtx, cfg, sk, nativeSkillNames)
 
 	store, err := scheduler.NewStore(cfg.SchedulerDB)
 	if err != nil {
+		stopMCP()
 		mem.Close()
 		return nil, nil, err
 	}
@@ -140,23 +143,23 @@ func New(cfg config.Config) (*Services, func(), error) {
 	native := map[string]agent.Skill{
 		"schedule_task": {
 			Schema: SkillSchemaFromMap(schedSkill.SkillSchema()),
-			Execute: func(args map[string]any) (any, error) {
+			Execute: func(_ context.Context, args map[string]any) (any, error) {
 				return schedSkill.Execute(args), nil
 			},
 		},
 		"web_search": {
 			Schema: SkillSchemaFromMap(searchSkill.SkillSchema()),
-			Execute: func(args map[string]any) (any, error) {
-				return searchSkill.Execute(args), nil
+			Execute: func(ctx context.Context, args map[string]any) (any, error) {
+				return searchSkill.ExecuteContext(ctx, args), nil
 			},
 		},
 	}
 
-	exec := func(name string, args map[string]any) (any, error) {
+	exec := func(ctx context.Context, name string, args map[string]any) (any, error) {
 		if n, ok := native[name]; ok {
-			return n.Execute(args)
+			return n.Execute(ctx, args)
 		}
-		return sk.Execute(name, args)
+		return sk.ExecuteContext(ctx, name, args)
 	}
 
 	// The runner is built but not started: only the long-running gateway
@@ -177,11 +180,25 @@ func New(cfg config.Config) (*Services, func(), error) {
 		MemoryHits:      cfg.MemoryHits,
 		ParallelEnabled: cfg.AgentParallelTools,
 		MaxParallel:     cfg.AgentMaxParallel,
+		ToolMode:        cfg.AgentToolMode,
 
 		AutoMemoryExtract:      cfg.AutoMemoryExtract,
 		AutoMemoryMaxFacts:     cfg.AutoMemoryMaxFacts,
 		AutoMemoryMinAnswerLen: cfg.AutoMemoryMinAnswerLen,
 	}
+
+	// Prompt tasks run a whole agent query on each fire.
+	runner.SetAgent(func(ctx context.Context, prompt string) (string, error) {
+		steps := cfg.AgentMaxSteps
+		if steps <= 0 {
+			steps = 25
+		}
+		res, err := ag.RunContext(ctx, agent.RunRequest{Query: prompt, MaxSteps: steps})
+		if err != nil {
+			return "", err
+		}
+		return res.Answer, nil
+	})
 
 	svc := &Services{
 		Chat:         chat,
@@ -195,6 +212,7 @@ func New(cfg config.Config) (*Services, func(), error) {
 	}
 
 	cleanup := func() {
+		stopMCP()
 		runner.Stop()
 		store.Close()
 		mem.Close()
@@ -268,37 +286,6 @@ func getString(m map[string]any, key string) string {
 	return ""
 }
 
-// connectMCPServers dials each configured remote MCP server, lists its tools,
-// and registers them into the skill registry namespaced as "<server>_<tool>".
-// Errors are logged and the server skipped; startup is never blocked.
-func connectMCPServers(cfg config.Config, sk *skills.Client) {
-	for i, entry := range cfg.MCPServers {
-		name, url, headers, err := parseMCPEntry(entry)
-		if err != nil {
-			// Never log entry itself: it can carry "|Authorization: Bearer …".
-			log.Printf("mcp client: skipping MCP_SERVERS entry #%d: %v", i+1, err)
-			continue
-		}
-		client := mcp.NewClient(url, headers, 30*time.Second)
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		if err := client.Initialize(ctx); err != nil {
-			cancel()
-			log.Printf("mcp client %q: initialize failed: %v", name, err)
-			continue
-		}
-		tools, err := client.ListTools(ctx)
-		cancel()
-		if err != nil {
-			log.Printf("mcp client %q: tools/list failed: %v", name, err)
-			continue
-		}
-		for _, t := range tools {
-			registerRemoteTool(sk, client, name, t)
-		}
-		log.Printf("mcp client %q: registered %d tool(s) from %s", name, len(tools), url)
-	}
-}
-
 // maxRemoteDescription caps a remote tool description. Descriptions go into
 // the system prompt verbatim, so a hostile MCP server could otherwise inject
 // paragraphs of instructions there.
@@ -317,8 +304,20 @@ func sanitizeRemoteDescription(d string) string {
 	return d
 }
 
-func registerRemoteTool(sk *skills.Client, client *mcp.Client, server string, t mcp.Tool) {
+// nativeSkillNames are the agent tools that live outside the skill registry
+// (bootstrap and agent wire them directly), so the registry cannot see them
+// when checking a remote tool's name for collisions. The agent resolves
+// native names first, so a remote tool by one of these names would be
+// unreachable from the agent yet listed twice by tools/list.
+var nativeSkillNames = map[string]bool{
+	"schedule_task": true, "web_search": true, "vector_add": true, "vector_search": true, "session_search": true,
+}
+
+func registerRemoteTool(sk *skills.Client, client *mcp.Client, server string, t mcp.Tool, native map[string]bool) error {
 	skillName := server + "_" + t.Name
+	if native[skillName] {
+		return fmt.Errorf("%q would shadow a native agent tool", skillName)
+	}
 	desc := sanitizeRemoteDescription(t.Description)
 	if desc == "" {
 		desc = t.Name
@@ -331,8 +330,8 @@ func registerRemoteTool(sk *skills.Client, client *mcp.Client, server string, t 
 	}
 
 	remoteName := t.Name
-	sk.Register(skillName, desc, params, func(args map[string]any) (any, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	return sk.Register(skillName, desc, params, func(ctx context.Context, args map[string]any) (any, error) {
+		ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 		defer cancel()
 		return client.CallTool(ctx, remoteName, args)
 	})

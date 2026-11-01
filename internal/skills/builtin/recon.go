@@ -33,8 +33,13 @@ func TlsProbeSchema() Skill {
 		}}
 }
 
+// TlsProbe is TlsProbeContext without cancellation.
 func TlsProbe() Executor {
-	return func(args map[string]any) (any, error) {
+	return withoutContext(TlsProbeContext())
+}
+
+func TlsProbeContext() ContextExecutor {
+	return func(ctx context.Context, args map[string]any) (any, error) {
 		host := str(args, "host")
 		if host == "" {
 			return map[string]any{"error": "host is required"}, nil
@@ -66,7 +71,7 @@ func TlsProbe() Executor {
 		}
 
 		t0 := time.Now()
-		raw, err := dialer.Dial("tcp", addr)
+		raw, err := dialer.DialContext(ctx, "tcp", addr)
 		if err != nil {
 			return map[string]any{"host": host, "port": port, "error": err.Error()}, nil
 		}
@@ -214,8 +219,13 @@ func HttpHeadersSchema() Skill {
 		}}
 }
 
+// HttpHeaders is HttpHeadersContext without cancellation.
 func HttpHeaders() Executor {
-	return func(args map[string]any) (any, error) {
+	return withoutContext(HttpHeadersContext())
+}
+
+func HttpHeadersContext() ContextExecutor {
+	return func(ctx context.Context, args map[string]any) (any, error) {
 		rawURL := str(args, "url")
 		if rawURL == "" {
 			return map[string]any{"error": "url is required"}, nil
@@ -276,7 +286,7 @@ func HttpHeaders() Executor {
 					"redirect_chain": chain,
 				}, nil
 			}
-			req, err := http.NewRequest(method, current, nil)
+			req, err := http.NewRequestWithContext(ctx, method, current, nil)
 			if err != nil {
 				return map[string]any{"url": rawURL, "error": err.Error(), "redirect_chain": chain}, nil
 			}
@@ -308,8 +318,7 @@ func HttpHeaders() Executor {
 
 			next, err := resp.Request.URL.Parse(loc)
 			if err != nil {
-				final = resp
-				// re-open? body already drained; return what we have
+				// The body is already drained; report the chain so far.
 				return map[string]any{
 					"url": rawURL, "error": "bad redirect location: " + err.Error(),
 					"redirect_chain": chain, "elapsed_ms": time.Since(t0).Milliseconds(),
@@ -444,8 +453,13 @@ func BannerGrabSchema() Skill {
 		}}
 }
 
+// BannerGrab is BannerGrabContext without cancellation.
 func BannerGrab() Executor {
-	return func(args map[string]any) (any, error) {
+	return withoutContext(BannerGrabContext())
+}
+
+func BannerGrabContext() ContextExecutor {
+	return func(ctx context.Context, args map[string]any) (any, error) {
 		host := str(args, "host")
 		if host == "" {
 			return map[string]any{"error": "host is required"}, nil
@@ -474,7 +488,7 @@ func BannerGrab() Executor {
 		addr := net.JoinHostPort(host, strconv.Itoa(port))
 		d := netguard.Dialer(time.Duration(timeout * float64(time.Second)))
 		t0 := time.Now()
-		raw, err := d.Dial("tcp", addr)
+		raw, err := d.DialContext(ctx, "tcp", addr)
 		if err != nil {
 			return map[string]any{"host": host, "port": port, "error": err.Error()}, nil
 		}
@@ -578,8 +592,13 @@ func PtrLookupSchema() Skill {
 		}}
 }
 
+// PtrLookup is PtrLookupContext without cancellation.
 func PtrLookup() Executor {
-	return func(args map[string]any) (any, error) {
+	return withoutContext(PtrLookupContext())
+}
+
+func PtrLookupContext() ContextExecutor {
+	return func(ctx context.Context, args map[string]any) (any, error) {
 		ip := strings.TrimSpace(str(args, "ip"))
 		if ip == "" {
 			return map[string]any{"error": "ip is required"}, nil
@@ -587,7 +606,7 @@ func PtrLookup() Executor {
 		if net.ParseIP(ip) == nil {
 			return map[string]any{"error": fmt.Sprintf("invalid ip: %q", ip)}, nil
 		}
-		names, err := net.LookupAddr(ip)
+		names, err := net.DefaultResolver.LookupAddr(ctx, ip)
 		if err != nil {
 			return map[string]any{"ip": ip, "names": []string{}, "count": 0, "error": err.Error()}, nil
 		}
@@ -627,8 +646,13 @@ var lookupTXT = func(ctx context.Context, name string) ([]string, error) {
 	return net.DefaultResolver.LookupTXT(ctx, name)
 }
 
+// EmailAuth is EmailAuthContext without cancellation.
 func EmailAuth() Executor {
-	return func(args map[string]any) (any, error) {
+	return withoutContext(EmailAuthContext())
+}
+
+func EmailAuthContext() ContextExecutor {
+	return func(ctx context.Context, args map[string]any) (any, error) {
 		domain := strings.TrimSpace(str(args, "domain"))
 		if domain == "" {
 			return map[string]any{"error": "domain is required"}, nil
@@ -641,7 +665,7 @@ func EmailAuth() Executor {
 		timeout := clampTimeout(floatOr(args, "timeout", 10), 10, maxTimeoutSec)
 		// One deadline for the whole skill: SPF, DMARC and every DKIM probe
 		// share it, so the call can never outlast what the caller asked for.
-		ctx, cancel := context.WithTimeout(context.Background(),
+		ctx, cancel := context.WithTimeout(ctx,
 			time.Duration(timeout*float64(time.Second)))
 		defer cancel()
 

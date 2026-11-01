@@ -108,7 +108,7 @@ func Hash() Executor {
 func UuidGenSchema() Skill {
 	return Skill{Name: "uuid_gen", Description: "Generate UUIDs (v1/v3/v4/v5).",
 		Parameters: map[string]Param{
-			"version":   {Type: "number", Description: "UUID version: 1, 3, 4, or 5 (default 4)", Required: false},
+			"version":   {Type: "number", Description: "UUID version: 1, 3, 4, 5 or 7 (default 4)", Required: false},
 			"count":     {Type: "number", Description: "Number to generate 1-50 (default 1)", Required: false},
 			"namespace": {Type: "string", Description: "Namespace for v3/v5: dns, url, oid, x500 (default dns)", Required: false},
 			"name":      {Type: "string", Description: "Name for v3/v5 (required for those versions)", Required: false},
@@ -137,6 +137,13 @@ func UuidGen() Executor {
 		default:
 			ns = uuid.NameSpaceDNS
 		}
+		switch version {
+		case 1, 3, 4, 5, 7:
+		default:
+			// Any other version used to return v4 UUIDs labelled as the
+			// version asked for.
+			return map[string]any{"error": fmt.Sprintf("unsupported UUID version %d (use 1, 3, 4, 5 or 7)", version)}, nil
+		}
 		name := str(args, "name")
 		if (version == 3 || version == 5) && name == "" {
 			return map[string]any{"error": "name is required for UUID v3/v5"}, nil
@@ -152,6 +159,8 @@ func UuidGen() Executor {
 				u = uuid.NewMD5(ns, []byte(name))
 			case 5:
 				u = uuid.NewSHA1(ns, []byte(name))
+			case 7:
+				u = uuid.Must(uuid.NewV7())
 			default:
 				u = uuid.New()
 			}

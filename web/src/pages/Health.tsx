@@ -2,6 +2,7 @@ import { useQuery } from '@tanstack/react-query'
 import { Activity, Server, Bot, FolderOpen, RefreshCw, CheckCircle2, XCircle, Loader2, Cpu, type LucideIcon } from 'lucide-react'
 import { fetchHealth } from '../api/client'
 import type { HealthStatus } from '../api/types'
+import UsagePanel from '../components/UsagePanel'
 
 function Row({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
   return (
@@ -30,6 +31,7 @@ function HealthCard({ status }: { status: HealthStatus }) {
       </div>
 
       <div className="px-4">
+        {status.version && <Row label="Version" value={status.version} mono />}
         <Row label="Provider"     value={status.provider} />
         <Row label="Chat model"   value={status.chat_model} mono />
         <Row label="LLM base URL" value={status.chat_base} mono />
@@ -138,6 +140,8 @@ export default function Health() {
                 sub={data.skills_dir}
               />
             </div>
+
+            <UsagePanel />
           </>
         )}
       </div>

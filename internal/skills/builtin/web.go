@@ -2,6 +2,7 @@
 package builtin
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -28,13 +29,17 @@ func httpClient(timeoutSec float64) *http.Client {
 // (TLS handshake timeouts, connection resets) up to 3 attempts total with a
 // short backoff. Only network-level errors are retried — HTTP error statuses
 // are returned to the caller as-is. GET is idempotent, so this is safe.
-func getWithRetry(cl *http.Client, url string, header http.Header) (*http.Response, error) {
+func getWithRetry(ctx context.Context, cl *http.Client, url string, header http.Header) (*http.Response, error) {
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
-			time.Sleep(time.Duration(attempt) * time.Second) // 1s, 2s
+			select { // 1s, 2s
+			case <-time.After(time.Duration(attempt) * time.Second):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
 		}
-		req, err := http.NewRequest(http.MethodGet, url, nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -57,16 +62,21 @@ func WeatherSchema() Skill {
 		}}
 }
 
+// Weather is WeatherContext without cancellation.
 func Weather(timeoutSec float64) Executor {
+	return withoutContext(WeatherContext(timeoutSec))
+}
+
+func WeatherContext(timeoutSec float64) ContextExecutor {
 	cl := httpClient(timeoutSec)
-	return func(args map[string]any) (any, error) {
+	return func(ctx context.Context, args map[string]any) (any, error) {
 		city := str(args, "city")
 		if city == "" {
 			return map[string]any{"error": "city is required"}, nil
 		}
 		// geocode
 		geoURL := fmt.Sprintf("https://geocoding-api.open-meteo.com/v1/search?name=%s&count=1&language=en&format=json", url.QueryEscape(city))
-		geoResp, err := getWithRetry(cl, geoURL, nil)
+		geoResp, err := getWithRetry(ctx, cl, geoURL, nil)
 		if err != nil {
 			return map[string]any{"error": err.Error()}, nil
 		}
@@ -89,7 +99,7 @@ func Weather(timeoutSec float64) Executor {
 				"&timezone=UTC&forecast_days=1",
 			r.Latitude, r.Longitude,
 		)
-		wResp, err := getWithRetry(cl, wURL, nil)
+		wResp, err := getWithRetry(ctx, cl, wURL, nil)
 		if err != nil {
 			return map[string]any{"error": err.Error()}, nil
 		}
@@ -130,9 +140,14 @@ func HttpRequestSchema() Skill {
 		}}
 }
 
+// HttpRequest is HttpRequestContext without cancellation.
 func HttpRequest(timeoutSec float64) Executor {
+	return withoutContext(HttpRequestContext(timeoutSec))
+}
+
+func HttpRequestContext(timeoutSec float64) ContextExecutor {
 	cl := httpClient(timeoutSec)
-	return func(args map[string]any) (any, error) {
+	return func(ctx context.Context, args map[string]any) (any, error) {
 		rawURL := str(args, "url")
 		if rawURL == "" {
 			return map[string]any{"error": "url is required"}, nil
@@ -151,7 +166,7 @@ func HttpRequest(timeoutSec float64) Executor {
 				bodyReader = strings.NewReader(string(enc))
 			}
 		}
-		req, err := http.NewRequest(method, rawURL, bodyReader)
+		req, err := http.NewRequestWithContext(ctx, method, rawURL, bodyReader)
 		if err != nil {
 			return map[string]any{"error": err.Error()}, nil
 		}
@@ -190,9 +205,14 @@ func WebScrapeSchema() Skill {
 		}}
 }
 
+// WebScrape is WebScrapeContext without cancellation.
 func WebScrape(timeoutSec float64) Executor {
+	return withoutContext(WebScrapeContext(timeoutSec))
+}
+
+func WebScrapeContext(timeoutSec float64) ContextExecutor {
 	cl := httpClient(timeoutSec)
-	return func(args map[string]any) (any, error) {
+	return func(ctx context.Context, args map[string]any) (any, error) {
 		rawURL := str(args, "url")
 		if rawURL == "" {
 			return map[string]any{"error": "url is required"}, nil
@@ -209,7 +229,7 @@ func WebScrape(timeoutSec float64) Executor {
 			maxChars = 4000
 		}
 
-		resp, err := getWithRetry(cl, rawURL, http.Header{"User-Agent": {"OmegaGridAgent/1.0"}})
+		resp, err := getWithRetry(ctx, cl, rawURL, http.Header{"User-Agent": {"OmegaGridAgent/1.0"}})
 		if err != nil {
 			return map[string]any{"error": err.Error()}, nil
 		}
@@ -287,8 +307,13 @@ func HttpHealthSchema() Skill {
 		}}
 }
 
+// HttpHealth is HttpHealthContext without cancellation.
 func HttpHealth() Executor {
-	return func(args map[string]any) (any, error) {
+	return withoutContext(HttpHealthContext())
+}
+
+func HttpHealthContext() ContextExecutor {
+	return func(ctx context.Context, args map[string]any) (any, error) {
 		rawURL := str(args, "url")
 		if rawURL == "" {
 			return map[string]any{"error": "url is required"}, nil
@@ -311,7 +336,7 @@ func HttpHealth() Executor {
 		// kind of value an LLM produces. Dereferencing it panicked, and inside a
 		// parallel tool batch that panic runs on its own goroutine and takes the
 		// whole process down.
-		req, err := http.NewRequest(method, rawURL, nil)
+		req, err := http.NewRequestWithContext(ctx, method, rawURL, nil)
 		if err != nil {
 			return map[string]any{"url": rawURL, "ok": false, "error": err.Error(), "response_time_ms": 0}, nil
 		}
@@ -344,15 +369,20 @@ func IpInfoSchema() Skill {
 		}}
 }
 
+// IpInfo is IpInfoContext without cancellation.
 func IpInfo(timeoutSec float64) Executor {
+	return withoutContext(IpInfoContext(timeoutSec))
+}
+
+func IpInfoContext(timeoutSec float64) ContextExecutor {
 	cl := httpClient(timeoutSec)
-	return func(args map[string]any) (any, error) {
+	return func(ctx context.Context, args map[string]any) (any, error) {
 		ip := str(args, "ip")
 		// ip-api.com's free endpoint is HTTP-only; HTTPS requires a paid key
 		// and the request fails outright.
 		target := "http://ip-api.com/json/" + url.QueryEscape(ip)
 		target += "?fields=status,message,country,countryCode,region,regionName,city,zip,lat,lon,timezone,isp,org,as,reverse,mobile,proxy,hosting,query"
-		resp, err := getWithRetry(cl, target, nil)
+		resp, err := getWithRetry(ctx, cl, target, nil)
 		if err != nil {
 			return map[string]any{"error": err.Error()}, nil
 		}

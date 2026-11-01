@@ -2,6 +2,7 @@ package builtin
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -24,8 +25,15 @@ func DnsLookupSchema() Skill {
 		}}
 }
 
+var dnsRecordTypes = map[string]bool{"A": true, "AAAA": true, "MX": true, "TXT": true, "CNAME": true, "NS": true}
+
+// DnsLookup is DnsLookupContext without cancellation.
 func DnsLookup() Executor {
-	return func(args map[string]any) (any, error) {
+	return withoutContext(DnsLookupContext())
+}
+
+func DnsLookupContext() ContextExecutor {
+	return func(ctx context.Context, args map[string]any) (any, error) {
 		domain := str(args, "domain")
 		if domain == "" {
 			return map[string]any{"error": "domain is required"}, nil
@@ -33,9 +41,15 @@ func DnsLookup() Executor {
 		if !isHostname(domain) {
 			return map[string]any{"error": fmt.Sprintf("invalid domain: %q", domain)}, nil
 		}
-		rtype := strings.ToUpper(str(args, "record_type"))
+		rtype := strings.ToUpper(strings.TrimSpace(str(args, "record_type")))
 		if rtype == "" {
 			rtype = "A"
+		}
+		// Validated before the dig branch, not only in the stdlib fallback:
+		// rtype is an argv entry too, and "@10.0.0.53" made dig query that
+		// server directly — past netguard and SKILL_ALLOW_PRIVATE_NETWORKS.
+		if !dnsRecordTypes[rtype] {
+			return map[string]any{"error": fmt.Sprintf("unsupported record type: %s (use A, AAAA, MX, TXT, CNAME or NS)", rtype)}, nil
 		}
 
 		var records []string
@@ -46,7 +60,7 @@ func DnsLookup() Executor {
 		// tokens as its own options (`-f <file>`, `@<server>`), so an unvalidated
 		// domain from the model could redirect the query or read a local file.
 		if digPath, err := exec.LookPath("dig"); err == nil {
-			out, err := exec.Command(digPath, "+short", "+time=5", domain, rtype).Output()
+			out, err := exec.CommandContext(ctx, digPath, "+short", "+time=5", domain, rtype).Output()
 			if err == nil {
 				method = "dig"
 				for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
@@ -61,34 +75,34 @@ func DnsLookup() Executor {
 			method = "stdlib"
 			switch rtype {
 			case "A":
-				addrs, _ := net.LookupHost(domain)
+				addrs, _ := net.DefaultResolver.LookupHost(ctx, domain)
 				for _, a := range addrs {
 					if net.ParseIP(a).To4() != nil {
 						records = append(records, a)
 					}
 				}
 			case "AAAA":
-				addrs, _ := net.LookupHost(domain)
+				addrs, _ := net.DefaultResolver.LookupHost(ctx, domain)
 				for _, a := range addrs {
 					if net.ParseIP(a).To4() == nil {
 						records = append(records, a)
 					}
 				}
 			case "MX":
-				mxs, _ := net.LookupMX(domain)
+				mxs, _ := net.DefaultResolver.LookupMX(ctx, domain)
 				for _, mx := range mxs {
 					records = append(records, fmt.Sprintf("%d %s", mx.Pref, mx.Host))
 				}
 			case "TXT":
-				txts, _ := net.LookupTXT(domain)
+				txts, _ := net.DefaultResolver.LookupTXT(ctx, domain)
 				records = append(records, txts...)
 			case "NS":
-				nss, _ := net.LookupNS(domain)
+				nss, _ := net.DefaultResolver.LookupNS(ctx, domain)
 				for _, ns := range nss {
 					records = append(records, ns.Host)
 				}
 			case "CNAME":
-				cname, _ := net.LookupCNAME(domain)
+				cname, _ := net.DefaultResolver.LookupCNAME(ctx, domain)
 				if cname != "" {
 					records = append(records, cname)
 				}
@@ -145,17 +159,25 @@ func PingCheckSchema() Skill {
 		}}
 }
 
+// PingCheck is PingCheckContext without cancellation.
 func PingCheck() Executor {
-	return func(args map[string]any) (any, error) {
+	return withoutContext(PingCheckContext())
+}
+
+func PingCheckContext() ContextExecutor {
+	return func(ctx context.Context, args map[string]any) (any, error) {
 		host := str(args, "host")
 		if host == "" {
 			return map[string]any{"error": "host is required"}, nil
 		}
 		port := intOr(args, "port", 80)
+		if port < 1 || port > 65535 {
+			return map[string]any{"host": host, "reachable": false, "error": fmt.Sprintf("port %d outside 1-65535", port)}, nil
+		}
 		timeout := clampTimeout(floatOr(args, "timeout", 5), 5, maxTimeoutSec)
 
 		t0 := time.Now()
-		addrs, err := net.LookupHost(host)
+		addrs, err := net.DefaultResolver.LookupHost(ctx, host)
 		dnsMs := time.Since(t0).Milliseconds()
 		if err != nil {
 			return map[string]any{"host": host, "reachable": false, "error": err.Error(), "dns_ms": dnsMs}, nil
@@ -166,8 +188,7 @@ func PingCheck() Executor {
 		resolvedIP := addrs[0]
 
 		t1 := time.Now()
-		conn, err := netguard.DialTimeout("tcp", net.JoinHostPort(resolvedIP, strconv.Itoa(port)),
-			time.Duration(timeout*float64(time.Second)))
+		conn, err := netguard.Dialer(time.Duration(timeout*float64(time.Second))).DialContext(ctx, "tcp", net.JoinHostPort(resolvedIP, strconv.Itoa(port)))
 		connectMs := time.Since(t1).Milliseconds()
 		if err != nil {
 			out := map[string]any{
@@ -200,8 +221,13 @@ func PortScanSchema() Skill {
 		}}
 }
 
+// PortScan is PortScanContext without cancellation.
 func PortScan() Executor {
-	return func(args map[string]any) (any, error) {
+	return withoutContext(PortScanContext())
+}
+
+func PortScanContext() ContextExecutor {
+	return func(ctx context.Context, args map[string]any) (any, error) {
 		host := str(args, "host")
 		if host == "" {
 			return map[string]any{"error": "host is required"}, nil
@@ -218,14 +244,11 @@ func PortScan() Executor {
 		if err != nil {
 			return map[string]any{"error": err.Error()}, nil
 		}
-		if len(ports) > 1024 {
-			ports = ports[:1024]
-		}
 
 		// Resolve once and scan the address: a policy refusal then surfaces as
 		// an error instead of every port silently reading as closed, and the
 		// target cannot re-resolve elsewhere mid-scan.
-		target, err := resolveScanTarget(host)
+		target, err := resolveScanTarget(ctx, host)
 		if err != nil {
 			return map[string]any{"host": host, "error": err.Error()}, nil
 		}
@@ -243,7 +266,7 @@ func PortScan() Executor {
 				defer wg.Done()
 				defer func() { <-sem }()
 				addr := net.JoinHostPort(target, strconv.Itoa(port))
-				conn, err := netguard.DialTimeout("tcp", addr, time.Duration(timeout*float64(time.Second)))
+				conn, err := netguard.Dialer(time.Duration(timeout*float64(time.Second))).DialContext(ctx, "tcp", addr)
 				if err == nil {
 					_ = conn.Close()
 					mu.Lock()
@@ -270,8 +293,8 @@ const maxPortScanTimeoutSec = 10
 
 // resolveScanTarget resolves host to one address and vets it against the
 // network policy.
-func resolveScanTarget(host string) (string, error) {
-	addrs, err := net.LookupHost(host)
+func resolveScanTarget(ctx context.Context, host string) (string, error) {
+	addrs, err := net.DefaultResolver.LookupHost(ctx, host)
 	if err != nil {
 		return "", err
 	}
@@ -292,12 +315,21 @@ func resolveScanTarget(host string) (string, error) {
 // Bounds are enforced while parsing: an out-of-range range such as "1-1000000"
 // used to expand into a million-element slice before the caller trimmed it back
 // to 1024, and negative or zero ports produced dial addresses that could never
-// connect.
+// connect. Duplicates are dropped ("80,80,80" listed an open port three times
+// and inflated the counts), and expansion stops at maxScanPorts, so thousands
+// of repeated "1-65535" parts can no longer allocate gigabytes first.
 func parsePorts(s string) ([]int, error) {
 	const minPort, maxPort = 1, 65535
 	inRange := func(p int) bool { return p >= minPort && p <= maxPort }
 
 	var out []int
+	seen := make(map[int]bool)
+	add := func(p int) {
+		if !seen[p] && len(out) < maxScanPorts {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
 	for _, part := range strings.Split(s, ",") {
 		part = strings.TrimSpace(part)
 		if strings.Contains(part, "-") {
@@ -310,8 +342,8 @@ func parsePorts(s string) ([]int, error) {
 			if !inRange(lo) || !inRange(hi) {
 				return nil, fmt.Errorf("port range %s outside %d-%d", part, minPort, maxPort)
 			}
-			for p := lo; p <= hi; p++ {
-				out = append(out, p)
+			for p := lo; p <= hi && len(out) < maxScanPorts; p++ {
+				add(p)
 			}
 		} else {
 			p, err := strconv.Atoi(part)
@@ -321,11 +353,14 @@ func parsePorts(s string) ([]int, error) {
 			if !inRange(p) {
 				return nil, fmt.Errorf("port %d outside %d-%d", p, minPort, maxPort)
 			}
-			out = append(out, p)
+			add(p)
 		}
 	}
 	return out, nil
 }
+
+// maxScanPorts is the most ports one port_scan call probes.
+const maxScanPorts = 1024
 
 func sortInts(a []int) {
 	// simple insertion sort for small slices
@@ -347,8 +382,13 @@ func WhoisLookupSchema() Skill {
 		}}
 }
 
+// WhoisLookup is WhoisLookupContext without cancellation.
 func WhoisLookup() Executor {
-	return func(args map[string]any) (any, error) {
+	return withoutContext(WhoisLookupContext())
+}
+
+func WhoisLookupContext() ContextExecutor {
+	return func(ctx context.Context, args map[string]any) (any, error) {
 		domain := str(args, "domain")
 		if domain == "" {
 			return map[string]any{"error": "domain is required"}, nil
@@ -358,7 +398,7 @@ func WhoisLookup() Executor {
 		if !isHostname(domain) {
 			return map[string]any{"error": fmt.Sprintf("invalid domain: %q", domain)}, nil
 		}
-		raw, err := whoisQuery("whois.iana.org", domain)
+		raw, err := whoisQuery(ctx, "whois.iana.org", domain)
 		if err != nil {
 			return map[string]any{"domain": domain, "error": err.Error()}, nil
 		}
@@ -378,7 +418,7 @@ func WhoisLookup() Executor {
 		// The referral comes from the remote response; only follow it when it
 		// is a plain hostname (whoisQuery's guarded dial vets where it lands).
 		if server != "" && isHostname(server) {
-			if r2, err := whoisQuery(server, domain); err == nil {
+			if r2, err := whoisQuery(ctx, server, domain); err == nil {
 				raw = r2
 			}
 		}
@@ -389,8 +429,8 @@ func WhoisLookup() Executor {
 	}
 }
 
-func whoisQuery(server, domain string) (string, error) {
-	conn, err := netguard.DialTimeout("tcp", net.JoinHostPort(server, "43"), 10*time.Second)
+func whoisQuery(ctx context.Context, server, domain string) (string, error) {
+	conn, err := netguard.Dialer(10*time.Second).DialContext(ctx, "tcp", net.JoinHostPort(server, "43"))
 	if err != nil {
 		return "", err
 	}

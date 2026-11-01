@@ -17,12 +17,12 @@ func TestPanickingToolInParallelBatchDoesNotCrash(t *testing.T) {
 	svc.ParallelEnabled = true
 	svc.MaxParallel = 4
 	svc.NativeSkills = map[string]Skill{
-		"boom": {Execute: func(map[string]any) (any, error) {
+		"boom": {Execute: func(context.Context, map[string]any) (any, error) {
 			var s []int
 			_ = s[5]
 			return nil, nil
 		}},
-		"fine": {Execute: func(map[string]any) (any, error) { return "ok", nil }},
+		"fine": {Execute: func(context.Context, map[string]any) (any, error) { return "ok", nil }},
 	}
 
 	res, err := svc.Run(RunRequest{Query: "hi", MaxSteps: 3})
@@ -49,7 +49,7 @@ func TestPanickingToolInSingleCallDoesNotCrash(t *testing.T) {
 		`{"type":"final","answer":"done"}`,
 	}})
 	svc.NativeSkills = map[string]Skill{
-		"boom": {Execute: func(map[string]any) (any, error) {
+		"boom": {Execute: func(context.Context, map[string]any) (any, error) {
 			panic("kaboom")
 		}},
 	}
@@ -77,11 +77,11 @@ func TestPanickingToolInSingleCallDoesNotCrash(t *testing.T) {
 
 // safeExecute must leave normal results and normal errors untouched.
 func TestSafeExecutePassesThrough(t *testing.T) {
-	res, err := safeExecute(func(map[string]any) (any, error) { return "value", nil }, "t", nil)
+	res, err := safeExecute(context.Background(), func(context.Context, map[string]any) (any, error) { return "value", nil }, "t", nil)
 	if err != nil || res != "value" {
 		t.Fatalf("got (%v, %v), want (value, nil)", res, err)
 	}
-	_, err = safeExecute(func(map[string]any) (any, error) { return nil, context.Canceled }, "t", nil)
+	_, err = safeExecute(context.Background(), func(context.Context, map[string]any) (any, error) { return nil, context.Canceled }, "t", nil)
 	if err != context.Canceled {
 		t.Fatalf("got %v, want context.Canceled", err)
 	}

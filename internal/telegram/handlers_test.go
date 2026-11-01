@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -483,5 +484,31 @@ func TestLongAnswerIsChunked(t *testing.T) {
 	}
 	if !strings.Contains(joined.String(), "END") {
 		t.Fatal("the tail of the answer was dropped")
+	}
+}
+
+// BOT_MEMORY_SCOPE decides which memory namespace a Telegram query runs in.
+func TestMemoryScopeSetsTheNamespace(t *testing.T) {
+	var got []any
+	gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		got = append(got, req["namespace"])
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: final\ndata: " + `{"event":"final","session_id":1,"answer":"ok","meta":{}}` + "\n\n"))
+	}))
+	defer gw.Close()
+	f := newFakeTelegram(t)
+	b := newTestBot(t, f, newAuthStore(t, 5), gw.URL)
+
+	for _, scope := range []string{"", "user", "chat"} {
+		b.SetMemoryScope(scope)
+		msg := command(-100, "ask", "q")
+		msg.From = &tgbotapi.User{ID: 5}
+		b.handle(msg)
+	}
+	want := []any{nil, "telegram:user:5", "telegram:chat:-100"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("namespaces sent = %v, want %v", got, want)
 	}
 }

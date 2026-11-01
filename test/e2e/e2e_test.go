@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -322,6 +323,11 @@ func TestHealth(t *testing.T) {
 	if s, _ := body["chat_model"].(string); s == "" {
 		t.Error("chat_model is empty")
 	}
+	// The suite imports none of the project's packages, so it checks the
+	// shape of the version (built into the image) rather than its value.
+	if v, _ := body["version"].(string); !regexp.MustCompile(`^\d+\.\d+\.\d+`).MatchString(v) {
+		t.Errorf("version = %q, want MAJOR.MINOR.PATCH", v)
+	}
 	if s, _ := body["embed_error"].(string); s != "" {
 		t.Errorf("embed_error = %q", s)
 	}
@@ -487,34 +493,75 @@ func TestUnknownToolIsRecoverable(t *testing.T) {
 	}
 }
 
-// A model that stops emitting JSON must degrade to a polite answer on both
-// endpoints — they used to disagree, with the stream surfacing raw parser text.
-func TestNonJSONReplyFallsBackOnBothEndpoints(t *testing.T) {
-	const notJSON = "I'm afraid I can't do that, Dave."
+// With native tool calling (AGENT_TOOL_MODE=auto, the default, against an
+// Ollama-compatible backend) a plain-text reply IS the answer — in envelope
+// mode the same reply was an unparseable turn and a "please rephrase"
+// fallback. Both endpoints must agree, and say which mode ran.
+func TestPlainTextReplyIsTheAnswerOnBothEndpoints(t *testing.T) {
+	const plain = "I'm afraid I can't do that, Dave."
 
-	script(t, notJSON)
+	script(t, plain)
 	status, body := req(t, "POST", baseURL()+"/api/query", map[string]any{"query": "hello"})
 	mustOK(t, status, body, "query")
-	answer, _ := body["answer"].(string)
-	if answer == "" || strings.Contains(answer, "did not return JSON") {
-		t.Fatalf("answer = %q, want the graceful fallback", answer)
+	if body["answer"] != plain {
+		t.Fatalf("answer = %q, want the model's text verbatim", body["answer"])
 	}
-	if metaOf(t, body)["fallback"] != true {
-		t.Errorf("meta.fallback = %v, want true", metaOf(t, body)["fallback"])
+	meta := metaOf(t, body)
+	if meta["tool_mode"] != "native" || meta["fallback"] != nil {
+		t.Errorf("meta = %v, want tool_mode=native and no fallback", meta)
 	}
 
-	script(t, notJSON)
+	script(t, plain)
 	events := streamQuery(t, map[string]any{"query": "hello"})
 	if names := eventNames(events); contains(names, "error") {
 		t.Fatalf("stream emitted an error event: %v", names)
 	}
 	final := lastEvent(t, events, "final")
-	if final["answer"] != answer {
-		t.Errorf("stream answer %q != non-streaming answer %q", final["answer"], answer)
+	if final["answer"] != plain {
+		t.Errorf("stream answer %q, want %q", final["answer"], plain)
 	}
-	meta, _ := final["meta"].(map[string]any)
-	if meta["fallback"] != true {
-		t.Errorf("stream meta.fallback = %v, want true", meta["fallback"])
+}
+
+// A native tool call (no envelope text at all) runs the tool, and the
+// result goes back to the model as a role=tool message tied to the call.
+func TestNativeToolCallRoundTrip(t *testing.T) {
+	script(t,
+		`{"tool_calls":[{"name":"math_eval","arguments":{"expression":"6*7"}}]}`,
+		"It is 42.",
+	)
+	status, body := req(t, "POST", baseURL()+"/api/query", map[string]any{"query": "6*7?"})
+	mustOK(t, status, body, "query")
+	if body["answer"] != "It is 42." {
+		t.Fatalf("answer = %v", body["answer"])
+	}
+	recs := invocations(t, sessionIDOf(t, body))
+	if len(recs) != 1 || recs[0]["skill"] != "math_eval" {
+		t.Fatalf("audit rows = %v, want one math_eval call", recs)
+	}
+	status, raw := req(t, "GET", mockURL()+"/__control/requests", nil)
+	mustOK(t, status, raw, "mock requests")
+	chats, _ := raw["chats"].([]any)
+	if len(chats) != 2 {
+		t.Fatalf("mock saw %d chat requests, want 2", len(chats))
+	}
+	first, _ := chats[0].(map[string]any)
+	if tools, _ := first["tools"].([]any); len(tools) == 0 {
+		t.Fatal("the request offered no native tools")
+	}
+	second, _ := chats[1].(map[string]any)
+	msgs, _ := second["messages"].([]any)
+	var sawCall, sawResult bool
+	for _, m := range msgs {
+		mm, _ := m.(map[string]any)
+		if tc, _ := mm["tool_calls"].([]any); len(tc) > 0 {
+			sawCall = true
+		}
+		if mm["role"] == "tool" && mm["tool_name"] == "math_eval" && strings.Contains(fmt.Sprint(mm["content"]), "42") {
+			sawResult = true
+		}
+	}
+	if !sawCall || !sawResult {
+		t.Fatalf("second turn lacks the native call/result pair: %v", msgs)
 	}
 }
 
@@ -884,6 +931,36 @@ func TestDisabledFeaturesAreEnforced(t *testing.T) {
 	mustOK(t, status, body, "locked /api/skills")
 }
 
+// A DNS-rebinding page reaches the token-less gateway with its own dotted name
+// in both Host and Origin. The real binary must turn it away on reads and
+// writes alike, while the service-name Host every in-network client uses
+// keeps working.
+func TestDNSRebindingHostRejected(t *testing.T) {
+	for _, method := range []string{"GET", "POST"} {
+		path := "/api/invocations"
+		if method == "POST" {
+			path = "/api/sessions/new"
+		}
+		httpReq, err := http.NewRequest(method, baseURL()+path, nil)
+		if err != nil {
+			t.Fatalf("build request: %v", err)
+		}
+		httpReq.Host = "rebind.attacker.example"
+		httpReq.Header.Set("Origin", "http://rebind.attacker.example")
+		resp, err := client.Do(httpReq)
+		if err != nil {
+			t.Fatalf("%s %s: %v", method, path, err)
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("%s %s with a rebinding Host: status %d, want 403 (%s)", method, path, resp.StatusCode, truncate(raw))
+		}
+	}
+	status, body := req(t, "GET", baseURL()+"/api/skills", nil)
+	mustOK(t, status, body, "service-name Host")
+}
+
 // Sessions persist the conversation, and a reused session id continues it.
 func TestSessionHistoryIsRecorded(t *testing.T) {
 	status, body := req(t, "POST", baseURL()+"/api/sessions/new", nil)
@@ -1011,4 +1088,146 @@ func contains(haystack []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+// Memory namespaces, in-place edits and export/import through the real
+// binary (chromem on disk, bag-of-words mock embeddings).
+func TestMemoryNamespacesEditAndExport(t *testing.T) {
+	tag := unique(t)
+	status, body := req(t, "POST", baseURL()+"/api/memory/add", map[string]any{
+		"text": "e2e namespaced fact " + tag, "namespace": "e2e:" + tag, "ttl_seconds": 3600,
+	})
+	mustOK(t, status, body, "namespaced add")
+	id, _ := body["memory_id"].(string)
+
+	status, body = req(t, "GET", baseURL()+"/api/memory?namespace=e2e:"+tag, nil)
+	mustOK(t, status, body, "namespace list")
+	if body["total"] != float64(1) {
+		t.Fatalf("namespace list = %v", body)
+	}
+
+	status, body = req(t, "PUT", baseURL()+"/api/memory/"+id, map[string]any{"text": "e2e edited fact " + tag})
+	mustOK(t, status, body, "edit")
+	hit, _ := body["hit"].(map[string]any)
+	if hit["text"] != "e2e edited fact "+tag {
+		t.Fatalf("edited hit = %v", hit)
+	}
+
+	status, raw := reqRaw(t, "GET", baseURL()+"/api/memory/export", nil)
+	if status != http.StatusOK || !strings.Contains(string(raw), "e2e edited fact "+tag) {
+		t.Fatalf("export = %d, missing the edited memory", status)
+	}
+}
+
+// Agent-prompt task with run-now and history; the scheduler runs it through
+// the real agent and the mock model.
+func TestSchedulerPromptTaskRunNow(t *testing.T) {
+	status, body := req(t, "POST", baseURL()+"/api/scheduler/tasks", map[string]any{
+		"name": "e2e digest " + unique(t), "cron_expr": "0 0 1 1 *", "prompt": "write the digest",
+		"timezone": "Europe/Berlin", "max_retries": 1,
+	})
+	mustOK(t, status, body, "create prompt task")
+	if body["skill"] != "agent" || body["timezone"] != "Europe/Berlin" {
+		t.Fatalf("task = %v", body)
+	}
+	id := int(body["id"].(float64))
+	path := fmt.Sprintf("%s/api/scheduler/tasks/%d", baseURL(), id)
+	defer req(t, "DELETE", path, nil)
+
+	script(t, "Digest: all quiet.")
+	status, body = req(t, "POST", path+"/run", nil)
+	mustOK(t, status, body, "run now")
+	if body["ok"] != true || body["result"] != "Digest: all quiet." || body["trigger"] != "manual" {
+		t.Fatalf("run = %v", body)
+	}
+	status, runs := reqList(t, "GET", path+"/runs", nil)
+	if status != http.StatusOK || len(runs) != 1 {
+		t.Fatalf("history = %d %v", status, runs)
+	}
+	if code, b := req(t, "POST", baseURL()+"/api/scheduler/tasks", map[string]any{
+		"name": "bad", "cron_expr": "0 0 * * *", "skill": "reminder", "timezone": "Mars/Base",
+	}); code != http.StatusBadRequest {
+		t.Fatalf("bad zone = %d %v", code, b)
+	}
+}
+
+// Skill editor routes, session rename/search/delete and usage stats.
+func TestEditorSessionsAndUsage(t *testing.T) {
+	name := fmt.Sprintf("e2e_skill_%d", time.Now().UnixNano()%1000000)
+	src := "---\nname: " + name + "\ndescription: e2e prompt skill\n---\n\nSay hi.\n"
+	status, body := req(t, "POST", baseURL()+"/api/skills/validate", map[string]any{"content": src})
+	mustOK(t, status, body, "validate")
+	if body["ok"] != true {
+		t.Fatalf("validate = %v", body)
+	}
+	status, body = req(t, "POST", baseURL()+"/api/skills/source", map[string]any{"content": src})
+	mustOK(t, status, body, "save")
+	status, body = req(t, "GET", baseURL()+"/api/skills/"+name+"/source", nil)
+	mustOK(t, status, body, "source")
+	if body["content"] != src {
+		t.Fatalf("source = %v", body)
+	}
+	if status, _ := req(t, "DELETE", baseURL()+"/api/skills/"+name, nil); status != http.StatusOK {
+		t.Fatalf("delete skill = %d", status)
+	}
+
+	marker := "zebra-" + unique(t)
+	script(t, `{"type":"final","answer":"ok"}`)
+	status, body = req(t, "POST", baseURL()+"/api/query", map[string]any{"query": "remember " + marker})
+	mustOK(t, status, body, "query")
+	sid := sessionIDOf(t, body)
+	sp := fmt.Sprintf("%s/api/sessions/%d", baseURL(), sid)
+	status, body = req(t, "PATCH", sp, map[string]any{"title": "E2E " + marker})
+	mustOK(t, status, body, "rename")
+	status, body = req(t, "GET", baseURL()+"/api/sessions?q="+marker, nil)
+	mustOK(t, status, body, "search")
+	if s, _ := body["sessions"].([]any); len(s) != 1 {
+		t.Fatalf("search = %v", body)
+	}
+	status, body = req(t, "GET", baseURL()+"/api/stats/usage?days=1", nil)
+	mustOK(t, status, body, "usage")
+	if body["bucket"] != "hour" {
+		t.Fatalf("usage = %v", body)
+	}
+	if status, _ := req(t, "DELETE", sp, nil); status != http.StatusOK {
+		t.Fatalf("delete session = %d", status)
+	}
+}
+
+// A few of the newer skills through the playground on the real binary: the
+// pure ones, and the workspace (which lives on the data volume).
+func TestNewSkillsThroughPlayground(t *testing.T) {
+	invoke := func(skill string, args map[string]any) map[string]any {
+		t.Helper()
+		status, body := req(t, "POST", baseURL()+"/api/skills/"+skill+"/invoke", map[string]any{"args": args})
+		mustOK(t, status, body, skill)
+		if body["error"] != nil {
+			t.Fatalf("%s: %v", skill, body["error"])
+		}
+		res, _ := body["result"].(map[string]any)
+		if res["error"] != nil {
+			t.Fatalf("%s result: %v", skill, res["error"])
+		}
+		return res
+	}
+	if r := invoke("json_query", map[string]any{"json": `{"a":[1,2,3]}`, "query": ".a | add"}); r["result"] != 6.0 {
+		t.Errorf("json_query = %v", r)
+	}
+	if r := invoke("unit_convert", map[string]any{"value": 1, "from": "GiB", "to": "MiB"}); r["result"] != 1024.0 {
+		t.Errorf("unit_convert = %v", r)
+	}
+	r := invoke("time_convert", map[string]any{"time": "2026-11-03 15:00", "from_tz": "Asia/Tokyo", "to_tz": "Europe/Berlin"})
+	if res, _ := r["results"].([]any); len(res) != 1 || res[0].(map[string]any)["time"] != "2026-11-03 07:00:00" {
+		t.Errorf("time_convert (embedded tzdata in a distroless image) = %v", r)
+	}
+	name := fmt.Sprintf("e2e/%d.txt", time.Now().UnixNano())
+	invoke("file_write", map[string]any{"path": name, "content": "written by e2e"})
+	if r := invoke("file_read", map[string]any{"path": name}); r["content"] != "written by e2e" {
+		t.Errorf("file_read = %v", r)
+	}
+	status, body := req(t, "POST", baseURL()+"/api/skills/file_read/invoke", map[string]any{"args": map[string]any{"path": "../agent_memory.sqlite3"}})
+	mustOK(t, status, body, "escape attempt")
+	if res, _ := body["result"].(map[string]any); res["content"] != nil {
+		t.Fatalf("file_read escaped the workspace: %v", res)
+	}
 }

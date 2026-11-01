@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -16,26 +15,27 @@ func runAsk(args []string) {
 	sessionID := fs.Int("session", 0, "Reuse existing session ID")
 	maxSteps := fs.Int("max-steps", 0, "Override max agent steps")
 	jsonOut := fs.Bool("json", false, "Output full JSON result")
+	namespace := fs.String("namespace", "", "Memory namespace for this run (default: the shared one)")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "Usage: omega ask [flags] \"question\"")
 		fs.PrintDefaults()
 	}
-	fs.Parse(args)
+	pos := parseArgs(fs, args)
 
-	query := fs.Arg(0)
+	query := argAt(pos, 0)
 	if query == "" {
 		fs.Usage()
 		os.Exit(1)
 	}
 
 	if isRemote() {
-		runAskRemote(query, *sessionID, *maxSteps, *stream, *jsonOut)
+		runAskRemote(query, *namespace, *sessionID, *maxSteps, *stream, *jsonOut)
 	} else {
-		runAskLocal(query, *sessionID, *maxSteps, *stream, *jsonOut)
+		runAskLocal(query, *namespace, *sessionID, *maxSteps, *stream, *jsonOut)
 	}
 }
 
-func runAskLocal(query string, sessionID, maxSteps int, stream, jsonOut bool) {
+func runAskLocal(query, namespace string, sessionID, maxSteps int, stream, jsonOut bool) {
 	defer closeLocal()
 	svc := getLocal()
 
@@ -45,16 +45,17 @@ func runAskLocal(query string, sessionID, maxSteps int, stream, jsonOut bool) {
 		Query:     query,
 		SessionID: sessionID,
 		MaxSteps:  steps,
+		Namespace: namespace,
 	}
 
 	if stream {
 		ch := make(chan agent.Event, 32)
-		go svc.Agent.RunStream(context.Background(), req, ch)
+		go svc.Agent.RunStream(interruptContext(), req, ch)
 		printStreamEvents(ch, jsonOut)
 		return
 	}
 
-	result, err := svc.Agent.Run(req)
+	result, err := svc.Agent.RunContext(interruptContext(), req)
 	if err != nil {
 		fatalf("agent: %v", err)
 	}
@@ -86,11 +87,14 @@ func resolveMaxSteps(flagVal, configured int) int {
 	return defaultMaxSteps
 }
 
-func runAskRemote(query string, sessionID, maxSteps int, stream, jsonOut bool) {
+func runAskRemote(query, namespace string, sessionID, maxSteps int, stream, jsonOut bool) {
 	body := map[string]any{
 		"query":      query,
 		"session_id": sessionID,
 		"remember":   true,
+	}
+	if namespace != "" {
+		body["namespace"] = namespace
 	}
 	if maxSteps > 0 {
 		body["max_steps"] = maxSteps

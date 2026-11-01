@@ -27,6 +27,11 @@ func allSchemas() []Skill {
 		Base64Schema(), HashSchema(), UuidGenSchema(), PasswordGenSchema(), CidrCalcSchema(), JwtInspectSchema(),
 		DateTimeSchema(), MathEvalSchema(), CronScheduleSchema(), ReminderSchema(),
 		ShellCommandSchema(), SshCommandSchema(), QrGenerateSchema(),
+		RssFetchSchema(), NotifySchema(),
+		HttpTimingSchema(), DnsCompareSchema(), RdapLookupSchema(), TracerouteSchema(), SmtpCheckSchema(), WakeOnLanSchema(), SubnetSweepSchema(),
+		JsonQuerySchema(), TimeConvertSchema(), RegexTestSchema(), TextDiffSchema(), CsvQuerySchema(), UnitConvertSchema(), HtmlToMarkdownSchema(),
+		WikipediaSchema(), CurrencyConvertSchema(), GithubSchema(),
+		FileListSchema(), FileReadSchema(), FileWriteSchema(), PdfTextSchema(),
 	}
 }
 
@@ -66,7 +71,7 @@ func TestEverySchemaIsWellFormed(t *testing.T) {
 			}
 		}
 	}
-	if len(seen) != 27 {
+	if len(seen) != 50 {
 		t.Fatalf("allSchemas covers %d skills; keep it in sync with registerBuiltins", len(seen))
 	}
 }
@@ -82,6 +87,11 @@ func TestRequiredParametersAreDeclared(t *testing.T) {
 		"hash_skill": "text", "cidr_calc": "cidr", "math_eval": "expression",
 		"cron_schedule": "expression", "reminder": "message", "qr_generate": "data",
 		"shell_command": "command",
+		"rss_fetch":     "urls", "notify": "channel",
+		"http_timing": "url", "dns_compare": "name", "rdap_lookup": "query", "traceroute": "host", "wake_on_lan": "mac", "subnet_sweep": "cidr",
+		"json_query": "query", "regex_test": "pattern", "text_diff": "a", "unit_convert": "value",
+		"wikipedia": "query", "currency_convert": "from", "github": "action",
+		"file_read": "path", "file_write": "path",
 	}
 	byName := map[string]Skill{}
 	for _, s := range allSchemas() {
@@ -291,7 +301,7 @@ func TestLoadSignerErrors(t *testing.T) {
 func TestSshCommandReportsUnreachableHost(t *testing.T) {
 	_, path := newTestKey(t)
 	// Port 1 on localhost refuses connections immediately.
-	res, err := SshCommand(SSHConfig{Enabled: true, IdentFile: path})(map[string]any{
+	res, err := SshCommand(SSHConfig{Enabled: true, IdentFile: path, KnownHosts: filepath.Join(t.TempDir(), "kh")})(map[string]any{
 		"host": "127.0.0.1", "port": 1, "command": "ls", "timeout": 1,
 	})
 	if err != nil {

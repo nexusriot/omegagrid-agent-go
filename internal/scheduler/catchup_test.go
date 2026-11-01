@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 	"time"
@@ -64,15 +65,21 @@ func TestPendingMinutesCapsCatchup(t *testing.T) {
 	}
 }
 
-func TestMatchesAny(t *testing.T) {
+func TestLatestMatch(t *testing.T) {
 	minutes := []time.Time{
 		minuteAt(t, "2026-07-30 12:01"),
 		minuteAt(t, "2026-07-30 12:02"),
 	}
-	if !matchesAny("2 12 * * *", minutes) {
-		t.Fatal("expected 12:02 expression to match the swept window")
+	if got, ok := latestMatch("2 12 * * *", minutes); !ok || !got.Equal(minutes[1]) {
+		t.Fatalf("latestMatch = %v, %v; want 12:02", got, ok)
 	}
-	if matchesAny("5 12 * * *", minutes) {
+	if got, ok := latestMatch("* * * * *", minutes); !ok || !got.Equal(minutes[1]) {
+		t.Fatalf("every-minute task: latestMatch = %v, want the newest swept minute", got)
+	}
+	if got, ok := latestMatch("1 12 * * *", minutes); !ok || !got.Equal(minutes[0]) {
+		t.Fatalf("latestMatch = %v, %v; want 12:01", got, ok)
+	}
+	if _, ok := latestMatch("5 12 * * *", minutes); ok {
 		t.Fatal("12:05 expression must not match a 12:01-12:02 window")
 	}
 }
@@ -91,7 +98,7 @@ func TestTickRunsMissedTaskExactlyOnce(t *testing.T) {
 	}
 
 	var runs int
-	r := NewRunner(store, func(string, map[string]any) (any, error) {
+	r := NewRunner(store, func(context.Context, string, map[string]any) (any, error) {
 		runs++
 		return map[string]any{"ok": true}, nil
 	}, "", time.Minute)

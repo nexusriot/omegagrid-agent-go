@@ -4,6 +4,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"unicode/utf16"
+	"unicode/utf8"
 )
 
 func TestSplitForTelegram(t *testing.T) {
@@ -175,4 +177,27 @@ func TestSessionMapConcurrentAccess(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+}
+
+// Telegram's 4096 limit counts UTF-16 code units; counting runes let 3000
+// emoji (6000 units) through as one chunk, which Telegram rejects with 400.
+func TestSplitForTelegramCountsUTF16Units(t *testing.T) {
+	for _, in := range []string{
+		strings.Repeat("😀", 3000),
+		strings.Repeat("😀 line\n", 900),
+		strings.Repeat("a", 3999) + "😀😀",
+	} {
+		chunks := splitForTelegram(in)
+		if strings.Join(chunks, "") != strings.ReplaceAll(in, "\n", "") && strings.Join(chunks, "\n") != in {
+			t.Fatalf("chunks do not reassemble the input")
+		}
+		for i, c := range chunks {
+			if n := len(utf16.Encode([]rune(c))); n > telegramMaxLen {
+				t.Errorf("chunk %d is %d UTF-16 units, over %d", i, n, telegramMaxLen)
+			}
+			if !utf8.ValidString(c) {
+				t.Errorf("chunk %d split a rune", i)
+			}
+		}
+	}
 }

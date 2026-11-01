@@ -477,7 +477,7 @@ func TestRunOne_KnownTool(t *testing.T) {
 		timings:    map[string]float64{},
 	}
 	st.tools["echo"] = Skill{
-		Execute: func(args map[string]any) (any, error) {
+		Execute: func(_ context.Context, args map[string]any) (any, error) {
 			return map[string]any{"echoed": args["msg"]}, nil
 		},
 	}
@@ -512,7 +512,7 @@ func TestRunOne_SensitiveSkillRedacted(t *testing.T) {
 		timings:    map[string]float64{},
 	}
 	st.tools["shell_command"] = Skill{
-		Execute: func(args map[string]any) (any, error) {
+		Execute: func(_ context.Context, args map[string]any) (any, error) {
 			return map[string]any{"stdout": "ok"}, nil
 		},
 	}
@@ -643,7 +643,7 @@ func TestExecuteBatch_Sequential(t *testing.T) {
 		timings:    map[string]float64{},
 	}
 	st.tools["adder"] = Skill{
-		Execute: func(args map[string]any) (any, error) {
+		Execute: func(_ context.Context, args map[string]any) (any, error) {
 			n, _ := args["n"].(float64)
 			return map[string]any{"result": n + 1}, nil
 		},
@@ -687,7 +687,7 @@ func TestExecuteBatch_Parallel(t *testing.T) {
 	for _, name := range []string{"t1", "t2", "t3"} {
 		n := name
 		st.tools[n] = Skill{
-			Execute: func(_ map[string]any) (any, error) {
+			Execute: func(_ context.Context, _ map[string]any) (any, error) {
 				mu.Lock()
 				called[n] = true
 				mu.Unlock()
@@ -738,7 +738,7 @@ func TestJwtInspectIsRedactedInTheAuditLog(t *testing.T) {
 		`{"type":"final","answer":"done"}`,
 	}})
 	svc.NativeSkills = map[string]Skill{
-		"jwt_inspect": {Execute: func(map[string]any) (any, error) {
+		"jwt_inspect": {Execute: func(context.Context, map[string]any) (any, error) {
 			return map[string]any{"sub": "secret-subject"}, nil
 		}},
 	}

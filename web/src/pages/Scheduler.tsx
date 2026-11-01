@@ -1,66 +1,15 @@
-import { useState, useEffect } from 'react'
+import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
-  Clock, Plus, Trash2, Play, Pause, Loader2, X, ChevronDown, CheckCircle2,
-  XCircle, Calendar,
+  Clock, Plus, Trash2, Play, Pause, Loader2, CheckCircle2, XCircle, Calendar,
+  Zap, History, Bot, RotateCcw, Globe, Send,
 } from 'lucide-react'
 import { toast } from 'sonner'
-import { fetchTasks, createTask, deleteTask, enableTask, disableTask, fetchSkills } from '../api/client'
-import type { SchedulerTask, CreateTaskRequest } from '../api/types'
-
-function cronFieldMatches(field: string, value: number, lo: number): boolean {
-  for (const part of field.split(',')) {
-    const trimmed = part.trim()
-    let step = 1
-    let base = trimmed
-    const slashIdx = trimmed.indexOf('/')
-    if (slashIdx >= 0) {
-      step = parseInt(trimmed.slice(slashIdx + 1), 10)
-      if (isNaN(step) || step <= 0) continue
-      base = trimmed.slice(0, slashIdx)
-    }
-    if (base === '*') {
-      if ((value - lo) % step === 0) return true
-      continue
-    }
-    const dashIdx = base.indexOf('-')
-    if (dashIdx >= 0) {
-      const lo2 = parseInt(base.slice(0, dashIdx), 10)
-      const hi2 = parseInt(base.slice(dashIdx + 1), 10)
-      if (!isNaN(lo2) && !isNaN(hi2) && value >= lo2 && value <= hi2 && (value - lo2) % step === 0) return true
-      continue
-    }
-    const n = parseInt(base, 10)
-    if (!isNaN(n) && n === value && step === 1) return true
-  }
-  return false
-}
-
-function cronMatches(parts: string[], d: Date): boolean {
-  return (
-    cronFieldMatches(parts[0], d.getMinutes(), 0) &&
-    cronFieldMatches(parts[1], d.getHours(), 0) &&
-    cronFieldMatches(parts[2], d.getDate(), 1) &&
-    cronFieldMatches(parts[3], d.getMonth() + 1, 1) &&
-    cronFieldMatches(parts[4], d.getDay(), 0)
-  )
-}
-
-function nextCronFires(expr: string, count: number): Date[] | null {
-  const parts = expr.trim().split(/\s+/)
-  if (parts.length !== 5) return null
-  const results: Date[] = []
-  const d = new Date()
-  d.setSeconds(0, 0)
-  d.setMinutes(d.getMinutes() + 1)
-  let attempts = 0
-  while (results.length < count && attempts < 60 * 24 * 400) {
-    attempts++
-    if (cronMatches(parts, d)) results.push(new Date(d))
-    d.setMinutes(d.getMinutes() + 1)
-  }
-  return results.length === count ? results : null
-}
+import { fetchTasks, deleteTask, enableTask, disableTask, runTask } from '../api/client'
+import type { SchedulerTask } from '../api/types'
+import TaskCreateModal, { CronPreview } from '../components/TaskCreateModal'
+import TaskRunHistory, { resultPreview } from '../components/TaskRunHistory'
+import { isValidTimezone } from '../lib/cron'
 
 function fmtTs(ts: number | null): string {
   if (!ts) return '—'
@@ -73,117 +22,14 @@ function StatusBadge({ enabled }: { enabled: boolean }) {
     : <span className="flex items-center gap-1 text-[11px] text-gray-600"><XCircle size={10} /> disabled</span>
 }
 
-function CreateModal({ onClose }: { onClose: () => void }) {
-  const qc = useQueryClient()
-  const { data: skills = [] } = useQuery({ queryKey: ['skills'], queryFn: fetchSkills, staleTime: 30_000 })
-
-  const [form, setForm] = useState<CreateTaskRequest>({
-    name: '', cron_expr: '0 9 * * *', skill: '', args: {},
-  })
-  const [argsRaw, setArgsRaw] = useState('{}')
-  const [nextRuns, setNextRuns] = useState<Date[]>(() => nextCronFires('0 9 * * *', 3) ?? [])
-
-  useEffect(() => {
-    setNextRuns(nextCronFires(form.cron_expr, 3) ?? [])
-  }, [form.cron_expr])
-
-  const mut = useMutation({
-    mutationFn: () => {
-      let args: Record<string, unknown> = {}
-      try { args = JSON.parse(argsRaw) } catch { toast.error('Invalid JSON in args'); throw new Error('invalid json') }
-      return createTask({ ...form, args })
-    },
-    onSuccess: () => {
-      toast.success('Task created')
-      qc.invalidateQueries({ queryKey: ['tasks'] })
-      onClose()
-    },
-    onError: (e: Error) => toast.error(e.message),
-  })
-
-  const field = (key: keyof CreateTaskRequest) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) =>
-    setForm((f) => ({ ...f, [key]: e.target.value }))
-
-  const inputCls = 'w-full rounded-xl border border-surface-border bg-surface px-3 py-2 text-sm text-gray-200 placeholder-gray-600 outline-none focus:border-accent/50'
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
-      <div className="w-full max-w-md rounded-2xl border border-surface-border bg-surface-raised p-6 shadow-2xl animate-slide-up">
-        <div className="flex items-center justify-between mb-5">
-          <h2 className="text-sm font-semibold text-gray-200">New scheduled task</h2>
-          <button onClick={onClose} className="text-gray-600 hover:text-gray-300"><X size={16} /></button>
-        </div>
-
-        <div className="space-y-3">
-          <div>
-            <label className="mb-1 block text-xs text-gray-500">Name</label>
-            <input value={form.name} onChange={field('name')} placeholder="my-task" className={inputCls} />
-          </div>
-          <div>
-            <label className="mb-1 block text-xs text-gray-500">Cron expression</label>
-            <input value={form.cron_expr} onChange={field('cron_expr')} placeholder="0 9 * * *" className={`${inputCls} font-mono`} />
-            <p className="mt-1 text-[10px] text-gray-600">minute hour day month weekday</p>
-            {nextRuns.length > 0 && (
-              <div className="mt-1.5 space-y-0.5">
-                {nextRuns.map((d, i) => (
-                  <div key={i} className="flex items-center gap-1.5 text-[10px] text-emerald-500/70">
-                    <span className="text-gray-600">{i === 0 ? 'Next:' : '     '}</span>
-                    <span>{d.toLocaleString()}</span>
-                  </div>
-                ))}
-              </div>
-            )}
-            {nextRuns.length === 0 && form.cron_expr.trim() !== '' && (
-              <p className="mt-1 text-[10px] text-red-400/70">No fires found — check expression</p>
-            )}
-          </div>
-          <div>
-            <label className="mb-1 block text-xs text-gray-500">Skill</label>
-            <div className="relative">
-              <select
-                value={form.skill}
-                onChange={field('skill')}
-                className={`${inputCls} appearance-none pr-8 cursor-pointer`}
-              >
-                <option value="">Choose a skill…</option>
-                {skills.map((s) => (
-                  <option key={s.name} value={s.name}>{s.name}</option>
-                ))}
-              </select>
-              <ChevronDown size={14} className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-gray-600" />
-            </div>
-          </div>
-          <div>
-            <label className="mb-1 block text-xs text-gray-500">Args (JSON)</label>
-            <textarea
-              rows={3}
-              value={argsRaw}
-              onChange={(e) => setArgsRaw(e.target.value)}
-              className={`${inputCls} font-mono text-xs resize-none`}
-            />
-          </div>
-        </div>
-
-        <div className="mt-5 flex justify-end gap-2">
-          <button onClick={onClose} className="rounded-xl px-4 py-2 text-sm text-gray-500 hover:text-gray-300 transition-colors">
-            Cancel
-          </button>
-          <button
-            onClick={() => mut.mutate()}
-            disabled={!form.name || !form.cron_expr || !form.skill || mut.isPending}
-            className="flex items-center gap-2 rounded-xl bg-accent px-4 py-2 text-sm font-semibold text-white hover:bg-accent-hover disabled:opacity-40 transition-colors"
-          >
-            {mut.isPending && <Loader2 size={13} className="animate-spin" />}
-            Create
-          </button>
-        </div>
-      </div>
-    </div>
-  )
+function isAgentTask(t: SchedulerTask): boolean {
+  return !!t.prompt || t.skill === 'agent'
 }
 
 function TaskRow({ task }: { task: SchedulerTask }) {
   const qc = useQueryClient()
+  const [showHistory, setShowHistory] = useState(false)
+  const agent = isAgentTask(task)
 
   const toggleMut = useMutation({
     mutationFn: () => (task.enabled ? disableTask(task.id) : enableTask(task.id)),
@@ -197,18 +43,75 @@ function TaskRow({ task }: { task: SchedulerTask }) {
     onError: (e: Error) => toast.error(e.message),
   })
 
+  const runMut = useMutation({
+    mutationFn: () => runTask(task.id),
+    onSuccess: (run) => {
+      const line = resultPreview(run.result)
+      if (run.ok) toast.success(`${task.name}: run succeeded`, { description: line })
+      else toast.error(`${task.name}: run failed`, { description: line })
+    },
+    onError: (e: Error) => toast.error(e.message),
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: ['tasks'] })
+      qc.invalidateQueries({ queryKey: ['task-runs', task.id] })
+    },
+  })
+
   return (
     <div className="rounded-2xl border border-surface-border bg-surface-overlay p-4 animate-fade-in">
       <div className="flex items-start justify-between gap-3 mb-3">
-        <div>
+        <div className="min-w-0">
           <div className="font-medium text-sm text-gray-200">{task.name}</div>
-          <div className="flex items-center gap-3 mt-1">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mt-1">
             <code className="rounded bg-surface px-2 py-0.5 font-mono text-[11px] text-indigo-300">{task.cron_expr}</code>
-            <code className="font-mono text-[11px] text-gray-500">{task.skill}</code>
+            {task.timezone && (
+              <span className="flex items-center gap-1 text-[11px] text-gray-500" title="Cron timezone">
+                <Globe size={10} /> {task.timezone}
+              </span>
+            )}
+            {agent
+              ? <span className="flex items-center gap-1 rounded bg-accent/15 px-1.5 py-0.5 text-[10px] font-medium text-accent"><Bot size={10} /> agent</span>
+              : <code className="font-mono text-[11px] text-gray-500">{task.skill}</code>}
             <StatusBadge enabled={task.enabled} />
+            {task.one_shot && <span className="text-[10px] text-gray-500">one-shot</span>}
+            {task.max_retries > 0 && (
+              <span className="flex items-center gap-1 text-[10px] text-gray-500" title="Retries on failure">
+                <RotateCcw size={9} /> {task.max_retries}× / {task.retry_delay_sec}s
+              </span>
+            )}
+            {task.notify_telegram_chat_id != null && (
+              <span className="flex items-center gap-1 text-[10px] text-gray-500" title="Telegram chat notified">
+                <Send size={9} /> {task.notify_telegram_chat_id}
+              </span>
+            )}
           </div>
+          {agent && task.prompt && (
+            <p className="mt-1.5 line-clamp-2 text-[11px] italic text-gray-500" title={task.prompt}>“{task.prompt}”</p>
+          )}
+          {task.next_retry_at != null && (
+            <p className="mt-1.5 flex items-center gap-1 text-[11px] text-amber-400">
+              <RotateCcw size={10} /> retry {task.retry_attempt} pending at {fmtTs(task.next_retry_at)}
+            </p>
+          )}
+          {task.enabled && isValidTimezone(task.timezone) && <CronPreview expr={task.cron_expr} tz={task.timezone} count={1} />}
         </div>
-        <div className="flex items-center gap-1.5">
+        <div className="flex shrink-0 items-center gap-1.5">
+          <button
+            onClick={() => runMut.mutate()}
+            disabled={runMut.isPending}
+            title="Run now"
+            className="flex h-7 items-center gap-1 rounded-lg px-2 text-[11px] text-gray-500 hover:bg-surface-border hover:text-gray-300 transition-colors disabled:opacity-60"
+          >
+            {runMut.isPending ? <Loader2 size={12} className="animate-spin" /> : <Zap size={12} />}
+            {runMut.isPending ? 'Running…' : 'Run now'}
+          </button>
+          <button
+            onClick={() => setShowHistory((s) => !s)}
+            title="Run history"
+            className={`flex h-7 w-7 items-center justify-center rounded-lg transition-colors ${showHistory ? 'bg-accent/20 text-accent' : 'text-gray-500 hover:bg-surface-border hover:text-gray-300'}`}
+          >
+            <History size={13} />
+          </button>
           <button
             onClick={() => toggleMut.mutate()}
             disabled={toggleMut.isPending}
@@ -227,7 +130,6 @@ function TaskRow({ task }: { task: SchedulerTask }) {
           </button>
         </div>
       </div>
-
       <div className="grid grid-cols-3 gap-3 text-[11px] text-gray-600">
         <div>
           <div className="text-[10px] uppercase tracking-widest mb-0.5">Last run</div>
@@ -248,6 +150,8 @@ function TaskRow({ task }: { task: SchedulerTask }) {
           {task.last_result}
         </div>
       )}
+
+      {showHistory && <TaskRunHistory taskId={task.id} />}
     </div>
   )
 }
@@ -299,7 +203,7 @@ export default function Scheduler() {
             </div>
             <p className="text-sm text-gray-500">No scheduled tasks</p>
             <p className="text-xs text-gray-700 max-w-xs">
-              Create tasks to run skills on a cron schedule. Results can be sent to Telegram.
+              Create tasks to run skills or agent prompts on a cron schedule. Results can be sent to Telegram.
             </p>
             <button
               onClick={() => setShowCreate(true)}
@@ -311,7 +215,7 @@ export default function Scheduler() {
         )}
       </div>
 
-      {showCreate && <CreateModal onClose={() => setShowCreate(false)} />}
+      {showCreate && <TaskCreateModal onClose={() => setShowCreate(false)} />}
     </div>
   )
 }

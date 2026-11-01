@@ -59,10 +59,10 @@ func TestCleanHTML(t *testing.T) {
 		{"nbsp entity", "a&nbsp;b", "a b"},
 		{"strips tags", "<p>Hello <b>world</b></p>", "Hello world"},
 		{"tags and entities", `<a href="x">Go &amp; <b>Rust</b></a>`, "Go & Rust"},
-		// NOTE: entities are unescaped in fixed order with &amp; first, so an
-		// author-escaped literal like "&amp;lt;" (intended to display "&lt;")
-		// is over-unescaped to "<". cleanHTML is lossy for pre-escaped text.
-		{"double unescape quirk", "&amp;lt;", "<"},
+		// Entities are decoded exactly once: an author-escaped "&amp;lt;"
+		// displays as "&lt;", not "<".
+		{"decodes once", "&amp;lt;", "&lt;"},
+		{"hex apostrophe", "it&#x27;s", "it's"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -319,5 +319,26 @@ func TestAsInt(t *testing.T) {
 				t.Errorf("asInt(%v) = %d, want %d", tt.in, got, tt.want)
 			}
 		})
+	}
+}
+
+// Snippets were paired with titles by match index, so a result without a
+// snippet shifted every later snippet onto the wrong result.
+func TestParseResultsPairsSnippetsByPosition(t *testing.T) {
+	page := `
+<a class="result__a" href="/l/?uddg=https%3A%2F%2Fone.example">One</a>
+<a class="result__a" href="/l/?uddg=https%3A%2F%2Ftwo.example">Two</a>
+<a class="result__snippet" href="x">snippet for two</a>
+<a class="result__a" href="/l/?uddg=https%3A%2F%2Fthree.example">Three</a>
+<a class="result__snippet" href="x">snippet for three</a>`
+	got := parseResults(page, 10)
+	if len(got) != 3 {
+		t.Fatalf("got %d results", len(got))
+	}
+	want := []string{"", "snippet for two", "snippet for three"}
+	for i, r := range got {
+		if r.Snippet != want[i] {
+			t.Errorf("%s: snippet %q, want %q", r.Title, r.Snippet, want[i])
+		}
 	}
 }

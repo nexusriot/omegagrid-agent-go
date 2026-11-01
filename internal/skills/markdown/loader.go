@@ -3,6 +3,7 @@
 package markdown
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -21,7 +22,8 @@ import (
 )
 
 // SkillExecutor lets pipeline steps invoke other registered skills by name.
-type SkillExecutor func(name string, args map[string]any) (any, error)
+// ctx is the pipeline's own, so cancelling a run stops its nested steps.
+type SkillExecutor func(ctx context.Context, name string, args map[string]any) (any, error)
 
 // Param describes a single skill parameter.
 type Param struct {
@@ -48,6 +50,17 @@ type Skill struct {
 	steps    []step
 }
 
+// Steps returns the names of the skills this pipeline's steps call.
+func (s *Skill) Steps() []string {
+	var out []string
+	for _, st := range s.steps {
+		if st.Skill != "" {
+			out = append(out, st.Skill)
+		}
+	}
+	return out
+}
+
 type step struct {
 	Name     string         `yaml:"name"`
 	Skill    string         `yaml:"skill"`
@@ -65,6 +78,12 @@ type step struct {
 // panic, so nothing could recover it and the whole process died.
 const MaxPipelineDepth = 5
 
+// MaxPipelineSteps caps the steps of one pipeline file.
+const MaxPipelineSteps = 20
+
+// maxTimeoutSec caps a skill's per-request timeout.
+const maxTimeoutSec = 300
+
 // maxBodyBytes caps how much of an endpoint response is read into memory.
 const maxBodyBytes = 2 << 20
 
@@ -74,23 +93,26 @@ const maxTextBody = 4000
 // Execute runs the skill as a top-level call; executor is used for pipeline
 // skill-steps.
 func (s *Skill) Execute(args map[string]any, executor SkillExecutor) (any, error) {
-	return s.ExecuteAt(args, executor, 0)
+	return s.ExecuteAt(context.Background(), args, executor, 0)
 }
 
 // ExecuteAt runs the skill at the given pipeline nesting depth (0 for a
 // top-level call). The caller supplies an executor that runs nested skills at
 // depth+1; a pipeline at MaxPipelineDepth or deeper refuses to run.
-func (s *Skill) ExecuteAt(args map[string]any, executor SkillExecutor, depth int) (any, error) {
+func (s *Skill) ExecuteAt(ctx context.Context, args map[string]any, executor SkillExecutor, depth int) (any, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if len(s.steps) > 0 {
 		if depth >= MaxPipelineDepth {
 			return map[string]any{"error": fmt.Sprintf(
 				"pipeline %q exceeds the maximum nesting depth of %d (recursive pipeline?)",
 				s.Schema.Name, MaxPipelineDepth)}, nil
 		}
-		return s.execPipeline(args, executor)
+		return s.execPipeline(ctx, args, executor)
 	}
 	if s.endpoint != "" {
-		return s.execSingle(args)
+		return s.execSingle(ctx, args)
 	}
 	// prompt-only
 	return map[string]any{
@@ -104,13 +126,13 @@ func (s *Skill) ExecuteAt(args map[string]any, executor SkillExecutor, depth int
 	}, nil
 }
 
-func (s *Skill) execSingle(args map[string]any) (any, error) {
+func (s *Skill) execSingle(ctx context.Context, args map[string]any) (any, error) {
 	cl := netguard.Client(time.Duration(s.timeout * float64(time.Second)))
 	var query map[string]any
 	if strings.ToUpper(s.method) != "POST" {
 		query = args
 	}
-	resp, err := doRequest(cl, s.method, s.endpoint, nil, query, args)
+	resp, err := doRequest(ctx, cl, s.method, s.endpoint, nil, query, args)
 	if err != nil {
 		return map[string]any{"error": err.Error()}, nil
 	}
@@ -164,7 +186,7 @@ func trimPartialRune(b []byte) []byte {
 // alongside the error for a URL it cannot parse, and skill endpoints come from
 // markdown files whose {{placeholders}} may resolve to anything (or stay
 // unresolved). The old `req, _ :=` sites panicked on those.
-func doRequest(cl *http.Client, method, endpoint string, headers map[string]any, query, body map[string]any) (*http.Response, error) {
+func doRequest(ctx context.Context, cl *http.Client, method, endpoint string, headers map[string]any, query, body map[string]any) (*http.Response, error) {
 	hdrs := http.Header{"User-Agent": {"OmegaGridAgent/1.0"}}
 	for k, v := range headers {
 		hdrs.Set(k, fmt.Sprintf("%v", v))
@@ -185,7 +207,7 @@ func doRequest(cl *http.Client, method, endpoint string, headers map[string]any,
 	if post {
 		verb = http.MethodPost
 	}
-	req, err := http.NewRequest(verb, endpoint, reader)
+	req, err := http.NewRequestWithContext(ctx, verb, endpoint, reader)
 	if err != nil {
 		return nil, err
 	}
@@ -200,8 +222,8 @@ func doRequest(cl *http.Client, method, endpoint string, headers map[string]any,
 	return cl.Do(req)
 }
 
-func (s *Skill) execPipeline(kwargs map[string]any, executor SkillExecutor) (any, error) {
-	ctx := map[string]any{}
+func (s *Skill) execPipeline(ctx context.Context, kwargs map[string]any, executor SkillExecutor) (any, error) {
+	stepCtx := map[string]any{}
 	var results []any
 	cl := netguard.Client(time.Duration(s.timeout * float64(time.Second)))
 
@@ -216,14 +238,14 @@ func (s *Skill) execPipeline(kwargs map[string]any, executor SkillExecutor) (any
 			if executor == nil {
 				parsed = map[string]any{"error": "no skill executor available"}
 			} else {
-				resolvedArgs := resolveObj(st.Args, kwargs, ctx).(map[string]any)
+				resolvedArgs := resolveObj(st.Args, kwargs, stepCtx).(map[string]any)
 				var execErr error
-				parsed, execErr = executor(st.Skill, resolvedArgs)
+				parsed, execErr = executor(ctx, st.Skill, resolvedArgs)
 				if execErr != nil {
 					parsed = map[string]any{"error": execErr.Error(), "skill": st.Skill}
 				}
 			}
-			ctx[name] = parsed
+			stepCtx[name] = parsed
 			results = append(results, map[string]any{"step": name, "kind": "skill", "skill": st.Skill, "body": parsed})
 			continue
 		}
@@ -231,13 +253,13 @@ func (s *Skill) execPipeline(kwargs map[string]any, executor SkillExecutor) (any
 		// Escaped: a value substituted into the URL must stay data. Raw, an
 		// argument such as "@evil.example/" or "x/../../admin?" rewrote the
 		// host, path or query the skill author wrote.
-		endpoint := resolveStrEscaped(st.Endpoint, kwargs, ctx, escapeURLValue)
+		endpoint := resolveStrEscaped(st.Endpoint, kwargs, stepCtx, escapeURLValue)
 		method := strings.ToUpper(st.Method)
 		if method == "" {
 			method = "GET"
 		}
-		resolvedParams := resolveObj(st.Params, kwargs, ctx).(map[string]any)
-		resolvedBody := resolveObj(st.Body, kwargs, ctx).(map[string]any)
+		resolvedParams := resolveObj(st.Params, kwargs, stepCtx).(map[string]any)
+		resolvedBody := resolveObj(st.Body, kwargs, stepCtx).(map[string]any)
 		// GET steps also inherit the skill's own kwargs as query parameters;
 		// explicit step params win on conflict.
 		query := resolvedParams
@@ -253,7 +275,10 @@ func (s *Skill) execPipeline(kwargs map[string]any, executor SkillExecutor) (any
 
 		var parsed any
 		var statusCode int
-		resp, err := doRequest(cl, method, endpoint, st.Headers, query, resolvedBody)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		resp, err := doRequest(ctx, cl, method, endpoint, st.Headers, query, resolvedBody)
 		if err != nil {
 			parsed = map[string]any{"error": err.Error()}
 		} else {
@@ -261,7 +286,7 @@ func (s *Skill) execPipeline(kwargs map[string]any, executor SkillExecutor) (any
 			parsed, _ = readBody(resp.Body)
 			resp.Body.Close()
 		}
-		ctx[name] = parsed
+		stepCtx[name] = parsed
 		results = append(results, map[string]any{"step": name, "kind": "http", "status": statusCode, "body": parsed})
 	}
 	return map[string]any{
@@ -421,7 +446,13 @@ func Load(path string) (*Skill, error) {
 	if err != nil {
 		return nil, err
 	}
-	fm, body, err := parseFrontmatter(string(raw))
+	return Parse(string(raw), filepath.Base(path))
+}
+
+// Parse builds a skill from a file's content; source names it in the
+// default description.
+func Parse(content, source string) (*Skill, error) {
+	fm, body, err := parseFrontmatter(content)
 	if err != nil {
 		return nil, fmt.Errorf("parse frontmatter: %w", err)
 	}
@@ -429,7 +460,7 @@ func Load(path string) (*Skill, error) {
 		return nil, fmt.Errorf("missing name field")
 	}
 	if fm.Description == "" {
-		fm.Description = fmt.Sprintf("Skill from %s", filepath.Base(path))
+		fm.Description = fmt.Sprintf("Skill from %s", source)
 	}
 	method := strings.ToUpper(fm.Method)
 	if method == "" {
@@ -438,6 +469,14 @@ func Load(path string) (*Skill, error) {
 	timeout := fm.Timeout
 	if timeout <= 0 {
 		timeout = 30
+	}
+	// Bound a single request: the value is author- (or model-) supplied, and
+	// skill_creator once let an injected "timeout: 100000" (~28 h) through.
+	if timeout > maxTimeoutSec {
+		timeout = maxTimeoutSec
+	}
+	if len(fm.Steps) > MaxPipelineSteps {
+		return nil, fmt.Errorf("pipeline has %d steps, the limit is %d", len(fm.Steps), MaxPipelineSteps)
 	}
 	schema := fmToSkillSchema(fm)
 	// Surface the instructions block in the schema so the agent's system

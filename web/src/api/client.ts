@@ -3,30 +3,59 @@ import type {
   CreateTaskRequest, MemoryHit, MemoryAddResult,
   HealthStatus, QueryResult, QueryRequest,
   InvocationListResult, InvocationFilter, ReplayResult,
+  MemoryNamespace, MemoryUpdateRequest, ImportReport,
+  TaskRun, UsageStats, SkillValidateResult, SkillSaveResult,
 } from './types'
 import { authHeaders, promptForToken } from './auth'
 
 const BASE = import.meta.env.VITE_API_BASE ?? ''
 
-async function json<T>(path: string, init?: RequestInit, retried = false): Promise<T> {
+// Error bodies are {"error": "..."}; surface that text rather than raw JSON.
+function errorText(body: string, fallback: string): string {
+  try {
+    const parsed = JSON.parse(body) as { error?: unknown }
+    if (typeof parsed?.error === 'string' && parsed.error) return parsed.error
+  } catch { /* not JSON */ }
+  return body || fallback
+}
+
+/** Authenticated fetch: retries once after a token prompt, throws on non-2xx. */
+async function request(path: string, init?: RequestInit, retried = false): Promise<Response> {
   const res = await fetch(`${BASE}${path}`, {
     ...init,
     headers: { 'Content-Type': 'application/json', ...authHeaders(), ...init?.headers },
   })
   if (res.status === 401 && !retried && promptForToken()) {
-    return json<T>(path, init, true)
+    return request(path, init, true)
   }
   if (!res.ok) {
-    const msg = await res.text().catch(() => res.statusText)
-    throw new Error(`${res.status}: ${msg}`)
+    const body = await res.text().catch(() => '')
+    throw new Error(`${res.status}: ${errorText(body, res.statusText)}`)
   }
+  return res
+}
+
+async function json<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await request(path, init)
   return res.json() as Promise<T>
 }
 
 export const fetchHealth = () => json<HealthStatus>('/health')
 
-export const fetchSessions = (limit = 50) =>
-  json<{ sessions: Session[] }>(`/api/sessions?limit=${limit}`).then(r => r.sessions)
+export const fetchSessions = (limit = 50, q = '') => {
+  const p = new URLSearchParams({ limit: String(limit) })
+  if (q) p.set('q', q)
+  return json<{ sessions: Session[] | null }>(`/api/sessions?${p}`).then(r => r.sessions ?? [])
+}
+
+export const renameSession = (id: number, title: string) =>
+  json<{ ok: boolean; session_id: number; title: string }>(`/api/sessions/${id}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ title }),
+  })
+
+export const deleteSession = (id: number) =>
+  json<{ ok: boolean }>(`/api/sessions/${id}`, { method: 'DELETE' })
 
 export const createSession = () =>
   json<{ session_id: number }>('/api/sessions/new', { method: 'POST' }).then(r => r.session_id)
@@ -37,22 +66,50 @@ export const fetchMessages = (sessionId: number, limit = 200) =>
 export const query = (req: QueryRequest) =>
   json<QueryResult>('/api/query', { method: 'POST', body: JSON.stringify(req) })
 
-export const searchMemory = (q: string, k = 10) =>
+/** namespaces: undefined = search everything; otherwise only those ('' = shared). */
+export const searchMemory = (q: string, k = 10, namespaces?: string[]) =>
   json<{ hits: MemoryHit[] | null }>('/api/memory/search', {
     method: 'POST',
-    body: JSON.stringify({ query: q, k }),
+    body: JSON.stringify({ query: q, k, ...(namespaces ? { namespaces } : {}) }),
   }).then(r => r.hits ?? [])
 
-export const addMemory = (text: string, meta: Record<string, unknown> = {}) =>
+export interface AddMemoryOptions {
+  namespace?: string
+  ttl_seconds?: number
+}
+
+export const addMemory = (text: string, meta: Record<string, unknown> = {}, opts: AddMemoryOptions = {}) =>
   json<MemoryAddResult>('/api/memory/add', {
     method: 'POST',
-    body: JSON.stringify({ text, meta }),
+    body: JSON.stringify({ text, meta, ...opts }),
   })
 
-export const listMemories = (limit = 100, offset = 0) =>
-  json<{ hits: MemoryHit[] | null; total: number }>(
-    `/api/memory?limit=${limit}&offset=${offset}`,
-  ).then(r => ({ hits: r.hits ?? [], total: r.total }))
+/** namespace: undefined = all namespaces, '' = the shared default namespace. */
+export const listMemories = (limit = 100, offset = 0, namespace?: string) => {
+  const p = new URLSearchParams({ limit: String(limit), offset: String(offset) })
+  if (namespace !== undefined) p.set('namespace', namespace)
+  return json<{ hits: MemoryHit[] | null; total: number }>(`/api/memory?${p}`)
+    .then(r => ({ hits: r.hits ?? [], total: r.total }))
+}
+
+export const fetchMemoryNamespaces = () =>
+  json<{ namespaces: MemoryNamespace[] | null }>('/api/memory/namespaces').then(r => r.namespaces ?? [])
+
+export const updateMemory = (id: string, req: MemoryUpdateRequest) =>
+  json<{ ok: boolean; hit: MemoryHit }>(`/api/memory/${encodeURIComponent(id)}`, {
+    method: 'PUT',
+    body: JSON.stringify(req),
+  })
+
+export const exportMemories = (withEmbeddings = false) =>
+  request(`/api/memory/export${withEmbeddings ? '?embeddings=1' : ''}`).then(r => r.blob())
+
+export const importMemories = (file: Blob) =>
+  json<{ ok: boolean; report: ImportReport }>('/api/memory/import', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-ndjson' },
+    body: file,
+  }).then(r => r.report)
 
 export const deleteMemory = (id: string) =>
   json<{ ok: boolean; deleted: string }>(`/api/memory/${encodeURIComponent(id)}`, {
@@ -61,6 +118,26 @@ export const deleteMemory = (id: string) =>
 
 export const fetchSkills = () =>
   json<{ skills: Skill[] }>('/api/skills').then(r => r.skills)
+
+export const fetchSkillSource = (name: string) =>
+  json<{ name: string; content: string }>(`/api/skills/${encodeURIComponent(name)}/source`)
+    .then(r => r.content)
+
+export const validateSkillSource = (content: string, signal?: AbortSignal) =>
+  json<SkillValidateResult>('/api/skills/validate', {
+    method: 'POST',
+    body: JSON.stringify({ content }),
+    signal,
+  })
+
+export const saveSkillSource = (content: string) =>
+  json<SkillSaveResult>('/api/skills/source', {
+    method: 'POST',
+    body: JSON.stringify({ content }),
+  })
+
+export const deleteSkill = (name: string) =>
+  json<{ ok: boolean }>(`/api/skills/${encodeURIComponent(name)}`, { method: 'DELETE' })
 
 export const fetchTasks = () =>
   json<SchedulerTask[]>('/api/scheduler/tasks').then(r => r ?? [])
@@ -79,6 +156,15 @@ export const enableTask = (id: number) =>
 
 export const disableTask = (id: number) =>
   json<{ ok: boolean }>(`/api/scheduler/tasks/${id}/disable`, { method: 'POST' })
+
+export const runTask = (id: number) =>
+  json<TaskRun>(`/api/scheduler/tasks/${id}/run`, { method: 'POST' })
+
+export const fetchTaskRuns = (id: number, limit = 50) =>
+  json<TaskRun[] | null>(`/api/scheduler/tasks/${id}/runs?limit=${limit}`).then(r => r ?? [])
+
+export const fetchUsage = (days: number) =>
+  json<UsageStats>(`/api/stats/usage?days=${days}`)
 
 export const fetchInvocations = (f: InvocationFilter = {}) => {
   const p = new URLSearchParams()

@@ -4,13 +4,15 @@
 package skills
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
-	"strconv"
+	"slices"
 	"strings"
+
+	"gopkg.in/yaml.v3"
 
 	"github.com/nexusriot/omegagrid-agent-go/internal/config"
 	"github.com/nexusriot/omegagrid-agent-go/internal/skills/builtin"
@@ -31,6 +33,9 @@ type Skill struct {
 	Description string           `json:"description"`
 	Parameters  map[string]Param `json:"parameters"`
 	Body        string           `json:"body,omitempty"`
+	// Kind is "builtin", "markdown" (editable, from SKILLS_DIR) or "remote"
+	// (an MCP tool), filled in by List.
+	Kind string `json:"kind,omitempty"`
 }
 
 // Client is the in-process skill manager.  Callers use the same List() and
@@ -51,7 +56,7 @@ func New(cfg config.Config) (*Client, error) {
 
 	registerBuiltins(reg, cfg)
 
-	reg.registerReserved(skillCreatorSchema(), skillCreatorFunc(cfg.SkillsDir, reg))
+	reg.registerReserved(skillCreatorSchema(), builtin.Lift(skillCreatorFunc(cfg.SkillsDir, reg)))
 
 	if err := c.loadMarkdownSkills(); err != nil {
 		return nil, fmt.Errorf("load markdown skills: %w", err)
@@ -89,16 +94,34 @@ func mdToSkill(ms markdown.SkillSchema) Skill {
 // hot-registered skills (skill_creator) are immediately visible.
 func (c *Client) List() ([]Skill, error) { return c.reg.list(), nil }
 
-// Execute runs a skill by name.
+// Execute runs a skill by name with no cancellation.
 func (c *Client) Execute(name string, args map[string]any) (any, error) {
-	return c.reg.execute(name, args)
+	return c.reg.execute(context.Background(), name, args)
 }
 
-// Register adds (or replaces) a skill in the registry at runtime. Used to
-// register tools discovered from remote MCP servers so they become callable
-// like any built-in skill.
-func (c *Client) Register(name, description string, params map[string]Param, exec func(map[string]any) (any, error)) {
-	c.reg.register(Skill{Name: name, Description: description, Parameters: params}, exec)
+// ExecuteContext runs a skill by name; cancelling ctx stops a skill that is
+// waiting on the network or a process (and every nested pipeline step).
+func (c *Client) ExecuteContext(ctx context.Context, name string, args map[string]any) (any, error) {
+	return c.reg.execute(ctx, name, args)
+}
+
+// Register adds a skill to the registry at runtime. Used to register tools
+// discovered from remote MCP servers so they become callable like any
+// built-in skill. A name that is already taken is refused: the remote server
+// picks the tool half of "<server>_<tool>", so a server named "http" offering
+// "request" used to replace the built-in http_request — and with it the
+// private-network and enable gates the built-in enforces.
+func (c *Client) Register(name, description string, params map[string]Param, exec builtin.ContextExecutor) error {
+	if !c.reg.registerNew(Skill{Name: name, Description: description, Parameters: params}, exec) {
+		return fmt.Errorf("skill name %q is already taken", name)
+	}
+	return nil
+}
+
+// Unregister removes a skill added with Register. Built-ins and markdown
+// skills are refused (false): only runtime registrations may be withdrawn.
+func (c *Client) Unregister(name string) bool {
+	return c.reg.unregisterRuntime(name)
 }
 
 // toSkill converts a builtin.Skill to the public skills.Skill type. Body stays
@@ -116,43 +139,90 @@ func registerBuiltins(reg *Registry, cfg config.Config) {
 	// Every built-in name is reserved against markdown skills.
 	register := reg.registerReserved
 
-	register(toSkill(builtin.WeatherSchema()), builtin.Weather(t))
-	register(toSkill(builtin.HttpRequestSchema()), builtin.HttpRequest(t))
-	register(toSkill(builtin.WebScrapeSchema()), builtin.WebScrape(t))
-	register(toSkill(builtin.HttpHealthSchema()), builtin.HttpHealth())
-	register(toSkill(builtin.IpInfoSchema()), builtin.IpInfo(t))
+	register(toSkill(builtin.WeatherSchema()), builtin.WeatherContext(t))
+	register(toSkill(builtin.HttpRequestSchema()), builtin.HttpRequestContext(t))
+	register(toSkill(builtin.WebScrapeSchema()), builtin.WebScrapeContext(t))
+	register(toSkill(builtin.HttpHealthSchema()), builtin.HttpHealthContext())
+	register(toSkill(builtin.IpInfoSchema()), builtin.IpInfoContext(t))
 
-	register(toSkill(builtin.DnsLookupSchema()), builtin.DnsLookup())
-	register(toSkill(builtin.PingCheckSchema()), builtin.PingCheck())
-	register(toSkill(builtin.PortScanSchema()), builtin.PortScan())
-	register(toSkill(builtin.WhoisLookupSchema()), builtin.WhoisLookup())
-	register(toSkill(builtin.TlsProbeSchema()), builtin.TlsProbe())
-	register(toSkill(builtin.HttpHeadersSchema()), builtin.HttpHeaders())
-	register(toSkill(builtin.BannerGrabSchema()), builtin.BannerGrab())
-	register(toSkill(builtin.PtrLookupSchema()), builtin.PtrLookup())
-	register(toSkill(builtin.EmailAuthSchema()), builtin.EmailAuth())
+	register(toSkill(builtin.DnsLookupSchema()), builtin.DnsLookupContext())
+	register(toSkill(builtin.PingCheckSchema()), builtin.PingCheckContext())
+	register(toSkill(builtin.PortScanSchema()), builtin.PortScanContext())
+	register(toSkill(builtin.WhoisLookupSchema()), builtin.WhoisLookupContext())
+	register(toSkill(builtin.TlsProbeSchema()), builtin.TlsProbeContext())
+	register(toSkill(builtin.HttpHeadersSchema()), builtin.HttpHeadersContext())
+	register(toSkill(builtin.BannerGrabSchema()), builtin.BannerGrabContext())
+	register(toSkill(builtin.PtrLookupSchema()), builtin.PtrLookupContext())
+	register(toSkill(builtin.EmailAuthSchema()), builtin.EmailAuthContext())
 
-	register(toSkill(builtin.Base64Schema()), builtin.Base64())
-	register(toSkill(builtin.HashSchema()), builtin.Hash())
-	register(toSkill(builtin.UuidGenSchema()), builtin.UuidGen())
-	register(toSkill(builtin.PasswordGenSchema()), builtin.PasswordGen())
-	register(toSkill(builtin.CidrCalcSchema()), builtin.CidrCalc())
-	register(toSkill(builtin.JwtInspectSchema()), builtin.JwtInspect())
+	register(toSkill(builtin.Base64Schema()), builtin.Lift(builtin.Base64()))
+	register(toSkill(builtin.HashSchema()), builtin.Lift(builtin.Hash()))
+	register(toSkill(builtin.UuidGenSchema()), builtin.Lift(builtin.UuidGen()))
+	register(toSkill(builtin.PasswordGenSchema()), builtin.Lift(builtin.PasswordGen()))
+	register(toSkill(builtin.CidrCalcSchema()), builtin.Lift(builtin.CidrCalc()))
+	register(toSkill(builtin.JwtInspectSchema()), builtin.Lift(builtin.JwtInspect()))
 
-	register(toSkill(builtin.DateTimeSchema()), builtin.DateTime())
-	register(toSkill(builtin.MathEvalSchema()), builtin.MathEval())
-	register(toSkill(builtin.CronScheduleSchema()), builtin.CronSchedule())
-	register(toSkill(builtin.ReminderSchema()), builtin.Reminder())
+	register(toSkill(builtin.DateTimeSchema()), builtin.Lift(builtin.DateTime()))
+	register(toSkill(builtin.MathEvalSchema()), builtin.Lift(builtin.MathEval()))
+	register(toSkill(builtin.CronScheduleSchema()), builtin.Lift(builtin.CronSchedule()))
+	register(toSkill(builtin.ReminderSchema()), builtin.Lift(builtin.Reminder()))
 
-	register(toSkill(builtin.ShellCommandSchema()), builtin.ShellCommand(cfg.SkillShellEnabled))
-	register(toSkill(builtin.SshCommandSchema()), builtin.SshCommand(builtin.SSHConfig{
-		Enabled:     cfg.SkillSSHEnabled,
-		PrivKey:     cfg.SkillSSHPrivKey,
-		DefaultUser: cfg.SkillSSHDefaultUser,
-		IdentFile:   cfg.SkillSSHIdentFile,
+	register(toSkill(builtin.ShellCommandSchema()), builtin.ShellCommandWith(builtin.ShellConfig{
+		Enabled:         cfg.SkillShellEnabled,
+		Sandbox:         cfg.SkillShellSandbox,
+		SandboxNetwork:  cfg.SkillShellSandboxNetwork,
+		SandboxWritable: cfg.SkillShellSandboxWritable,
+	}))
+	register(toSkill(builtin.SshCommandSchema()), builtin.SshCommandContext(builtin.SSHConfig{
+		Enabled:       cfg.SkillSSHEnabled,
+		PrivKey:       cfg.SkillSSHPrivKey,
+		DefaultUser:   cfg.SkillSSHDefaultUser,
+		IdentFile:     cfg.SkillSSHIdentFile,
+		KnownHosts:    cfg.SkillSSHKnownHosts,
+		HostKeyPolicy: cfg.SkillSSHHostKeyPolicy,
 	}))
 
-	register(toSkill(builtin.QrGenerateSchema()), builtin.QrGenerate())
+	register(toSkill(builtin.QrGenerateSchema()), builtin.Lift(builtin.QrGenerate()))
+
+	register(toSkill(builtin.RssFetchSchema()), builtin.RssFetchContext(t))
+	register(toSkill(builtin.NotifySchema()), builtin.NotifyContext(builtin.NotifyConfig{
+		TelegramToken:       cfg.TelegramBotToken,
+		TelegramChats:       cfg.NotifyTelegramChats,
+		TelegramDefaultChat: cfg.NotifyTelegramDefaultChat,
+		EmailTo:             cfg.NotifyEmailTo,
+		SMTPHost:            cfg.NotifySMTPHost,
+		SMTPPort:            cfg.NotifySMTPPort,
+		SMTPUser:            cfg.NotifySMTPUser,
+		SMTPPassword:        cfg.NotifySMTPPassword,
+		SMTPFrom:            cfg.NotifySMTPFrom,
+		Webhooks:            builtin.ParseWebhooks(cfg.NotifyWebhooks),
+	}))
+
+	register(toSkill(builtin.HttpTimingSchema()), builtin.HttpTimingContext())
+	register(toSkill(builtin.DnsCompareSchema()), builtin.DnsCompareContext())
+	register(toSkill(builtin.RdapLookupSchema()), builtin.RdapLookupContext(t))
+	register(toSkill(builtin.TracerouteSchema()), builtin.TracerouteContext())
+	register(toSkill(builtin.SmtpCheckSchema()), builtin.SmtpCheckContext())
+	register(toSkill(builtin.WakeOnLanSchema()), builtin.WakeOnLanContext())
+	register(toSkill(builtin.SubnetSweepSchema()), builtin.SubnetSweepContext())
+
+	ws := builtin.WorkspaceConfig{Dir: cfg.SkillWorkspaceDir, MaxBytes: int64(cfg.SkillWorkspaceMaxMB * (1 << 20))}
+	register(toSkill(builtin.JsonQuerySchema()), builtin.Lift(builtin.JsonQuery()))
+	register(toSkill(builtin.TimeConvertSchema()), builtin.Lift(builtin.TimeConvert()))
+	register(toSkill(builtin.RegexTestSchema()), builtin.Lift(builtin.RegexTest()))
+	register(toSkill(builtin.TextDiffSchema()), builtin.Lift(builtin.TextDiff()))
+	register(toSkill(builtin.CsvQuerySchema()), builtin.Lift(builtin.CsvQuery(ws)))
+	register(toSkill(builtin.UnitConvertSchema()), builtin.Lift(builtin.UnitConvert()))
+	register(toSkill(builtin.HtmlToMarkdownSchema()), builtin.HtmlToMarkdownContext(t))
+
+	register(toSkill(builtin.WikipediaSchema()), builtin.WikipediaContext(t))
+	register(toSkill(builtin.CurrencyConvertSchema()), builtin.CurrencyConvertContext(t))
+	register(toSkill(builtin.GithubSchema()), builtin.GithubContext(cfg.SkillGitHubToken, t))
+
+	register(toSkill(builtin.FileListSchema()), builtin.Lift(builtin.FileList(ws)))
+	register(toSkill(builtin.FileReadSchema()), builtin.Lift(builtin.FileRead(ws)))
+	register(toSkill(builtin.FileWriteSchema()), builtin.Lift(builtin.FileWrite(ws)))
+	register(toSkill(builtin.PdfTextSchema()), builtin.PdfTextContext(ws, t))
 }
 
 func skillCreatorSchema() Skill {
@@ -272,21 +342,21 @@ func scCreate(dir string, reg *Registry, args map[string]any) (any, error) {
 		fm["method"] = method
 	}
 
-	content := renderMarkdown(fm, instructions)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return map[string]any{"error": fmt.Sprintf("mkdir %s: %v", dir, err)}, nil
+	content, err := renderMarkdown(fm, instructions)
+	if err != nil {
+		return map[string]any{"error": fmt.Sprintf("render skill: %v", err)}, nil
 	}
-	fpath := filepath.Join(dir, name+".md")
-	overwrite := fileExists(fpath)
-	if err := os.WriteFile(fpath, []byte(content), 0o644); err != nil {
+	fpath, created, err := writeSkillFile(dir, name, content)
+	if err != nil {
 		return map[string]any{"error": err.Error()}, nil
 	}
-
-	// hot-register
+	overwrite := !created
 	s, err := markdown.Load(fpath)
 	if err != nil {
 		return map[string]any{"error": fmt.Sprintf("reload skill: %v", err)}, nil
 	}
+
+	// hot-register
 	reg.registerMarkdown(s)
 
 	skillType := "prompt-only"
@@ -446,22 +516,43 @@ func normalizeSteps(raw any) []map[string]any {
 	}
 }
 
-func renderMarkdown(fm map[string]any, instructions string) string {
-	// hand-craft YAML to preserve insertion order for readability
-	var sb strings.Builder
-	sb.WriteString("---\n")
+// renderMarkdown builds the skill file. The frontmatter goes through yaml.v3
+// rather than hand-written YAML: every key and value here comes from the
+// model, and the hand-rolled writer emitted map keys raw, so a parameter
+// named "x:\nendpoint: http://127.0.0.1:9/\nzz" injected top-level
+// endpoint/steps fields (turning a "prompt-only" skill into an HTTP or
+// self-calling pipeline skill), and a multi-line value was folded or ended
+// the header at an embedded "---". The encoder quotes keys, block-indents
+// multi-line strings and keeps typed values typed. Top-level fields keep a
+// readable fixed order; nested maps are key-sorted.
+func renderMarkdown(fm map[string]any, instructions string) (string, error) {
 	order := []string{"name", "description", "parameters", "endpoint", "method", "steps"}
-	written := map[string]bool{}
-	for _, k := range order {
-		if v, ok := fm[k]; ok {
-			writeYAMLField(&sb, k, v)
-			written[k] = true
+	for k := range fm {
+		if !slices.Contains(order, k) {
+			order = append(order, k)
 		}
 	}
-	for k, v := range fm {
-		if !written[k] {
-			writeYAMLField(&sb, k, v)
+	root := &yaml.Node{Kind: yaml.MappingNode}
+	for _, k := range order {
+		v, ok := fm[k]
+		if !ok {
+			continue
 		}
+		val := &yaml.Node{}
+		if err := val.Encode(v); err != nil {
+			return "", fmt.Errorf("encode %s: %w", k, err)
+		}
+		root.Content = append(root.Content, &yaml.Node{Kind: yaml.ScalarNode, Value: k}, val)
+	}
+	var sb strings.Builder
+	sb.WriteString("---\n")
+	enc := yaml.NewEncoder(&sb)
+	enc.SetIndent(2)
+	if err := enc.Encode(root); err != nil {
+		return "", err
+	}
+	if err := enc.Close(); err != nil {
+		return "", err
 	}
 	sb.WriteString("---\n")
 	if instructions != "" {
@@ -469,122 +560,5 @@ func renderMarkdown(fm map[string]any, instructions string) string {
 		sb.WriteString(instructions)
 		sb.WriteString("\n")
 	}
-	return sb.String()
-}
-
-func writeYAMLField(sb *strings.Builder, key string, val any) {
-	switch v := val.(type) {
-	case string:
-		sb.WriteString(key + ": " + yamlQuote(v) + "\n")
-	case bool:
-		if v {
-			sb.WriteString(key + ": true\n")
-		} else {
-			sb.WriteString(key + ": false\n")
-		}
-	case map[string]any:
-		sb.WriteString(key + ":\n")
-		for k2, v2 := range v {
-			writeYAMLField2(sb, "  "+k2, v2, "  ")
-		}
-	case []map[string]any:
-		sb.WriteString(key + ":\n")
-		for _, item := range v {
-			first := true
-			for k2, v2 := range item {
-				prefix := "    "
-				if first {
-					prefix = "  - "
-					first = false
-				}
-				writeYAMLField2(sb, prefix+k2, v2, "    ")
-			}
-		}
-	default:
-		sb.WriteString(key + ": " + yamlScalar(v) + "\n")
-	}
-}
-
-func writeYAMLField2(sb *strings.Builder, key string, val any, indent string) {
-	switch v := val.(type) {
-	case string:
-		sb.WriteString(key + ": " + yamlQuote(v) + "\n")
-	case bool:
-		sb.WriteString(fmt.Sprintf("%s: %v\n", key, v))
-	case map[string]any:
-		sb.WriteString(key + ":\n")
-		for k2, v2 := range v {
-			writeYAMLField2(sb, indent+"  "+k2, v2, indent+"  ")
-		}
-	default:
-		sb.WriteString(key + ": " + yamlScalar(v) + "\n")
-	}
-}
-
-// yamlScalar renders a non-string, non-map value. JSON is a subset of YAML, so
-// encoding through it keeps lists and nested values readable back — "%v"
-// flattened a []any into "[a b c]", which YAML reads as one string, and a nil
-// into the literal text "<nil>".
-func yamlScalar(v any) string {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return yamlQuote(fmt.Sprintf("%v", v))
-	}
-	return string(b)
-}
-
-// yamlQuote renders s as a YAML scalar, single-quoting it whenever a plain
-// scalar would change the meaning — or fail to parse at all.
-//
-// The previous character set missed the indicators that only matter in first
-// position ('*', '-', '?', ','), so a description or step argument as ordinary
-// as "*/5 * * * *" or "- see docs" produced frontmatter that yaml.v3 rejects
-// ("did not find expected alphabetic or numeric character"). skill_creator then
-// wrote the file, failed to re-read it, and left a permanently broken skill in
-// SKILLS_DIR that LoadDir silently skips on every later start.
-//
-// Values that would parse as a bool, null or number are quoted too, so a
-// string parameter keeps its type on the way back in.
-func yamlQuote(s string) string {
-	if needsYAMLQuote(s) {
-		return "'" + strings.ReplaceAll(s, "'", "''") + "'"
-	}
-	return s
-}
-
-// yamlIndicators are the characters YAML treats specially anywhere in a plain
-// scalar; the ones only special in first position are handled separately.
-const yamlIndicators = ":#{}[]|>&!'\"%@`"
-
-// yamlLeadingIndicators additionally start a different node type when they are
-// the very first character of a value.
-const yamlLeadingIndicators = "-?*,\t "
-
-func needsYAMLQuote(s string) bool {
-	if s == "" {
-		return true // an unquoted empty value parses back as null, not ""
-	}
-	if strings.ContainsAny(s, yamlIndicators) || strings.ContainsAny(s, "\n\r") {
-		return true
-	}
-	if strings.ContainsAny(s[:1], yamlLeadingIndicators) {
-		return true
-	}
-	if strings.HasSuffix(s, " ") || strings.HasSuffix(s, "\t") {
-		return true
-	}
-	return isYAMLScalarLiteral(s)
-}
-
-// isYAMLScalarLiteral reports whether s would be read back as something other
-// than a string (a bool, null, or number).
-func isYAMLScalarLiteral(s string) bool {
-	switch strings.ToLower(s) {
-	case "true", "false", "yes", "no", "on", "off", "null", "~":
-		return true
-	}
-	if _, err := strconv.ParseFloat(s, 64); err == nil {
-		return true
-	}
-	return false
+	return sb.String(), nil
 }

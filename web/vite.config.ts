@@ -9,9 +9,12 @@ export default defineConfig({
     emptyOutDir: true,
   },
   server: {
+    // changeOrigin stays false: the string shorthand turns it on, which
+    // rewrites Host to :8000 while the browser's Origin says :5173, and the
+    // gateway's origin guard then rejects every write as cross-origin.
     proxy: {
-      '/api': 'http://localhost:8000',
-      '/health': 'http://localhost:8000',
+      '/api': { target: 'http://localhost:8000', changeOrigin: false },
+      '/health': { target: 'http://localhost:8000', changeOrigin: false },
     },
   },
 })

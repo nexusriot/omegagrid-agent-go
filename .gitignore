@@ -17,9 +17,11 @@ build/
 /migrate-vector
 /cli
 /omega
+/mockllm
 
 # Go test / coverage artifacts
 *.test
+!Dockerfile.test
 *.out
 coverage.*
 *.prof
@@ -31,8 +33,6 @@ data/
 .env
 .env.*
 !.env.example
-.env.local
-.env.*.local
 
 # Frontend build artifacts (web/node_modules and web/dist are covered by web/.gitignore)
 *.tsbuildinfo

@@ -1,7 +1,9 @@
 package search
 
 import (
+	"context"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"net/url"
@@ -42,7 +44,14 @@ func (s *WebSearchSkill) SkillSchema() map[string]any {
 	}
 }
 
+// Execute is ExecuteContext without cancellation.
 func (s *WebSearchSkill) Execute(args map[string]any) any {
+	return s.ExecuteContext(context.Background(), args)
+}
+
+// ExecuteContext runs a search; cancelling ctx aborts the request and the
+// retry backoff.
+func (s *WebSearchSkill) ExecuteContext(ctx context.Context, args map[string]any) any {
 	query := asString(args["query"])
 	if query == "" {
 		return map[string]any{"error": "query is required"}
@@ -58,7 +67,7 @@ func (s *WebSearchSkill) Execute(args map[string]any) any {
 		maxResults = 10
 	}
 
-	results, err := s.search(query, maxResults)
+	results, err := s.search(ctx, query, maxResults)
 	if err != nil {
 		return map[string]any{"error": err.Error()}
 	}
@@ -70,10 +79,10 @@ func (s *WebSearchSkill) Execute(args map[string]any) any {
 	}
 }
 
-func (s *WebSearchSkill) search(query string, maxResults int) ([]SearchResult, error) {
+func (s *WebSearchSkill) search(ctx context.Context, query string, maxResults int) ([]SearchResult, error) {
 	reqURL := "https://html.duckduckgo.com/html/?q=" + url.QueryEscape(query)
 
-	req, err := http.NewRequest("GET", reqURL, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -86,7 +95,11 @@ func (s *WebSearchSkill) search(query string, maxResults int) ([]SearchResult, e
 	var resp *http.Response
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
-			time.Sleep(time.Duration(attempt) * time.Second)
+			select {
+			case <-time.After(time.Duration(attempt) * time.Second):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
 		}
 		resp, err = s.client.Do(req)
 		if err == nil {
@@ -122,9 +135,9 @@ var (
 	tagRe     = regexp.MustCompile(`<[^>]+>`)
 )
 
-func parseResults(html string, maxResults int) []SearchResult {
-	titleMatches := titleRe.FindAllStringSubmatch(html, -1)
-	snippetMatches := snippetRe.FindAllStringSubmatch(html, -1)
+func parseResults(page string, maxResults int) []SearchResult {
+	titleMatches := titleRe.FindAllStringSubmatchIndex(page, -1)
+	snippetMatches := snippetRe.FindAllStringSubmatchIndex(page, -1)
 
 	var results []SearchResult
 
@@ -133,22 +146,29 @@ func parseResults(html string, maxResults int) []SearchResult {
 			break
 		}
 
-		href := m[1]
+		href := page[m[2]:m[3]]
 		realURL := extractRealURL(href)
 		if realURL == "" || strings.Contains(realURL, "duckduckgo.com") {
 			continue
 		}
 
-		// Pair each result with the snippet at the same document position, so a
-		// skipped title (an ad or DDG-internal link) does not shift every
-		// following snippet onto the wrong result.
+		// A result's snippet is the first one between its title and the next
+		// title. Pairing by match index shifted every later snippet onto the
+		// wrong result as soon as one result had no snippet.
+		end := len(page)
+		if i+1 < len(titleMatches) {
+			end = titleMatches[i+1][0]
+		}
 		snippet := ""
-		if i < len(snippetMatches) {
-			snippet = cleanHTML(snippetMatches[i][1])
+		for _, sm := range snippetMatches {
+			if sm[0] >= m[1] && sm[0] < end {
+				snippet = cleanHTML(page[sm[2]:sm[3]])
+				break
+			}
 		}
 
 		results = append(results, SearchResult{
-			Title:   cleanHTML(m[2]),
+			Title:   cleanHTML(page[m[4]:m[5]]),
 			URL:     realURL,
 			Snippet: snippet,
 		})
@@ -179,14 +199,13 @@ func extractRealURL(href string) string {
 	return href
 }
 
+// cleanHTML strips tags and decodes entities once. The hand-written
+// replacement chain decoded "&amp;lt;" twice (to "<") and left "&#x27;" —
+// which DDG emits for every apostrophe — undecoded.
 func cleanHTML(s string) string {
 	s = tagRe.ReplaceAllString(s, "")
-	s = strings.ReplaceAll(s, "&amp;", "&")
-	s = strings.ReplaceAll(s, "&lt;", "<")
-	s = strings.ReplaceAll(s, "&gt;", ">")
-	s = strings.ReplaceAll(s, "&quot;", `"`)
-	s = strings.ReplaceAll(s, "&#39;", "'")
-	s = strings.ReplaceAll(s, "&nbsp;", " ")
+	s = html.UnescapeString(s)
+	s = strings.ReplaceAll(s, "\u00a0", " ")
 	return strings.TrimSpace(s)
 }
 

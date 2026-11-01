@@ -1,12 +1,14 @@
 package builtin
 
 import (
+	"context"
 	"crypto/rand"
 	"errors"
 	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -224,5 +226,56 @@ func TestPasswordGenRandomFailure(t *testing.T) {
 	m := runExec(t, PasswordGen(), map[string]any{})
 	if !strings.Contains(errOf(m), "random") {
 		t.Fatalf("expected random-source error, got %#v", m)
+	}
+}
+
+// shell_command used a fresh Background context, so cancelling the agent run
+// left the process (and its whole process group) running to its own timeout.
+func TestShellCommandStopsOnCancel(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("no sh")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	t0 := time.Now()
+	res, err := ShellCommandContext(true)(ctx, map[string]any{"command": "sleep 30 | cat", "timeout": 60})
+	if d := time.Since(t0); d > 5*time.Second {
+		t.Fatalf("shell_command ran %v past its cancelled context (%v, %v)", d, res, err)
+	}
+}
+
+// Every skill that dials must give up promptly once ctx is done.
+func TestNetworkSkillsHonourCancelledContext(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() { // accept and stall: never send a byte
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			defer c.Close()
+		}
+	}()
+	_, port, _ := net.SplitHostPort(ln.Addr().String())
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	cases := map[string]struct {
+		run  ContextExecutor
+		args map[string]any
+	}{
+		"http_request": {HttpRequestContext(30), map[string]any{"url": "http://127.0.0.1:" + port + "/"}},
+		"banner_grab":  {BannerGrabContext(), map[string]any{"host": "127.0.0.1", "port": port, "timeout": 30}},
+		"port_scan":    {PortScanContext(), map[string]any{"host": "127.0.0.1", "ports": port}},
+	}
+	for name, c := range cases {
+		t0 := time.Now()
+		_, _ = c.run(ctx, c.args)
+		if d := time.Since(t0); d > 2*time.Second {
+			t.Errorf("%s took %v with a cancelled context", name, d)
+		}
 	}
 }

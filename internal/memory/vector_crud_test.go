@@ -116,15 +116,18 @@ func TestListAllPagination(t *testing.T) {
 	}
 }
 
-func TestListAllEmbeddingsFailure(t *testing.T) {
+// Listing used to embed a probe text, so it failed whenever the embeddings
+// backend was down. Once the width is known (recorded on the first add) it
+// enumerates with a fixed probe vector and needs no embeddings call.
+func TestListAllWorksWithEmbeddingsDown(t *testing.T) {
 	vs := openTestVectorStore(t)
 	if _, err := vs.addText("something", nil, ""); err != nil {
 		t.Fatalf("addText: %v", err)
 	}
-	// The probe query needs the embeddings backend; its failure must surface.
 	vs.embedClient = &errEmbeddings{}
-	if _, _, err := vs.listAll(10, 0); err == nil {
-		t.Fatal("expected an error when the embeddings backend is down")
+	hits, total, err := vs.listAll(10, 0)
+	if err != nil || total != 1 || hits[0].Text != "something" {
+		t.Fatalf("listAll with embeddings down = %v, %d, %v", hits, total, err)
 	}
 }
 
@@ -336,5 +339,74 @@ func TestAddTextStampsCreatedAt(t *testing.T) {
 	}
 	if createdAt(hit.Metadata) <= 0 {
 		t.Fatalf("created_at %q does not parse as a timestamp", ts)
+	}
+}
+
+// searchText and listAll clamp k to Count() and then query; a delete landing
+// in between made chromem refuse with "nResults must be <= the number of
+// documents", so searches failed for as long as deletions were in flight.
+func TestSearchSurvivesConcurrentDeletes(t *testing.T) {
+	vs, err := newVectorStore(t.TempDir(), "race", &mockEmbeddings{}, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for i := range 300 {
+		r, err := vs.addText(fmt.Sprintf("fact number %d", i), nil, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, r.MemoryID)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for _, id := range ids {
+			_, _ = vs.deleteByID(id)
+		}
+	}()
+	fails := 0
+	for running := true; running; {
+		select {
+		case <-done:
+			running = false
+		default:
+		}
+		if _, err := vs.searchText("fact", 1000); err != nil {
+			fails++
+			if fails == 1 {
+				t.Log(err)
+			}
+		}
+		if _, _, err := vs.listAll(0, 0); err != nil {
+			fails++
+			if fails == 1 {
+				t.Log(err)
+			}
+		}
+	}
+	if fails > 0 {
+		t.Errorf("%d searches/lists failed while deletes were in flight", fails)
+	}
+}
+
+// Deleting a document must not evict a hash entry that already points at a
+// different (newer) document, or the next exact re-add is no longer deduped.
+func TestDeleteKeepsHashOwnedByAnotherDoc(t *testing.T) {
+	vs, err := newVectorStore(t.TempDir(), "hash", &mockEmbeddings{}, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := vs.addText("same text", nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := sha256Text("same text")
+	vs.hashes[h] = "newer-id"
+	if ok, err := vs.deleteByID(first.MemoryID); !ok || err != nil {
+		t.Fatalf("deleteByID = %v, %v", ok, err)
+	}
+	if vs.hashes[h] != "newer-id" {
+		t.Fatalf("hash entry = %q, want it left pointing at newer-id", vs.hashes[h])
 	}
 }

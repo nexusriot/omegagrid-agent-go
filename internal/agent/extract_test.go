@@ -66,7 +66,7 @@ func TestMaybeExtractMemoriesGating(t *testing.T) {
 	// idx detects unexpected invocations after the synchronous path finishes.
 	mock := &mockLLM{responses: []string{`{"facts":["x"]}`}}
 	s := &Service{Chat: mock, AutoMemoryExtract: false, AutoMemoryMinAnswerLen: 1}
-	s.maybeExtractMemories(1, "query", "a sufficiently long answer")
+	s.maybeExtractMemories(1, "", "query", "a sufficiently long answer")
 	if mock.idx != 0 {
 		t.Errorf("disabled extraction still called the LLM (idx=%d)", mock.idx)
 	}
@@ -74,7 +74,7 @@ func TestMaybeExtractMemoriesGating(t *testing.T) {
 	// Short answers are skipped even when enabled.
 	s.AutoMemoryExtract = true
 	s.AutoMemoryMinAnswerLen = 100
-	s.maybeExtractMemories(1, "query", "short")
+	s.maybeExtractMemories(1, "", "query", "short")
 	if mock.idx != 0 {
 		t.Errorf("short answer still triggered extraction (idx=%d)", mock.idx)
 	}

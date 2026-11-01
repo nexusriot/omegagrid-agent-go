@@ -2,6 +2,7 @@ package config
 
 import (
 	"reflect"
+	"slices"
 	"testing"
 )
 
@@ -27,13 +28,19 @@ func clearEnv(t *testing.T) {
 		"OPENCODE_TIMEOUT", "EMBED_PROVIDER",
 		"SKILL_HTTP_TIMEOUT", "SKILL_SHELL_ENABLED", "SKILL_SSH_ENABLED",
 		"SKILL_SSH_PRIVATE_KEY", "SKILL_SSH_DEFAULT_USER", "SKILL_SSH_IDENTITY_FILE",
-		"SKILL_ALLOW_PRIVATE_NETWORKS",
+		"SKILL_ALLOW_PRIVATE_NETWORKS", "SKILL_SHELL_SANDBOX", "SKILL_SHELL_SANDBOX_NETWORK",
+		"SKILL_SHELL_SANDBOX_WRITABLE", "SKILL_SSH_KNOWN_HOSTS", "SKILL_SSH_HOST_KEY_POLICY",
+		"MEMORY_DEFAULT_TTL_DAYS", "MCP_CONNECT_WAIT_SEC", "MCP_REFRESH_SEC",
+		"SKILL_WORKSPACE_DIR", "SKILL_WORKSPACE_MAX_MB", "SKILL_GITHUB_TOKEN", "GITHUB_TOKEN",
+		"NOTIFY_TELEGRAM_CHATS", "NOTIFY_TELEGRAM_DEFAULT_CHAT", "NOTIFY_EMAIL_TO", "NOTIFY_SMTP_HOST",
+		"NOTIFY_SMTP_PORT", "NOTIFY_SMTP_USER", "NOTIFY_SMTP_PASSWORD", "NOTIFY_SMTP_FROM", "NOTIFY_WEBHOOKS",
 		"AGENT_CONTEXT_TAIL", "AGENT_MEMORY_HITS", "AGENT_MAX_STEPS",
-		"AGENT_PARALLEL_TOOLS", "AGENT_MAX_PARALLEL",
+		"AGENT_PARALLEL_TOOLS", "AGENT_MAX_PARALLEL", "AGENT_TOOL_MODE",
 		"AUTO_MEMORY_EXTRACT", "AUTO_MEMORY_MAX_FACTS", "AUTO_MEMORY_MIN_ANSWER_LEN",
 		"PLAYGROUND_DISABLED", "SCHEDULER_TICK_SEC", "TELEGRAM_BOT_TOKEN",
 		"AUDIT_MAX_BLOB_BYTES", "MCP_SERVER_DISABLED", "MCP_SERVERS",
 		"AGENT_DB", "AGENT_VECTOR_DIR", "SKILLS_DIR", "SCHEDULER_DB",
+		"GATEWAY_API_TOKEN", "CORS_ALLOWED_ORIGINS", "GATEWAY_ALLOWED_HOSTS",
 	}
 	for _, k := range keys {
 		t.Setenv(k, "")
@@ -606,6 +613,72 @@ func TestEmbedProviderOverride(t *testing.T) {
 	}
 }
 
+func TestNewFeatureDefaults(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("DATA_DIR", "/d")
+	c := Load()
+	if c.SkillShellSandbox != "none" || c.SkillSSHHostKeyPolicy != "accept-new" || c.SkillSSHKnownHosts != "/d/ssh_known_hosts" {
+		t.Fatalf("sandbox=%q policy=%q known_hosts=%q", c.SkillShellSandbox, c.SkillSSHHostKeyPolicy, c.SkillSSHKnownHosts)
+	}
+	if c.MCPConnectWait != 10 || c.MCPRefreshSec != 300 || c.MemoryDefaultTTLDays != 0 {
+		t.Fatalf("mcp wait=%v refresh=%v ttl=%v", c.MCPConnectWait, c.MCPRefreshSec, c.MemoryDefaultTTLDays)
+	}
+	t.Setenv("SKILL_SHELL_SANDBOX", " BWRAP ")
+	t.Setenv("SKILL_SSH_HOST_KEY_POLICY", "Strict")
+	t.Setenv("MEMORY_DEFAULT_TTL_DAYS", "30")
+	c = Load()
+	if c.SkillShellSandbox != "bwrap" || c.SkillSSHHostKeyPolicy != "strict" || c.MemoryDefaultTTLDays != 30 {
+		t.Fatalf("overrides: %q %q %v", c.SkillShellSandbox, c.SkillSSHHostKeyPolicy, c.MemoryDefaultTTLDays)
+	}
+}
+
+func TestSkillSetConfig(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("DATA_DIR", "/d")
+	c := Load()
+	if c.SkillWorkspaceDir != "/d/workspace" || c.SkillWorkspaceMaxMB != 100 || c.NotifySMTPPort != 587 || c.SkillGitHubToken != "" {
+		t.Fatalf("defaults: %q %v %d %q", c.SkillWorkspaceDir, c.SkillWorkspaceMaxMB, c.NotifySMTPPort, c.SkillGitHubToken)
+	}
+	t.Setenv("GITHUB_TOKEN", " gh-fallback ")
+	t.Setenv("NOTIFY_TELEGRAM_CHATS", "1, 2")
+	t.Setenv("NOTIFY_WEBHOOKS", "ops=https://h.example/x")
+	c = Load()
+	if c.SkillGitHubToken != "gh-fallback" || !slices.Equal(c.NotifyTelegramChats, []string{"1", "2"}) || c.NotifyWebhooks[0] != "ops=https://h.example/x" {
+		t.Fatalf("overrides: %q %v %v", c.SkillGitHubToken, c.NotifyTelegramChats, c.NotifyWebhooks)
+	}
+	t.Setenv("SKILL_GITHUB_TOKEN", "own")
+	if Load().SkillGitHubToken != "own" {
+		t.Fatal("SKILL_GITHUB_TOKEN must win over GITHUB_TOKEN")
+	}
+}
+
+func TestAgentToolMode(t *testing.T) {
+	clearEnv(t)
+	if got := Load().AgentToolMode; got != "auto" {
+		t.Fatalf("default AgentToolMode = %q, want auto", got)
+	}
+	t.Setenv("AGENT_TOOL_MODE", " Envelope ")
+	if got := Load().AgentToolMode; got != "envelope" {
+		t.Fatalf("AgentToolMode = %q, want envelope", got)
+	}
+}
+
+func TestAccessControlLists(t *testing.T) {
+	clearEnv(t)
+	if c := Load(); c.AllowedHosts != nil || c.CORSAllowedOrigins != nil || c.APIToken != "" {
+		t.Fatalf("defaults: hosts=%v origins=%v token=%q, want all empty", c.AllowedHosts, c.CORSAllowedOrigins, c.APIToken)
+	}
+	t.Setenv("GATEWAY_ALLOWED_HOSTS", " agent.example.org , ,box.lan ")
+	t.Setenv("GATEWAY_API_TOKEN", "  tok  ")
+	c := Load()
+	if !slices.Equal(c.AllowedHosts, []string{"agent.example.org", "box.lan"}) {
+		t.Errorf("AllowedHosts = %q", c.AllowedHosts)
+	}
+	if c.APIToken != "tok" {
+		t.Errorf("APIToken = %q, want trimmed", c.APIToken)
+	}
+}
+
 func TestFirstOf(t *testing.T) {
 	cases := []struct {
 		in   []string
@@ -762,6 +835,18 @@ func TestSkillAllowPrivateNetworks(t *testing.T) {
 	}
 }
 
+// A "disable" switch that does not understand "on" fails open: the operator
+// believes the playground / MCP server is off while it keeps serving.
+func TestDisableSwitchesAcceptOn(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("PLAYGROUND_DISABLED", "on")
+	t.Setenv("MCP_SERVER_DISABLED", "On")
+	c := Load()
+	if c.PlaygroundEnabled || c.MCPServerEnabled {
+		t.Fatalf("playground=%v mcp=%v, want both disabled by \"on\"", c.PlaygroundEnabled, c.MCPServerEnabled)
+	}
+}
+
 func TestIsTruthy(t *testing.T) {
 	tests := []struct {
 		in   string
@@ -780,7 +865,9 @@ func TestIsTruthy(t *testing.T) {
 		{"no", false},
 		{"", false},
 		{"y", false},
-		{"on", false},
+		{"on", true},
+		{" ON ", true},
+		{"off", false},
 		{"2", false},
 		{"truthy", false},
 	}

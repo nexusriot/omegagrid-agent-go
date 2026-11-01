@@ -145,9 +145,12 @@ func (a *AuthStore) ListUsers(limit int) ([]AuthUser, error) {
 func boolEnv(key string, def bool) bool {
 	v := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
 	switch v {
-	case "true", "1", "yes":
+	// Same spellings as internal/config: "off" used to fall through to the
+	// default, so BOT_AUTH_ENABLED=off silently left auth on (and "on" did
+	// the same for a default-off switch).
+	case "true", "1", "yes", "on":
 		return true
-	case "false", "0", "no":
+	case "false", "0", "no", "off":
 		return false
 	}
 	return def

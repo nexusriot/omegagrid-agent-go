@@ -100,3 +100,20 @@ func TestDialTimeoutBlocksMetadata(t *testing.T) {
 		t.Fatalf("dial metadata: err = %v, want *ErrBlocked", err)
 	}
 }
+
+// NAT64 / 6to4 addresses route to the IPv4 they embed; Unmap() only covers
+// ::ffff:. 64:ff9b::a9fe:a9fe is 169.254.169.254 on a NAT64 host.
+func TestTranslatedIPv6IsVettedAsItsIPv4(t *testing.T) {
+	blocked := []string{"64:ff9b::a9fe:a9fe", "2002:a9fe:a9fe::1", "64:ff9b::7f00:1", "2002:0a00:0001::"}
+	for _, s := range blocked {
+		if err := checkAddr(netip.MustParseAddr(s), false); err == nil {
+			t.Errorf("%s was allowed with private networks off", s)
+		}
+	}
+	if err := checkAddr(netip.MustParseAddr("64:ff9b::a9fe:a9fe"), true); err == nil {
+		t.Error("NAT64 metadata address allowed even with private networks on")
+	}
+	if err := checkAddr(netip.MustParseAddr("64:ff9b::808:808"), false); err != nil {
+		t.Errorf("NAT64 of a public IPv4 refused: %v", err)
+	}
+}

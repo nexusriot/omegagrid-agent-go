@@ -1,7 +1,9 @@
 package skills
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -9,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/nexusriot/omegagrid-agent-go/internal/config"
+	"github.com/nexusriot/omegagrid-agent-go/internal/skills/markdown"
 )
 
 func TestSafeNameChars(t *testing.T) {
@@ -42,36 +45,37 @@ func TestSafeNameChars(t *testing.T) {
 	}
 }
 
-func TestYamlQuote(t *testing.T) {
-	cases := []struct {
-		name, in, want string
-	}{
-		{"plain unquoted", "hello", "hello"},
-		{"empty quoted", "", "''"},
-		{"inner space not special", "with space", "with space"},
-		{"leading asterisk quoted", "*/5 * * * *", "'*/5 * * * *'"},
-		{"leading dash quoted", "- see docs", "'- see docs'"},
-		{"leading question quoted", "? maybe", "'? maybe'"},
-		{"leading comma quoted", ",oops", "',oops'"},
-		{"trailing space quoted", "trailing ", "'trailing '"},
-		{"boolish quoted", "yes", "'yes'"},
-		{"numeric quoted", "42", "'42'"},
-		{"colon quoted", "has:colon", "'has:colon'"},
-		{"hash quoted", "a#b", "'a#b'"},
-		{"percent quoted", "100%", "'100%'"},
-		{"at quoted", "a@b", "'a@b'"},
-		{"bracket quoted", "[x]", "'[x]'"},
-		{"single quote doubled", "it's", "'it''s'"},
-		{"newline quoted", "a\nb", "'a\nb'"},
+// Every value skill_creator writes must read back unchanged — including the
+// YAML-hostile ones that broke or silently altered the hand-rolled writer
+// (a leading "*" in a cron string, a value that looks like a bool, a newline
+// that single quotes folded into a space, an embedded "---" line).
+func TestRenderMarkdownRoundTripsHostileValues(t *testing.T) {
+	values := []string{
+		"hello", "", "with space", "*/5 * * * *", "- see docs", "? maybe", ",oops",
+		"trailing ", "yes", "42", "has:colon", "a#b", "100%", "a@b", "[x]", "it's",
+		"a\nb", "a\n---\nb", "line1\nline2\n", "{{city}}",
 	}
-	// NOTE: an interior space is harmless in a plain scalar, so "with space" is
-	// returned unquoted; a leading or trailing one is not.
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := yamlQuote(tc.in); got != tc.want {
-				t.Fatalf("yamlQuote(%q) = %q, want %q", tc.in, got, tc.want)
-			}
-		})
+	dir := t.TempDir()
+	for i, v := range values {
+		content, err := renderMarkdown(map[string]any{
+			"name":        "rt",
+			"description": v + "d", // description must be non-empty
+			"parameters":  map[string]any{"p": map[string]any{"type": "string", "description": v}},
+		}, "")
+		if err != nil {
+			t.Fatalf("render %q: %v", v, err)
+		}
+		path := filepath.Join(dir, fmt.Sprintf("rt%d.md", i))
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		sk, err := markdown.Load(path)
+		if err != nil {
+			t.Fatalf("value %q: generated file does not load: %v\n%s", v, err, content)
+		}
+		if sk.Schema.Description != v+"d" || sk.Schema.Parameters["p"].Description != v {
+			t.Errorf("value %q came back as description=%q param=%q", v, sk.Schema.Description, sk.Schema.Parameters["p"].Description)
+		}
 	}
 }
 
@@ -205,7 +209,7 @@ func TestClientRegister(t *testing.T) {
 
 	called := false
 	c.Register("custom_tool", "desc", map[string]Param{"a": {Type: "string", Required: true}},
-		func(args map[string]any) (any, error) {
+		func(_ context.Context, args map[string]any) (any, error) {
 			called = true
 			return args["a"], nil
 		})
@@ -219,5 +223,30 @@ func TestClientRegister(t *testing.T) {
 	}
 	if got != "ok" {
 		t.Fatalf("got %v, want ok", got)
+	}
+}
+
+// Every built-in is registered and reserved: 50 from builtin/ plus
+// skill_creator. A skill added to builtin/ but not to registerBuiltins (or
+// the reverse) changes this number.
+func TestBuiltinInventory(t *testing.T) {
+	c, err := New(config.Config{SkillsDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	list, _ := c.List()
+	n := 0
+	for _, s := range list {
+		if s.Kind == "builtin" {
+			n++
+		}
+	}
+	if n != 51 {
+		t.Fatalf("%d built-in skills registered, want 51", n)
+	}
+	for _, name := range []string{"rss_fetch", "notify", "traceroute", "json_query", "github", "file_write", "pdf_text"} {
+		if !c.reg.isReserved(name) {
+			t.Errorf("%s is not reserved against markdown skills", name)
+		}
 	}
 }

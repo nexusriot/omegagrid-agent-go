@@ -19,6 +19,8 @@ type queryRequest struct {
 	Remember       *bool  `json:"remember,omitempty"`
 	MaxSteps       int    `json:"max_steps,omitempty"`
 	TelegramChatID *int64 `json:"telegram_chat_id,omitempty"`
+	// Namespace scopes the run's memory (see agent.RunRequest.Namespace).
+	Namespace string `json:"namespace,omitempty"`
 }
 
 const (
@@ -48,6 +50,7 @@ func (req queryRequest) toAgentReq(defaultMaxSteps int) agent.RunRequest {
 		SessionID:      req.SessionID,
 		MaxSteps:       maxSteps,
 		TelegramChatID: req.TelegramChatID,
+		Namespace:      req.Namespace,
 	}
 }
 

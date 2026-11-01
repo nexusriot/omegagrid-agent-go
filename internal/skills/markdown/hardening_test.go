@@ -1,6 +1,7 @@
 package markdown
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -41,13 +42,13 @@ func TestExecuteAtRefusesPipelineBeyondMaxDepth(t *testing.T) {
 		t.Fatal(err)
 	}
 	called := false
-	exec := func(string, map[string]any) (any, error) { called = true; return "ok", nil }
+	exec := func(context.Context, string, map[string]any) (any, error) { called = true; return "ok", nil }
 
-	res, _ := s.ExecuteAt(map[string]any{}, exec, MaxPipelineDepth)
+	res, _ := s.ExecuteAt(context.Background(), map[string]any{}, exec, MaxPipelineDepth)
 	if msg, _ := res.(map[string]any)["error"].(string); !strings.Contains(msg, "nesting depth") || called {
 		t.Fatalf("depth %d: res=%#v called=%v, want refusal without running steps", MaxPipelineDepth, res, called)
 	}
-	res, _ = s.ExecuteAt(map[string]any{}, exec, MaxPipelineDepth-1)
+	res, _ = s.ExecuteAt(context.Background(), map[string]any{}, exec, MaxPipelineDepth-1)
 	if _, isErr := res.(map[string]any)["error"]; isErr || !called {
 		t.Fatalf("depth %d: res=%#v called=%v, want pipeline to run", MaxPipelineDepth-1, res, called)
 	}

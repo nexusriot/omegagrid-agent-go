@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,21 +16,29 @@ import (
 	"unicode/utf8"
 )
 
-// SkillExecutor runs a registered skill by name.  Wired up by the gateway to
-// the sidecar skill client (or any other implementation).
-type SkillExecutor func(skillName string, args map[string]any) (any, error)
+// SkillExecutor runs a registered skill by name.  Wired up by bootstrap to
+// the skill registry plus the native skills. ctx is cancelled when the runner
+// stops, so a task blocked in a skill no longer outlives shutdown.
+type SkillExecutor func(ctx context.Context, skillName string, args map[string]any) (any, error)
+
+// AgentFunc answers a prompt task's prompt with a full agent run.
+type AgentFunc func(ctx context.Context, prompt string) (answer string, err error)
 
 // Runner is a goroutine that wakes every checkInterval and runs any task whose
 // cron expression matches the current minute.  Mirrors scheduler/runner.py.
 type Runner struct {
 	store         *Store
 	exec          SkillExecutor
+	agent         AgentFunc
 	botToken      string
 	checkInterval time.Duration
 
 	stop     chan struct{}
 	stopOnce sync.Once
-	wg       sync.WaitGroup
+	// ctx is cancelled by Stop; every task runs under it.
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 
 	// lastMinute is the newest minute already evaluated. Ticks only ever look
 	// at whole minutes, and a 60s ticker drifts: fire at :59.8 and the next
@@ -48,14 +57,20 @@ func NewRunner(store *Store, exec SkillExecutor, botToken string, checkInterval 
 	if checkInterval <= 0 {
 		checkInterval = 60 * time.Second
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Runner{
 		store:         store,
 		exec:          exec,
 		botToken:      botToken,
 		checkInterval: checkInterval,
 		stop:          make(chan struct{}),
+		ctx:           ctx,
+		cancel:        cancel,
 	}
 }
+
+// SetAgent enables prompt tasks; without it they fail with an error.
+func (r *Runner) SetAgent(fn AgentFunc) { r.agent = fn }
 
 func (r *Runner) Start() {
 	r.wg.Add(1)
@@ -76,7 +91,10 @@ func (r *Runner) Stop() { r.StopTimeout(defaultStopTimeout) }
 // deadline the loop goroutine is abandoned and the process exits around it.
 // Reports whether the loop finished in time.
 func (r *Runner) StopTimeout(d time.Duration) bool {
-	r.stopOnce.Do(func() { close(r.stop) })
+	r.stopOnce.Do(func() {
+		close(r.stop)
+		r.cancel()
+	})
 	done := make(chan struct{})
 	go func() {
 		r.wg.Wait()
@@ -127,13 +145,16 @@ func (r *Runner) tick() {
 	for _, task := range tasks {
 		// A task matching several of the swept minutes still runs once: the
 		// sweep exists to not lose a run, not to replay a backlog.
-		if !matchesAny(task.CronExpr, minutes) {
+		slot, ok := latestMatchIn(task.CronExpr, minutes, task.Location())
+		if !ok {
 			continue
 		}
-		// Claim the minute atomically: skips tasks already run in this window
-		// and, when another process shares the database, lets only one of
-		// them run it.
-		won, err := r.store.ClaimRun(task.ID, now)
+		// Claim the minute that matched, not the current one, atomically:
+		// skips tasks already run in this window and, when another process
+		// shares the database, lets only one of them run it. Claiming `now`
+		// let a process whose ticker drifted past a slot re-run it after
+		// another process had already claimed that very slot.
+		won, err := r.store.ClaimRun(task.ID, slot)
 		if err != nil {
 			log.Printf("scheduler claim failed for task #%d: %v", task.ID, err)
 			continue
@@ -143,6 +164,35 @@ func (r *Runner) tick() {
 		}
 		r.runTask(task)
 	}
+	r.runDueRetries(time.Now())
+}
+
+// runDueRetries runs every pending retry whose time has come. ClaimRetry is
+// atomic, so a retry runs once even with several processes on one database.
+func (r *Runner) runDueRetries(now time.Time) {
+	due, err := r.store.DueRetries(now)
+	if err != nil {
+		log.Printf("scheduler: list retries failed: %v", err)
+		return
+	}
+	for _, t := range due {
+		if won, err := r.store.ClaimRetry(t.ID, *t.NextRetryAt); err != nil || !won {
+			continue
+		}
+		r.execute(r.ctx, t, "retry", t.RetryAttempt)
+	}
+}
+
+// RunNow runs a task immediately, outside its schedule, and returns the run.
+// It does not move last_run_at (the cron schedule is untouched), does not
+// disable a one-shot, and does not arm retries.
+func (r *Runner) RunNow(ctx context.Context, id int64) (*Run, error) {
+	t, err := r.store.Get(id)
+	if err != nil {
+		return nil, err
+	}
+	run := r.execute(ctx, t, "manual", 0)
+	return &run, nil
 }
 
 // pendingMinutes returns every minute that still needs evaluating, oldest
@@ -163,21 +213,38 @@ func (r *Runner) pendingMinutes(now time.Time) []time.Time {
 	return out
 }
 
-func matchesAny(cronExpr string, minutes []time.Time) bool {
-	for _, m := range minutes {
-		if Matches(cronExpr, m) {
-			return true
+// latestMatch returns the newest of minutes (oldest first) that cronExpr
+// matches.
+func latestMatch(cronExpr string, minutes []time.Time) (time.Time, bool) {
+	return latestMatchIn(cronExpr, minutes, time.UTC)
+}
+
+// latestMatchIn evaluates the expression on the wall clock of loc. Across a
+// DST change a wall-clock minute can occur twice (fall back: both fire, they
+// are distinct instants) or not at all (spring forward: skipped).
+func latestMatchIn(cronExpr string, minutes []time.Time, loc *time.Location) (time.Time, bool) {
+	for i := len(minutes) - 1; i >= 0; i-- {
+		if Matches(cronExpr, minutes[i].In(loc)) {
+			return minutes[i], true
 		}
 	}
-	return false
+	return time.Time{}, false
 }
 
 func (r *Runner) runTask(t *Task) {
+	r.execute(r.ctx, t, "cron", 0)
+}
+
+// execute runs t once, records the run, and handles the outcome: a failed
+// cron/retry run arms the next retry while attempts remain; the Telegram
+// notification goes out once the outcome is final.
+func (r *Runner) execute(ctx context.Context, t *Task, trigger string, attempt int) Run {
 	// Args are deliberately not logged: they can carry credentials (an
 	// http_request Authorization header, an SSH command with a password).
-	log.Printf("scheduler running task #%d %q: skill=%s", t.ID, t.Name, t.Skill)
+	log.Printf("scheduler running task #%d %q: skill=%s trigger=%s attempt=%d", t.ID, t.Name, t.Skill, trigger, attempt)
+	started := time.Now()
 	var resultStr string
-	res, err := r.safeExec(t)
+	res, err := r.safeExec(ctx, t)
 	if err != nil {
 		log.Printf("task #%d failed: %v", t.ID, err)
 		if b, merr := json.Marshal(map[string]string{"error": err.Error()}); merr == nil {
@@ -185,6 +252,8 @@ func (r *Runner) runTask(t *Task) {
 		} else {
 			resultStr = `{"error":"` + err.Error() + `"}`
 		}
+	} else if s, ok := res.(string); ok && t.Prompt != "" {
+		resultStr = s
 	} else {
 		if b, merr := json.MarshalIndent(res, "", "  "); merr == nil {
 			resultStr = string(b)
@@ -193,14 +262,42 @@ func (r *Runner) runTask(t *Task) {
 			resultStr = fmt.Sprintf("%v", res)
 		}
 	}
+	run := Run{TaskID: t.ID, Trigger: trigger, Attempt: attempt,
+		StartedAt: float64(started.UnixNano()) / 1e9, FinishedAt: float64(time.Now().UnixNano()) / 1e9,
+		OK: err == nil, Result: resultStr}
+	if id, rerr := r.store.RecordRun(run); rerr != nil {
+		log.Printf("scheduler record run failed: %v", rerr)
+	} else {
+		run.ID = id
+	}
 
 	if err := r.store.RecordResult(t.ID, resultStr); err != nil {
 		log.Printf("scheduler record result failed: %v", err)
 	}
+	if trigger == "manual" {
+		return run
+	}
+
+	retrying := false
+	if err != nil && attempt < t.MaxRetries {
+		delay := time.Duration(t.RetryDelaySec) * time.Second << attempt
+		if delay <= 0 || delay > 24*time.Hour {
+			delay = 24 * time.Hour
+		}
+		if serr := r.store.ScheduleRetry(t.ID, attempt+1, time.Now().Add(delay)); serr != nil {
+			log.Printf("scheduler: arming retry for task #%d failed: %v", t.ID, serr)
+		} else {
+			retrying = true
+			log.Printf("scheduler: task #%d will retry (attempt %d of %d) in %s", t.ID, attempt+1, t.MaxRetries, delay)
+		}
+	} else if t.RetryAttempt > 0 || t.NextRetryAt != nil {
+		_ = r.store.ClearRetry(t.ID)
+	}
 
 	// One-shot tasks are disabled (not deleted) after their first run so the
-	// last_result / run_count audit trail survives.
-	if t.OneShot {
+	// last_result / run_count audit trail survives. ClaimRun already did
+	// this atomically; this covers a direct call.
+	if t.OneShot && !retrying {
 		if _, derr := r.store.SetEnabled(t.ID, false); derr != nil {
 			log.Printf("scheduler one-shot disable failed for task #%d: %v", t.ID, derr)
 		} else {
@@ -208,7 +305,7 @@ func (r *Runner) runTask(t *Task) {
 		}
 	}
 
-	if t.NotifyTelegramChatID != nil && r.botToken != "" {
+	if t.NotifyTelegramChatID != nil && r.botToken != "" && !retrying {
 		var msg string
 		if reminderText := reminderMessage(t, err, res); reminderText != "" {
 			// Plain reminder text reads better than a JSON blob.
@@ -219,13 +316,14 @@ func (r *Runner) runTask(t *Task) {
 		}
 		sendTelegram(r.botToken, *t.NotifyTelegramChatID, msg)
 	}
+	return run
 }
 
 // safeExec runs one task's skill, converting a panic into a task error. Only
 // the tick's own recover stood between a panicking skill and the process, and
 // it fired after unwinding runTask — so one bad task both lost its own
 // last_result and cancelled every task still queued behind it in that minute.
-func (r *Runner) safeExec(t *Task) (res any, err error) {
+func (r *Runner) safeExec(ctx context.Context, t *Task) (res any, err error) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			log.Printf("scheduler task #%d %q: skill %q panicked: %v\n%s", t.ID, t.Name, t.Skill, rec, debug.Stack())
@@ -233,7 +331,13 @@ func (r *Runner) safeExec(t *Task) (res any, err error) {
 			err = fmt.Errorf("skill %q crashed: %v", t.Skill, rec)
 		}
 	}()
-	return r.exec(t.Skill, t.Args)
+	if t.Prompt != "" {
+		if r.agent == nil {
+			return nil, fmt.Errorf("prompt tasks need the agent, which this process has not wired")
+		}
+		return r.agent(ctx, t.Prompt)
+	}
+	return r.exec(ctx, t.Skill, t.Args)
 }
 
 // reminderMessage returns the bare reminder text for successful runs of the

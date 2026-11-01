@@ -15,6 +15,7 @@ import (
 	"github.com/nexusriot/omegagrid-agent-go/internal/bootstrap"
 	"github.com/nexusriot/omegagrid-agent-go/internal/config"
 	"github.com/nexusriot/omegagrid-agent-go/internal/httpapi"
+	"github.com/nexusriot/omegagrid-agent-go/internal/version"
 )
 
 func main() {
@@ -33,6 +34,7 @@ func main() {
 		Skills:       svc.Skills,
 		Chat:         svc.Chat,
 		Scheduler:    svc.Sched,
+		Runner:       svc.Runner,
 		ToolProvider: svc.ToolProvider,
 	}
 
@@ -55,14 +57,27 @@ func main() {
 		BaseContext:    func(net.Listener) context.Context { return baseCtx },
 	}
 
+	// The listener is on every interface (it has to be, inside a container);
+	// docker-compose publishes it on 127.0.0.1 only. Run natively without a
+	// token and the agent's tools (http_request, port_scan, schedule_task,
+	// shell_command when enabled) are open to the whole LAN — say so.
+	if cfg.APIToken == "" {
+		log.Printf("WARNING: GATEWAY_API_TOKEN is not set — /api/* and /mcp are unauthenticated; "+
+			"keep port %d reachable from loopback only, or set a token", cfg.BackendPort)
+	}
+
+	// Expired memories (expires_at in the past) are hidden from search and
+	// listing at once; the janitor deletes them for good, hourly.
+	go svc.Memory.RunJanitor(baseCtx, time.Hour)
+
 	// Only the gateway runs scheduled tasks; bootstrap.New leaves the runner
 	// stopped so CLI local mode doesn't start a competing one.
 	svc.Runner.Start()
 
 	serveErr := make(chan error, 1)
 	go func() {
-		log.Printf("gateway listening on %s (provider=%s, model=%s, skills-dir=%s)",
-			addr, cfg.Provider, svc.Chat.Model(), cfg.SkillsDir)
+		log.Printf("gateway %s listening on %s (provider=%s, model=%s, skills-dir=%s)",
+			version.Version, addr, cfg.Provider, svc.Chat.Model(), cfg.SkillsDir)
 		// log.Fatalf here skipped every deferred cleanup (scheduler stop, DB
 		// close); report the error to main instead.
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

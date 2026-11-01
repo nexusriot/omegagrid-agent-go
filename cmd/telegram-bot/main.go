@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/nexusriot/omegagrid-agent-go/internal/telegram"
+	"github.com/nexusriot/omegagrid-agent-go/internal/version"
 )
 
 // ensureDataDirs creates every on-disk directory the bot writes to before
@@ -77,5 +78,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("bot init: %v", err)
 	}
+	bot.SetMemoryScope(os.Getenv("BOT_MEMORY_SCOPE"))
+	log.Printf("omegagrid telegram bot %s starting (gateway %s)", version.Version, gatewayURL)
 	bot.Run()
 }

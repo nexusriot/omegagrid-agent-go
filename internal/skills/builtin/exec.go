@@ -6,14 +6,18 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 
 	"github.com/nexusriot/omegagrid-agent-go/internal/skills/netguard"
 )
@@ -35,8 +39,72 @@ var blockedPatterns = []string{
 	"rm -rf /", "mkfs", "dd if=", ":(){", "shutdown", "reboot", "halt", "poweroff",
 }
 
+// ShellCommand is ShellCommandContext without cancellation.
 func ShellCommand(enabled bool) Executor {
-	return func(args map[string]any) (any, error) {
+	return withoutContext(ShellCommandContext(enabled))
+}
+
+// ShellCommandContext runs commands unsandboxed.
+func ShellCommandContext(enabled bool) ContextExecutor {
+	return ShellCommandWith(ShellConfig{Enabled: enabled})
+}
+
+// ShellConfig controls shell_command.
+type ShellConfig struct {
+	Enabled bool
+	// Sandbox is "none" (or "") or "bwrap". With bwrap every command runs in
+	// a bubblewrap jail: the whole filesystem read-only, a private /tmp, its
+	// own PID/IPC/UTS/user namespaces and — unless SandboxNetwork — no
+	// network at all. The blocklist below is no boundary; this is.
+	Sandbox        string
+	SandboxNetwork bool
+	// SandboxWritable, when set, is bind-mounted read-write at the same path
+	// and becomes the working directory (the default is the private /tmp).
+	SandboxWritable string
+}
+
+// bwrapPath is the sandbox binary, resolved at call time (a seam for tests).
+var bwrapPath = func() (string, error) { return exec.LookPath("bwrap") }
+
+// shellCmd builds the process for command under cfg's sandbox.
+func shellCmd(ctx context.Context, cfg ShellConfig, command string) (*exec.Cmd, error) {
+	switch strings.ToLower(cfg.Sandbox) {
+	case "", "none", "off":
+		return exec.CommandContext(ctx, "sh", "-c", command), nil
+	case "bwrap", "bubblewrap":
+		bin, err := bwrapPath()
+		if err != nil {
+			// Fail closed: the operator asked for a sandbox.
+			return nil, fmt.Errorf("SKILL_SHELL_SANDBOX=bwrap but bwrap is not installed: %w", err)
+		}
+		a := []string{
+			"--ro-bind", "/", "/",
+			"--dev", "/dev",
+			"--proc", "/proc",
+			"--tmpfs", "/tmp",
+			"--unshare-all",
+			"--die-with-parent",
+			"--new-session",
+		}
+		if cfg.SandboxNetwork {
+			a = append(a, "--share-net")
+		}
+		if cfg.SandboxWritable != "" {
+			a = append(a, "--bind", cfg.SandboxWritable, cfg.SandboxWritable, "--chdir", cfg.SandboxWritable)
+		} else {
+			a = append(a, "--chdir", "/tmp")
+		}
+		a = append(a, "sh", "-c", command)
+		return exec.CommandContext(ctx, bin, a...), nil
+	default:
+		return nil, fmt.Errorf("unknown SKILL_SHELL_SANDBOX %q (use none or bwrap)", cfg.Sandbox)
+	}
+}
+
+// ShellCommandWith is shell_command under cfg.
+func ShellCommandWith(cfg ShellConfig) ContextExecutor {
+	enabled := cfg.Enabled
+	return func(ctx context.Context, args map[string]any) (any, error) {
 		if !enabled {
 			return map[string]any{"error": "shell_command is disabled (set SKILL_SHELL_ENABLED=true to enable)"}, nil
 		}
@@ -50,9 +118,12 @@ func ShellCommand(enabled bool) Executor {
 			}
 		}
 		timeout := clampCommandTimeout(floatOr(args, "timeout", 30))
-		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout*float64(time.Second)))
+		ctx, cancel := context.WithTimeout(ctx, time.Duration(timeout*float64(time.Second)))
 		defer cancel()
-		cmd := exec.CommandContext(ctx, "sh", "-c", command)
+		cmd, err := shellCmd(ctx, cfg, command)
+		if err != nil {
+			return map[string]any{"error": err.Error()}, nil
+		}
 		killProcessGroupOnCancel(cmd)
 		// Bound how long Wait lingers on pipes a stray grandchild still holds
 		// open after the kill.
@@ -61,7 +132,7 @@ func ShellCommand(enabled bool) Executor {
 		stderr := &cappedBuffer{limit: maxCommandOutput}
 		cmd.Stdout = stdout
 		cmd.Stderr = stderr
-		err := cmd.Run()
+		err = cmd.Run()
 		exitCode := 0
 		if err != nil {
 			var ee *exec.ExitError
@@ -71,10 +142,15 @@ func ShellCommand(enabled bool) Executor {
 				exitCode = -1
 			}
 		}
+		sandbox := strings.ToLower(cfg.Sandbox)
+		if sandbox == "" || sandbox == "off" {
+			sandbox = "none"
+		}
 		out := map[string]any{
 			"exit_code": exitCode,
 			"stdout":    stdout.String(),
 			"stderr":    stderr.String(),
+			"sandbox":   sandbox,
 		}
 		if stdout.truncated || stderr.truncated {
 			out["stdout_truncated"] = stdout.truncated
@@ -104,10 +180,77 @@ type SSHConfig struct {
 	PrivKey     string // PEM or base64-encoded PEM
 	DefaultUser string
 	IdentFile   string
+	// KnownHosts is the known_hosts file host keys are checked against.
+	KnownHosts string
+	// HostKeyPolicy is "accept-new" (default: trust a host's key the first
+	// time and record it; refuse a changed key), "strict" (only hosts
+	// already in KnownHosts) or "insecure" (no checking — the old behaviour,
+	// which let anyone on the path impersonate the host and read the
+	// command and the credentials it carries).
+	HostKeyPolicy string
 }
 
+// knownHostsMu serialises appends to a known_hosts file.
+var knownHostsMu sync.Mutex
+
+// hostKeyCallback builds the HostKeyCallback for cfg's policy.
+func hostKeyCallback(cfg SSHConfig) (ssh.HostKeyCallback, error) {
+	policy := strings.ToLower(strings.TrimSpace(cfg.HostKeyPolicy))
+	switch policy {
+	case "insecure", "off", "none":
+		return ssh.InsecureIgnoreHostKey(), nil //nolint:gosec
+	case "", "accept-new", "tofu", "strict":
+	default:
+		return nil, fmt.Errorf("unknown SKILL_SSH_HOST_KEY_POLICY %q (use accept-new, strict or insecure)", cfg.HostKeyPolicy)
+	}
+	if cfg.KnownHosts == "" {
+		return nil, errors.New("no known_hosts file configured (SKILL_SSH_KNOWN_HOSTS)")
+	}
+	if policy != "strict" {
+		if err := os.MkdirAll(filepath.Dir(cfg.KnownHosts), 0o700); err != nil {
+			return nil, err
+		}
+		f, err := os.OpenFile(cfg.KnownHosts, os.O_CREATE|os.O_RDONLY, 0o600)
+		if err != nil {
+			return nil, err
+		}
+		_ = f.Close()
+	}
+	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+		knownHostsMu.Lock()
+		defer knownHostsMu.Unlock()
+		check, err := knownhosts.New(cfg.KnownHosts)
+		if err != nil {
+			return fmt.Errorf("read known_hosts: %w", err)
+		}
+		err = check(hostname, remote, key)
+		var ke *knownhosts.KeyError
+		if err == nil || !errors.As(err, &ke) {
+			return err
+		}
+		if len(ke.Want) > 0 {
+			return fmt.Errorf("host key for %s does not match %s — refusing to connect (possible man-in-the-middle; remove the old entry if the key really changed)", hostname, cfg.KnownHosts)
+		}
+		if policy == "strict" {
+			return fmt.Errorf("host %s is not in %s (SKILL_SSH_HOST_KEY_POLICY=strict)", hostname, cfg.KnownHosts)
+		}
+		f, err := os.OpenFile(cfg.KnownHosts, os.O_APPEND|os.O_WRONLY, 0o600)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		_, err = fmt.Fprintln(f, knownhosts.Line([]string{knownhosts.Normalize(hostname)}, key))
+		return err
+	}, nil
+}
+
+// SshCommand is SshCommandContext without cancellation.
 func SshCommand(cfg SSHConfig) Executor {
-	return func(args map[string]any) (any, error) {
+	return withoutContext(SshCommandContext(cfg))
+}
+
+func SshCommandContext(cfg SSHConfig) ContextExecutor {
+	return func(ctx context.Context, args map[string]any) (any, error) {
 		if !cfg.Enabled {
 			return map[string]any{"error": "ssh_command is disabled (set SKILL_SSH_ENABLED=true to enable)"}, nil
 		}
@@ -139,15 +282,19 @@ func SshCommand(cfg SSHConfig) Executor {
 			authMethods = append(authMethods, ssh.PublicKeys(signer))
 		}
 
+		hostKeys, err := hostKeyCallback(cfg)
+		if err != nil {
+			return map[string]any{"host": host, "command": command, "error": err.Error()}, nil
+		}
 		clientCfg := &ssh.ClientConfig{
 			User:            user,
 			Auth:            authMethods,
-			HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec
+			HostKeyCallback: hostKeys,
 			Timeout:         10 * time.Second,
 		}
 		addr := net.JoinHostPort(host, strconv.Itoa(port))
 
-		conn, err := sshDial(addr, clientCfg)
+		conn, err := sshDial(ctx, addr, clientCfg)
 		if err != nil {
 			return map[string]any{"host": host, "command": command, "error": err.Error()}, nil
 		}
@@ -180,6 +327,10 @@ func SshCommand(cfg SSHConfig) Executor {
 					exitCode = -1
 				}
 			}
+		case <-ctx.Done():
+			_ = sess.Signal(ssh.SIGKILL)
+			_ = sess.Close()
+			return nil, ctx.Err()
 		case <-time.After(time.Duration(timeout * float64(time.Second))):
 			// Don't read stdout/stderr here: the Run goroutine may still be
 			// writing to those buffers (bytes.Buffer is not concurrency-safe).
@@ -211,8 +362,8 @@ func SshCommand(cfg SSHConfig) Executor {
 // covers only the TCP connect: a server that accepts and then stalls (or
 // trickles) the version exchange or key exchange held the call forever. The
 // connection also goes through the SSRF guard like every other skill dial.
-func sshDial(addr string, cfg *ssh.ClientConfig) (*ssh.Client, error) {
-	conn, err := netguard.DialTimeout("tcp", addr, cfg.Timeout)
+func sshDial(ctx context.Context, addr string, cfg *ssh.ClientConfig) (*ssh.Client, error) {
+	conn, err := netguard.Dialer(cfg.Timeout).DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, err
 	}
@@ -278,10 +429,37 @@ func (c *cappedBuffer) String() string {
 	return c.buf.String()
 }
 
+// maxKeyFileBytes is far above any real private key (an RSA-16384 PEM is
+// ~13 KB).
+const maxKeyFileBytes = 64 << 10
+
+// readKeyFile reads a model-supplied identity_file. os.ReadFile on
+// /dev/zero grew its buffer until the process ran out of memory, and on a
+// FIFO or /dev/stdin it blocked the call forever, before any timeout applied;
+// only bounded regular files are accepted.
+func readKeyFile(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !st.Mode().IsRegular() {
+		return nil, fmt.Errorf("identity_file %q is not a regular file", path)
+	}
+	if st.Size() > maxKeyFileBytes {
+		return nil, fmt.Errorf("identity_file %q is %d bytes, over the %d-byte limit", path, st.Size(), maxKeyFileBytes)
+	}
+	return io.ReadAll(io.LimitReader(f, maxKeyFileBytes+1))
+}
+
 func loadSigner(identFileArg, privKeyEnv, identFileEnv string) (ssh.Signer, error) {
 	// Priority: arg identity_file > env SKILL_SSH_PRIVATE_KEY > env SKILL_SSH_IDENTITY_FILE
 	if identFileArg != "" {
-		pem, err := os.ReadFile(identFileArg)
+		pem, err := readKeyFile(identFileArg)
 		if err != nil {
 			return nil, err
 		}

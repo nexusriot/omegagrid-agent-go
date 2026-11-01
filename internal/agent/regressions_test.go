@@ -2,8 +2,11 @@ package agent
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/nexusriot/omegagrid-agent-go/internal/skills"
@@ -210,5 +213,145 @@ func TestBatchFollowupReportsDroppedCalls(t *testing.T) {
 	}
 	if strings.Contains(batchFollowup(results, 0), "NOT executed") {
 		t.Fatal("followup must stay quiet when nothing was dropped")
+	}
+}
+
+// One unmatched `{` in the prose before the envelope kept the scan depth above
+// zero to the end of the reply, so the real object was never seen and the user
+// got the "trouble processing" fallback.
+func TestStrayOpenBraceDoesNotHideEnvelope(t *testing.T) {
+	for _, raw := range []string{
+		`Options are {a, b. Final: {"type":"final","answer":"hi"}`,
+		`{ {"type":"final","answer":"hi"}`,
+		`pick {x or "y. {"type":"final","answer":"hi"}`,
+	} {
+		d, err := parseJSONSafely(raw)
+		if err != nil || d["answer"] != "hi" {
+			t.Errorf("parseJSONSafely(%q) = %v, %v; want the envelope", raw, d, err)
+		}
+	}
+	// The restart cap keeps pathological input linear-ish and still returns.
+	if _, err := parseJSONSafely(strings.Repeat("{", 100000)); err == nil {
+		t.Error("100k unmatched braces parsed as an object")
+	}
+}
+
+// password_gen / jwt_inspect results were redacted in the audit log but still
+// went verbatim into the stream's tool_result event and the session history
+// (served by /api/sessions/{sid}/messages and replayed into later turns). A
+// failed jwt_inspect even stored the token itself via the error result's args.
+func TestSecretResultsStayOutOfStreamAndHistory(t *testing.T) {
+	const secret = "hunter2-SECRET"
+	svc := newMinimalService(t, &mockLLM{responses: []string{
+		`{"type":"tool_call","tool":"password_gen","args":{"x":"1"}}`,
+		`{"type":"final","answer":"done"}`,
+	}})
+	rec := &recordingSkill{result: map[string]any{"password": secret}}
+	svc.NativeSkills = map[string]Skill{"password_gen": rec.native("password_gen")}
+
+	out := make(chan Event, 32)
+	go svc.RunStream(context.Background(), RunRequest{Query: "pw", MaxSteps: 3}, out)
+	sid := 0
+	for ev := range out {
+		if strings.Contains(ev.Result, secret) {
+			t.Errorf("stream %s event leaked the password: %q", ev.Event, ev.Result)
+		}
+		if ev.SessionID != 0 {
+			sid = ev.SessionID
+		}
+	}
+	if rec.count() != 1 {
+		t.Fatalf("password_gen ran %d times, want 1", rec.count())
+	}
+	assertHistoryClean(t, svc, sid, secret)
+
+	svc2 := newMinimalService(t, &mockLLM{responses: []string{
+		`{"type":"tool_call","tool":"jwt_inspect","args":{"x":"eyJSECRET"}}`,
+		`{"type":"final","answer":"done"}`,
+	}})
+	failing := &recordingSkill{err: errors.New("boom")}
+	svc2.NativeSkills = map[string]Skill{"jwt_inspect": failing.native("jwt_inspect")}
+	res, err := svc2.Run(RunRequest{Query: "inspect", MaxSteps: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertHistoryClean(t, svc2, res.SessionID, "eyJSECRET")
+}
+
+func assertHistoryClean(t *testing.T, svc *Service, sid int, secret string) {
+	t.Helper()
+	msgs, err := svc.Memory.ListMessages(sid, 100, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawTool bool
+	for _, m := range msgs {
+		if strings.Contains(m.Content, secret) {
+			t.Errorf("history row %q persisted the secret: %q", m.Role, m.Content)
+		}
+		if m.Role == "tool" {
+			sawTool = true
+		}
+	}
+	if !sawTool {
+		t.Errorf("session %d has no tool row; the test is not exercising history", sid)
+	}
+}
+
+// Cancelling the run's context used to stop the loop only between steps; a
+// tool already running (shell, SSH, a scan) ran to completion first. The
+// context now reaches the tool.
+func TestCancellationReachesRunningTool(t *testing.T) {
+	svc := newMinimalService(t, &mockLLM{responses: []string{
+		`{"type":"tool_call","tool":"slow","args":{}}`,
+		`{"type":"final","answer":"never"}`,
+	}})
+	started := make(chan struct{})
+	svc.NativeSkills = map[string]Skill{"slow": {Execute: func(ctx context.Context, _ map[string]any) (any, error) {
+		close(started)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(10 * time.Second):
+			return "finished anyway", nil
+		}
+	}}}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { <-started; cancel() }()
+	t0 := time.Now()
+	_, _ = svc.RunContext(ctx, RunRequest{Query: "x", MaxSteps: 3})
+	if d := time.Since(t0); d > 2*time.Second {
+		t.Fatalf("RunContext returned %v after cancel; the tool never saw it", d)
+	}
+}
+
+// session_search finds what was said in an earlier conversation — never the
+// current one — and returns a snippet around the match.
+func TestSessionSearchTool(t *testing.T) {
+	svc := newMinimalService(t, &mockLLM{responses: []string{
+		`{"type":"final","answer":"noted"}`,
+		`{"type":"tool_call","tool":"session_search","args":{"query":"PARKING bay"}}`,
+		`{"type":"final","answer":"found"}`,
+	}})
+	first, err := svc.Run(RunRequest{Query: "my parking bay is B-17 near the lift", MaxSteps: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := svc.Run(RunRequest{Query: "where is my parking bay?", MaxSteps: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ := svc.Memory.ListMessages(second.SessionID, 50, 0)
+	var tool string
+	for _, m := range msgs {
+		if m.Role == "tool" {
+			tool = m.Content
+		}
+	}
+	if !strings.Contains(tool, "B-17") || !strings.Contains(tool, fmt.Sprintf(`"session_id":%d`, first.SessionID)) {
+		t.Fatalf("session_search result = %s", tool)
+	}
+	if strings.Contains(tool, "where is my parking bay") {
+		t.Fatalf("the current conversation was searched: %s", tool)
 	}
 }

@@ -1,7 +1,9 @@
 package scheduler
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"net/url"
 	"path/filepath"
 	"strings"
@@ -56,7 +58,7 @@ func TestTwoRunnersOnOneDatabaseRunATaskOnce(t *testing.T) {
 	}
 
 	var runs atomic.Int32
-	exec := func(string, map[string]any) (any, error) {
+	exec := func(context.Context, string, map[string]any) (any, error) {
 		runs.Add(1)
 		return "ok", nil
 	}
@@ -83,7 +85,7 @@ func TestLastRunAtIsTheScheduledMinute(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	r := NewRunner(store, func(string, map[string]any) (any, error) { return "ok", nil }, "", time.Minute)
+	r := NewRunner(store, func(context.Context, string, map[string]any) (any, error) { return "ok", nil }, "", time.Minute)
 	before := time.Now().UTC().Truncate(time.Minute)
 	r.tick()
 
@@ -109,7 +111,7 @@ func TestListFailureKeepsMinutesPending(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
-	r := NewRunner(store, func(string, map[string]any) (any, error) { return nil, nil }, "", time.Minute)
+	r := NewRunner(store, func(context.Context, string, map[string]any) (any, error) { return nil, nil }, "", time.Minute)
 	prev := time.Now().UTC().Truncate(time.Minute).Add(-5 * time.Minute)
 	r.lastMinute = prev
 	_ = store.Close() // ListEnabled now fails
@@ -128,7 +130,7 @@ func TestStopIsIdempotentAndBounded(t *testing.T) {
 	release := make(chan struct{})
 	started := make(chan struct{})
 	var once sync.Once
-	r := NewRunner(store, func(string, map[string]any) (any, error) {
+	r := NewRunner(store, func(context.Context, string, map[string]any) (any, error) {
 		once.Do(func() { close(started) })
 		<-release
 		return nil, nil
@@ -163,5 +165,104 @@ func TestRedactTelegramErrDropsToken(t *testing.T) {
 	}
 	if !strings.Contains(got, "dial tcp: timeout") {
 		t.Fatalf("underlying error lost: %q", got)
+	}
+}
+
+// Runner A ran the 12:00 slot; runner B's ticker drifted past 12:00, so B's
+// next tick swept [12:00, now] and matched 12:00. B used to claim `now`
+// instead of the slot that matched, which was newer than A's last_run_at, so
+// it won the claim and ran the slot a second time.
+func TestCatchupClaimsTheMatchedSlot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sched.sqlite3")
+	a, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	now := time.Now().UTC().Truncate(time.Minute)
+	prev := now.Add(-time.Minute)
+	cron := fmt.Sprintf("%d %d %d %d *", prev.Minute(), prev.Hour(), prev.Day(), int(prev.Month()))
+	task, err := a.Create("daily", cron, "noop", nil, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if won, err := a.ClaimRun(task.ID, prev); !won || err != nil {
+		t.Fatalf("A's claim = %v, %v", won, err)
+	}
+
+	var runs atomic.Int32
+	rb := NewRunner(b, func(context.Context, string, map[string]any) (any, error) { runs.Add(1); return "ok", nil }, "", time.Minute)
+	rb.lastMinute = prev.Add(-time.Minute)
+	rb.tick()
+	if n := runs.Load(); n != 0 {
+		t.Fatalf("B re-ran a slot A had already claimed (%d run(s))", n)
+	}
+}
+
+// A one-shot stayed enabled until its run finished, so a process that died
+// mid-run left it armed for the next match.
+func TestClaimDisablesOneShotAtomically(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sched.sqlite3")
+	s, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := s.Create("remind", "0 15 * * *", "noop", nil, nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := time.Date(2026, 10, 30, 15, 0, 0, 0, time.UTC)
+	if won, err := s.ClaimRun(task.ID, m); !won || err != nil {
+		t.Fatalf("ClaimRun = %v, %v", won, err)
+	}
+	// Simulate the crash: the run never finishes, the store is reopened.
+	_ = s.Close()
+	s, err = NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	got, err := s.Get(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Enabled {
+		t.Fatal("one-shot still enabled after its claim")
+	}
+	if won, _ := s.ClaimRun(task.ID, m.Add(24*time.Hour)); won {
+		t.Fatal("one-shot claimed again the next day")
+	}
+
+	// A recurring task stays enabled through its claim.
+	rec, _ := s.Create("daily", "0 15 * * *", "noop", nil, nil, false)
+	_, _ = s.ClaimRun(rec.ID, m)
+	if got, _ := s.Get(rec.ID); !got.Enabled {
+		t.Fatal("recurring task disabled by its claim")
+	}
+}
+
+// Stop cancels the context a running task's skill sees, so a hung skill no
+// longer outlives shutdown.
+func TestStopCancelsRunningTask(t *testing.T) {
+	store := newTestStore(t)
+	if _, err := store.Create("hang", "* * * * *", "slow", nil, nil, false); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	r := NewRunner(store, func(ctx context.Context, _ string, _ map[string]any) (any, error) {
+		close(started)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}, "", time.Hour)
+	r.Start()
+	<-started
+	if !r.StopTimeout(2 * time.Second) {
+		t.Fatal("Stop did not cancel the running task")
 	}
 }

@@ -17,3 +17,15 @@ func killProcessGroupOnCancel(cmd *exec.Cmd) {
 		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	}
 }
+
+// enableBroadcast sets SO_BROADCAST, without which sending to a broadcast
+// address fails with EACCES.
+func enableBroadcast(c syscall.RawConn) error {
+	var serr error
+	if err := c.Control(func(fd uintptr) {
+		serr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_BROADCAST, 1)
+	}); err != nil {
+		return err
+	}
+	return serr
+}

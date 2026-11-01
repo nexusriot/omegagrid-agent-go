@@ -202,6 +202,7 @@ func TestBoolEnv(t *testing.T) {
 	cases := map[string]bool{
 		"true": true, "TRUE": true, "1": true, "yes": true, " true ": true,
 		"false": false, "0": false, "no": false, "FALSE": false,
+		"on": true, " ON ": true, "off": false, "Off": false,
 	}
 	for in, want := range cases {
 		t.Setenv("TEST_BOOL_ENV", in)

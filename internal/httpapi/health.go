@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/nexusriot/omegagrid-agent-go/internal/memory"
+	"github.com/nexusriot/omegagrid-agent-go/internal/version"
 )
 
 // Each /health hit used to make a real embedding call, so a docker
@@ -94,6 +95,7 @@ func (d *Deps) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":             embedOK, // false when vector memory is broken
+		"version":        version.Version,
 		"provider":       d.Cfg.Provider,
 		"chat_base":      d.Chat.BaseURL(),
 		"chat_model":     d.Chat.Model(),

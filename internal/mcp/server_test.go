@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -15,7 +16,7 @@ type fakeProvider struct {
 
 func (f fakeProvider) Tools() []Tool { return f.tools }
 
-func (f fakeProvider) Call(name string, args map[string]any) (any, error) {
+func (f fakeProvider) Call(_ context.Context, name string, args map[string]any) (any, error) {
 	if name == "boom" {
 		return nil, errors.New("kaboom")
 	}
@@ -246,4 +247,38 @@ func TestServerHandler(t *testing.T) {
 			t.Errorf("body = %q, want empty", rec.Body.String())
 		}
 	})
+}
+
+// JSON-RPC 2.0: a request without an "id" member is a notification and gets
+// no response, whatever its method; "id": null is a request. initialize, ping
+// and tools/list notifications used to be answered, and a tools/call with
+// id:null was silently dropped.
+func TestNotificationsAndNullIDs(t *testing.T) {
+	h := newTestServer().Handler()
+	for _, method := range []string{"initialize", "ping", "tools/list", "tools/call", "nope"} {
+		rec := doPost(t, h, `{"jsonrpc":"2.0","method":"`+method+`"}`)
+		if rec.Code != http.StatusAccepted || rec.Body.Len() != 0 {
+			t.Errorf("%s notification: status %d body %q, want 202 and no body", method, rec.Code, rec.Body.String())
+		}
+	}
+	rec := doPost(t, h, `{"jsonrpc":"2.0","id":null,"method":"tools/call","params":{"name":"greet","arguments":{"who":"x"}}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("id:null tools/call: status %d, want a response", rec.Code)
+	}
+	if resp := decodeRPC(t, rec); resp.Error != nil || !strings.Contains(string(resp.Result), "result-of-greet") {
+		t.Fatalf("id:null tools/call = %+v", resp)
+	}
+}
+
+func TestInvalidToolParamsUseSpecCode(t *testing.T) {
+	h := newTestServer().Handler()
+	for _, body := range []string{
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":"oops"}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"arguments":{}}}`,
+	} {
+		resp := decodeRPC(t, doPost(t, h, body))
+		if resp.Error == nil || resp.Error.Code != -32602 {
+			t.Errorf("%s: error = %+v, want code -32602 (invalid params)", body, resp.Error)
+		}
+	}
 }

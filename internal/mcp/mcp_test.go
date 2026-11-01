@@ -147,3 +147,21 @@ func TestResultText(t *testing.T) {
 		})
 	}
 }
+
+// One union-typed property (["string","null"], as Pydantic/Zod emit for an
+// optional field) made the whole schema fail to decode, so the remote tool
+// registered with no parameters and the model never saw required ones.
+func TestParamsFromSchemaUnionTypes(t *testing.T) {
+	got := paramsFromSchema([]byte(`{"properties":{
+		"city":{"type":"string"},
+		"units":{"type":["null","string"],"description":"opt"},
+		"n":{"type":["integer","null"]},
+		"any":{}
+	},"required":["city"]}`))
+	if !got["city"].Required || got["city"].Type != "string" {
+		t.Fatalf("city = %+v, want required string", got["city"])
+	}
+	if got["units"].Type != "string" || got["n"].Type != "integer" || got["any"].Type != "string" {
+		t.Fatalf("types = units:%q n:%q any:%q", got["units"].Type, got["n"].Type, got["any"].Type)
+	}
+}

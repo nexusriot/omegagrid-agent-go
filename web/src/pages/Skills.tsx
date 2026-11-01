@@ -1,8 +1,20 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { Wrench, Search, ChevronDown, ChevronRight, Loader2, FileCode, Play, Copy, Check } from 'lucide-react'
+import { Wrench, Search, ChevronDown, ChevronRight, Loader2, FileCode, Play, Copy, Check, Pencil, Plus } from 'lucide-react'
 import { fetchSkills, invokeSkill } from '../api/client'
 import type { Skill, SkillInvokeResult } from '../api/types'
+import SkillEditor from '../components/SkillEditor'
+
+const KIND_CLS: Record<string, string> = {
+  builtin: 'bg-surface text-gray-500',
+  markdown: 'bg-emerald-950/50 text-emerald-400',
+  remote: 'bg-sky-950/50 text-sky-400',
+}
+
+function KindBadge({ kind }: { kind?: string }) {
+  if (!kind) return null
+  return <span className={`rounded px-1.5 py-0.5 text-[10px] ${KIND_CLS[kind] ?? KIND_CLS.builtin}`}>{kind}</span>
+}
 
 function ParamBadge({ required }: { required?: boolean }) {
   return required
@@ -127,7 +139,7 @@ function ResultPanel({ result }: { result: SkillInvokeResult }) {
   )
 }
 
-function SkillCard({ skill }: { skill: Skill }) {
+function SkillCard({ skill, onEdit }: { skill: Skill; onEdit: (name: string) => void }) {
   const [open, setOpen] = useState(false)
   const [playOpen, setPlayOpen] = useState(false)
   const [formValues, setFormValues] = useState<Record<string, string>>({})
@@ -184,12 +196,25 @@ function SkillCard({ skill }: { skill: Skill }) {
             <Wrench size={14} />
           </div>
           <div className="flex-1 min-w-0">
-            <div className="font-mono text-sm font-semibold text-indigo-300">{skill.name}</div>
+            <div className="flex items-center gap-2">
+              <span className="font-mono text-sm font-semibold text-indigo-300">{skill.name}</span>
+              <KindBadge kind={skill.kind} />
+            </div>
             <div className="truncate text-xs text-gray-500">{skill.description}</div>
           </div>
           <span className="shrink-0 text-[10px] text-gray-600">{params.length} param{params.length !== 1 ? 's' : ''}</span>
           {open ? <ChevronDown size={14} className="shrink-0 text-gray-600" /> : <ChevronRight size={14} className="shrink-0 text-gray-600" />}
         </button>
+
+        {skill.kind === 'markdown' && (
+          <button
+            onClick={() => onEdit(skill.name)}
+            title="Edit skill source"
+            className="shrink-0 ml-2 flex h-7 w-7 items-center justify-center rounded-lg bg-surface text-gray-500 hover:bg-surface-border hover:text-gray-300 transition-colors"
+          >
+            <Pencil size={12} />
+          </button>
+        )}
 
         {/* Run button */}
         <button
@@ -278,6 +303,8 @@ function SkillCard({ skill }: { skill: Skill }) {
 
 export default function Skills() {
   const [search, setSearch] = useState('')
+  // undefined = closed, '' = new skill, otherwise the markdown skill being edited.
+  const [editing, setEditing] = useState<string | undefined>(undefined)
   const { data: skills = [], isLoading, error } = useQuery({
     queryKey: ['skills'],
     queryFn: fetchSkills,
@@ -297,6 +324,12 @@ export default function Skills() {
         {!isLoading && (
           <span className="text-xs text-gray-600">{skills.length} registered</span>
         )}
+        <button
+          onClick={() => setEditing('')}
+          className="flex items-center gap-1.5 rounded-lg bg-accent/20 px-3 py-1.5 text-xs font-medium text-accent hover:bg-accent/30 transition-colors"
+        >
+          <Plus size={12} /> New skill
+        </button>
       </header>
 
       <div className="flex-1 overflow-y-auto p-5">
@@ -323,7 +356,7 @@ export default function Skills() {
         )}
 
         <div className="space-y-2">
-          {filtered.map(s => <SkillCard key={s.name} skill={s} />)}
+          {filtered.map(s => <SkillCard key={s.name} skill={s} onEdit={setEditing} />)}
         </div>
 
         {!isLoading && !error && filtered.length === 0 && (
@@ -337,6 +370,10 @@ export default function Skills() {
           </div>
         )}
       </div>
+
+      {editing !== undefined && (
+        <SkillEditor name={editing || undefined} onClose={() => setEditing(undefined)} />
+      )}
     </div>
   )
 }

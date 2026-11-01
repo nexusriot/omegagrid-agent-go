@@ -7,10 +7,15 @@ import (
 	"image/png"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
+	"github.com/google/uuid"
 	qrcode "github.com/skip2/go-qrcode"
 )
 
@@ -345,5 +350,100 @@ func TestWebScrapeNonPositiveMaxCharsUsesDefault(t *testing.T) {
 		if m["truncated"] != false {
 			t.Fatalf("max_chars=%v: truncated = %v, want false", maxChars, m["truncated"])
 		}
+	}
+}
+
+// cron_schedule must agree with the scheduler's evaluator on N/S steps and on
+// Vixie's "*-prefixed day field is unrestricted" rule.
+func TestCronScheduleStepAndStarDaySemantics(t *testing.T) {
+	res, err := CronSchedule()(map[string]any{"expression": "5/15 * * * *", "count": 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range res.(map[string]any)["next_runs"].([]string) {
+		ts, _ := time.Parse(time.RFC3339, r)
+		if ts.Minute()%15 != 5 {
+			t.Errorf("5/15 next run %s is not at :05/:20/:35/:50", r)
+		}
+	}
+	res, err = CronSchedule()(map[string]any{"expression": "0 0 */2 * 1", "count": 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range res.(map[string]any)["next_runs"].([]string) {
+		ts, _ := time.Parse(time.RFC3339, r)
+		if ts.Weekday() != time.Monday || ts.Day()%2 != 1 {
+			t.Errorf("*/2 dom + Monday next run %s is not an odd-numbered Monday", r)
+		}
+	}
+}
+
+// "80,80,80" listed an open port three times; thousands of repeated
+// "1-65535" parts expanded ~65k ports each before the 1024 cap applied.
+func TestParsePortsDedupesAndCapsWhileExpanding(t *testing.T) {
+	got, err := parsePorts("80,80, 443,80")
+	if err != nil || len(got) != 2 || got[0] != 80 || got[1] != 443 {
+		t.Fatalf("parsePorts dedupe = %v, %v; want [80 443]", got, err)
+	}
+	spec := strings.TrimSuffix(strings.Repeat("1-65535,", 3000), ",")
+	var m0, m1 runtime.MemStats
+	runtime.ReadMemStats(&m0)
+	got, err = parsePorts(spec)
+	runtime.ReadMemStats(&m1)
+	if err != nil || len(got) != maxScanPorts {
+		t.Fatalf("len = %d, %v; want %d", len(got), err, maxScanPorts)
+	}
+	if alloc := m1.TotalAlloc - m0.TotalAlloc; alloc > 16<<20 {
+		t.Fatalf("parsing allocated %d MB", alloc>>20)
+	}
+}
+
+// record_type is an argv entry for dig; "@10.0.0.53" made dig query that
+// server directly, bypassing the private-network guard.
+func TestDNSLookupRejectsUnknownRecordTypes(t *testing.T) {
+	for _, rt := range []string{"@10.0.0.53", "AXFR", "+tcp", "ANY", "-f/etc/passwd"} {
+		m := runExec(t, DnsLookup(), map[string]any{"domain": "example.com", "record_type": rt})
+		if msg, _ := m["error"].(string); !strings.Contains(msg, "unsupported record type") {
+			t.Errorf("record_type %q: got %v, want an unsupported-type error", rt, m)
+		}
+	}
+}
+
+// Unsupported versions returned v4 UUIDs labelled with the requested version.
+func TestUUIDGenVersions(t *testing.T) {
+	for _, v := range []int{2, 6, 8, 0} {
+		m := runExec(t, UuidGen(), map[string]any{"version": v})
+		if _, ok := m["error"]; !ok {
+			t.Errorf("version %d: got %v, want an error", v, m)
+		}
+	}
+	m := runExec(t, UuidGen(), map[string]any{"version": 7})
+	u, err := uuid.Parse(m["uuids"].([]string)[0])
+	if err != nil || u.Version() != 7 {
+		t.Fatalf("v7 = %v (%v), version %d", m, err, u.Version())
+	}
+}
+
+func TestPingCheckValidatesPort(t *testing.T) {
+	for _, p := range []int{0, 70000, -1} {
+		m := runExec(t, PingCheck(), map[string]any{"host": "127.0.0.1", "port": p})
+		if msg, _ := m["error"].(string); !strings.Contains(msg, "outside 1-65535") {
+			t.Errorf("port %d: got %v", p, m)
+		}
+	}
+}
+
+// identity_file comes from the model: /dev/zero used to be read until the
+// process ran out of memory, and a FIFO blocked forever.
+func TestReadKeyFileRejectsNonRegularAndHuge(t *testing.T) {
+	if _, err := readKeyFile("/dev/zero"); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("/dev/zero: err = %v", err)
+	}
+	big := filepath.Join(t.TempDir(), "big")
+	if err := os.WriteFile(big, make([]byte, maxKeyFileBytes+1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readKeyFile(big); err == nil || !strings.Contains(err.Error(), "limit") {
+		t.Fatalf("oversized key: err = %v", err)
 	}
 }

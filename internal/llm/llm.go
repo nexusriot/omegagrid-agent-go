@@ -8,10 +8,16 @@ package llm
 
 import "context"
 
-// Message is a single chat turn.
+// Message is a single chat turn. ToolCalls (on an assistant turn) and
+// ToolCallID / Name (on a role="tool" turn) are set only in native
+// tool-calling mode; they are not part of the plain JSON form, and each
+// client renders them in its own provider's wire shape.
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role       string     `json:"role"`
+	Content    string     `json:"content"`
+	ToolCalls  []ToolCall `json:"-"`
+	ToolCallID string     `json:"-"`
+	Name       string     `json:"-"`
 }
 
 // ChatClient is implemented by every LLM backend.

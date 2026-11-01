@@ -75,6 +75,9 @@ BOT_ADMIN_ID=0            # your numeric Telegram user ID
 
 # --- Optional: API token (set it if the gateway is reachable beyond loopback) ---
 # GATEWAY_API_TOKEN=
+# Without a token the gateway only answers to IPs and localhost-style names;
+# list any DNS name you open the UI by (e.g. http://box.lan/):
+# GATEWAY_ALLOWED_HOSTS=box.lan
 
 # --- Optional: ports ---
 FRONTEND_PORT=80
@@ -145,7 +148,7 @@ docker compose logs -f gateway
 ## 5. Verify
 
 ```bash
-# Health endpoint — should return {"ok":true, ...}
+# Health endpoint — should return {"ok":true,"version":"0.6.0", ...}
 curl -s http://localhost:8000/health | jq .
 
 # Web UI (chat, memory, skills, scheduler, activity, health)
@@ -194,6 +197,7 @@ export OMEGA_REMOTE=http://localhost:8000
 # export GATEWAY_API_TOKEN=...   # only if the gateway has one set
 ./bin/omega skills list
 ./bin/omega ask "hello"
+./bin/omega skills run weather --arg city=Berlin   # flags may follow the name
 ```
 
 ---
@@ -209,7 +213,10 @@ export OMEGA_REMOTE=http://localhost:8000
 | Bot replies "Access denied" | Auth is on (the default) and your user ID isn't allowlisted | Set the correct `BOT_ADMIN_ID`, or have the admin run `/auth_add <telegram_id>` (`/auth_list` shows the allowlist) |
 | `telegram-bot` keeps restarting | `TELEGRAM_BOT_TOKEN` unset, or auth on without `BOT_ADMIN_ID` | Set them in `.env`, or run `docker compose up -d gateway frontend` |
 | UI asks for an API token / `401 missing or invalid API token` | `GATEWAY_API_TOKEN` is set | Enter the token in the UI prompt (stored in browser `localStorage`); send `Authorization: Bearer <token>` from curl |
-| Every answer is *"I had trouble processing that request. Please try rephrasing."* | Local model too small to emit the clean JSON envelope the agent requires (the reply is reported as `meta.fallback: true`) | Switch to a stronger model (`llama3:70b`, `gpt-4o-mini`, `Llama-3.3-70B-Instruct`) |
+| `403 untrusted Host header` when opening the UI by name (`http://box.lan/`) | No `GATEWAY_API_TOKEN`, so the DNS-rebinding guard only accepts IPs and `localhost`-style hosts | Add the name to `GATEWAY_ALLOWED_HOSTS` in `.env` (or set a token), then `docker compose up -d --force-recreate gateway` |
+| Every answer is *"I had trouble processing that request. Please try rephrasing."* | The model has no native tool calling (the gateway logs "rejected native tools … using the JSON envelope") and is too small to write the JSON envelope cleanly (`meta.fallback: true`, `meta.tool_mode: envelope`) | Use a tool-capable model (`llama3.1`, `qwen2.5`, `gpt-4o-mini`, `Llama-3.3-70B-Instruct`), or a stronger one |
+| `ssh_command`: "host key … does not match" | The host's key changed since it was first recorded in `data/ssh_known_hosts` | If the change is expected, delete that host's line from `data/ssh_known_hosts` |
+| A remote MCP tool is missing right after start | That server had not answered within `MCP_CONNECT_WAIT_SEC` | Nothing to do — it keeps connecting in the background and registers its tools when it answers (`docker compose logs gateway` shows the retries) |
 | Port 80 already in use | Another service occupies the port | Set `FRONTEND_PORT=8080` in `.env`, then `docker compose up -d --force-recreate frontend` |
 | `DIGITALOCEAN_API_KEY is required for digitalocean provider` on startup | `LLM_PROVIDER=digitalocean` without a key | Add `DIGITALOCEAN_API_KEY=...` to `.env` |
 | `OPENCODE_API_KEY is required for opencode providers` on startup | `LLM_PROVIDER=opencode*` without a key | Add `OPENCODE_API_KEY=...` (or `OPENCODE_GO_API_KEY` / `OPENCODE_ZEN_API_KEY`) to `.env` |
@@ -230,6 +237,10 @@ docker compose down
 
 # Back up state
 tar czf "backup-$(date +%F).tgz" data/
+
+# Or just the memories, portable across embeddings models
+curl -s localhost:8000/api/memory/export > memories.jsonl
+curl -s -X POST --data-binary @memories.jsonl localhost:8000/api/memory/import
 
 # Restore from a backup
 tar xzf backup-YYYY-MM-DD.tgz

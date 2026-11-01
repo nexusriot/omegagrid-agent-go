@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -373,7 +374,7 @@ func (stubProvider) Tools() []mcp.Tool {
 	}}}
 }
 
-func (stubProvider) Call(name string, args map[string]any) (any, error) {
+func (stubProvider) Call(_ context.Context, name string, args map[string]any) (any, error) {
 	return map[string]any{"echoed": args["text"], "tool": name}, nil
 }
 
@@ -480,7 +481,7 @@ func TestQueryStreamSurvivesToolPanic(t *testing.T) {
 	}}
 	d := withAgent(newTestDeps(t), chat)
 	d.Agent.NativeSkills = map[string]agent.Skill{
-		"boom": {Execute: func(map[string]any) (any, error) { panic("stream boom") }},
+		"boom": {Execute: func(context.Context, map[string]any) (any, error) { panic("stream boom") }},
 	}
 	h := NewRouter(d)
 

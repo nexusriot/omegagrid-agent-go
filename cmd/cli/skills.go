@@ -29,7 +29,7 @@ func runSkills(args []string) {
 func skillsList(args []string) {
 	fs := flag.NewFlagSet("skills list", flag.ExitOnError)
 	jsonOut := fs.Bool("json", false, "JSON output")
-	fs.Parse(args)
+	parseArgs(fs, args)
 
 	list, err := listSkills()
 	if err != nil {
@@ -59,9 +59,9 @@ func skillsList(args []string) {
 func skillsDescribe(args []string) {
 	fs := flag.NewFlagSet("skills describe", flag.ExitOnError)
 	jsonOut := fs.Bool("json", false, "JSON output")
-	fs.Parse(args)
+	pos := parseArgs(fs, args)
 
-	name := fs.Arg(0)
+	name := argAt(pos, 0)
 	if name == "" {
 		fatalf("skills describe: skill name required")
 	}
@@ -91,16 +91,17 @@ func skillsDescribe(args []string) {
 
 func skillsRun(args []string) {
 	fs := flag.NewFlagSet("skills run", flag.ExitOnError)
-	jsonOut := fs.Bool("json", false, "JSON output")
+	// Results are always printed as JSON; the flag stays for compatibility.
+	fs.Bool("json", false, "JSON output (the default for skills run)")
 	var argPairs multiFlag
 	fs.Var(&argPairs, "arg", "Argument in key=value form (repeatable)")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "Usage: omega skills run NAME [--arg key=value ...] [--json]")
 		fs.PrintDefaults()
 	}
-	fs.Parse(args)
+	pos := parseArgs(fs, args)
 
-	name := fs.Arg(0)
+	name := argAt(pos, 0)
 	if name == "" {
 		fs.Usage()
 		os.Exit(1)
@@ -114,16 +115,7 @@ func skillsRun(args []string) {
 	if err != nil {
 		fatalf("skills run: %v", err)
 	}
-	if *jsonOut {
-		printJSON(result)
-		return
-	}
-	// Pretty-print the result field if present, else the whole map.
-	if r, ok := result["result"]; ok {
-		printJSON(r)
-	} else {
-		printJSON(result)
-	}
+	printJSON(result)
 }
 
 // multiFlag is a flag.Value that accumulates repeated --arg values.

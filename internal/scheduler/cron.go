@@ -19,13 +19,16 @@ var cronWeekdayNames = map[string]int{
 // Matches checks whether a 5-field cron expression fires at dt.
 //
 // Fields: minute hour day-of-month month day-of-week
-// Each field supports:  *, */N, single value, lo-hi range, comma-separated lists.
+// Each field supports:  *, */N, single value, lo-hi range, lo-hi/N, N/S (= N-max/S
+// as in Vixie cron and croniter), comma-separated lists.
 // Month and weekday also accept three-letter names (jan..dec, sun..sat).
 // Day-of-week uses 0=Sunday..6=Saturday; 7 is additionally accepted as Sunday.
 //
 // Day-of-month and day-of-week follow standard (Vixie) cron semantics: when
-// BOTH are restricted (neither is "*"), the expression fires if EITHER matches;
-// when only one is restricted, only that one applies.
+// BOTH are restricted, the expression fires if EITHER matches; when only one
+// is restricted, only that one applies. As in Vixie, a field counts as
+// unrestricted when it starts with "*" — so "*/2" is unrestricted and
+// "0 0 */2 * 1" means odd days that are also Mondays.
 //
 // Returns false on malformed expressions rather than erroring — this prevents
 // bad input from killing scheduler ticks.
@@ -44,8 +47,8 @@ func Matches(cronExpr string, dt time.Time) bool {
 		return false
 	}
 
-	domRestricted := strings.TrimSpace(parts[2]) != "*"
-	dowRestricted := strings.TrimSpace(parts[4]) != "*"
+	domRestricted := !strings.HasPrefix(parts[2], "*")
+	dowRestricted := !strings.HasPrefix(parts[4], "*")
 	domMatch := fieldMatches(parts[2], dt.Day(), 1, nil)
 	dowMatch := weekdayMatches(parts[4], int(dt.Weekday()))
 
@@ -93,7 +96,27 @@ func ValidateCron(cronExpr string) error {
 			return err
 		}
 	}
-	return nil
+	if !strings.HasPrefix(parts[4], "*") || strings.HasPrefix(parts[2], "*") {
+		return nil
+	}
+	// Day-of-month alone selects the day: reject combinations no calendar has
+	// (Feb 30, Apr 31). They validated fine and then silently never fired.
+	for m := 1; m <= 12; m++ {
+		if !fieldMatches(parts[3], m, 1, cronMonthNames) {
+			continue
+		}
+		for d := 1; d <= daysIn(time.Month(m)); d++ {
+			if fieldMatches(parts[2], d, 1, nil) {
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("day-of-month %q never occurs in month %q", parts[2], parts[3])
+}
+
+// daysIn is the longest a month can be (February counts its leap day).
+func daysIn(m time.Month) int {
+	return time.Date(2024, m+1, 0, 0, 0, 0, 0, time.UTC).Day()
 }
 
 func validateField(field string, lo, hi int, name string, names map[string]int) error {
@@ -177,7 +200,9 @@ func fieldMatches(field string, value, lo int, names map[string]int) bool {
 			if err != nil {
 				continue
 			}
-			if n == value {
+			// "N/S" means N through the field's maximum in steps of S; value
+			// never exceeds that maximum, so no upper bound is needed.
+			if n == value || (step > 1 && value >= n && (value-n)%step == 0) {
 				return true
 			}
 		}

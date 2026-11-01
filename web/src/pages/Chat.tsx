@@ -84,10 +84,15 @@ export default function Chat() {
           case 'tool_call':   addToolCall(ev.data);        break
           case 'tool_result': addToolResult(ev.data);      break
           case 'final':       setFinal(ev.data);           break
-          case 'error':
-            setStreamError(ev.data.message)
-            toast.error(ev.data.message)
+          case 'error': {
+            // Reading only .message made every gateway error undefined: the
+            // error box stayed hidden and the sent question just vanished.
+            const msg = ev.data.error ?? ev.data.message ?? 'Request failed'
+            setStreamError(msg)
+            toast.error(msg)
+            setInput((cur) => cur || q) // give the question back for a resend
             break
+          }
         }
       },
       () => {

@@ -25,14 +25,14 @@ export function streamQuery(
       })
 
       if (res.status === 401) {
-        promptForToken()
-        onEvent({ event: 'error', data: { message: 'API token required — saved, please resend.' } })
-        onDone()
+        const saved = promptForToken()
+        onEvent({ event: 'error', data: { message: saved
+          ? 'API token saved — please resend.'
+          : 'API token required — please enter a token and resend.' } })
         return
       }
       if (!res.ok || !res.body) {
         onEvent({ event: 'error', data: { message: `HTTP ${res.status}` } })
-        onDone()
         return
       }
 

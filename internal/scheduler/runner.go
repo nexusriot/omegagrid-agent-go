@@ -143,6 +143,11 @@ func (r *Runner) tick() {
 	}
 	r.lastMinute = now
 	for _, task := range tasks {
+		// Do not consume a queued one-shot after shutdown cancelled the
+		// preceding task. Leave its claim for the next process.
+		if r.ctx.Err() != nil {
+			return
+		}
 		// A task matching several of the swept minutes still runs once: the
 		// sweep exists to not lose a run, not to replay a backlog.
 		slot, ok := latestMatchIn(task.CronExpr, minutes, task.Location())
@@ -176,6 +181,9 @@ func (r *Runner) runDueRetries(now time.Time) {
 		return
 	}
 	for _, t := range due {
+		if r.ctx.Err() != nil {
+			return
+		}
 		if won, err := r.store.ClaimRetry(t.ID, *t.NextRetryAt); err != nil || !won {
 			continue
 		}

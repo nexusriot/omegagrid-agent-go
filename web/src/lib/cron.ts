@@ -114,7 +114,7 @@ function cronFieldMatches(field: string, value: number, lo: number): boolean {
     }
     const n = cronAtoi(base)
     if (isNaN(n)) continue
-    if (n === value || (step > 1 && value >= n && (value - n) % step === 0)) return true
+    if (n === value || (slashIdx >= 0 && value >= n && (value - n) % step === 0)) return true
   }
   return false
 }

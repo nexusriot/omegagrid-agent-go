@@ -172,6 +172,7 @@ func fieldMatches(field string, value, lo int, names map[string]int) bool {
 	for _, part := range strings.Split(field, ",") {
 		part = strings.TrimSpace(part)
 		step := 1
+		hasStep := strings.Contains(part, "/")
 		if i := strings.Index(part, "/"); i >= 0 {
 			s, err := strconv.Atoi(part[i+1:])
 			if err != nil || s <= 0 {
@@ -202,7 +203,7 @@ func fieldMatches(field string, value, lo int, names map[string]int) bool {
 			}
 			// "N/S" means N through the field's maximum in steps of S; value
 			// never exceeds that maximum, so no upper bound is needed.
-			if n == value || (step > 1 && value >= n && (value-n)%step == 0) {
+			if n == value || (hasStep && value >= n && (value-n)%step == 0) {
 				return true
 			}
 		}

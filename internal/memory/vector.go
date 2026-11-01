@@ -158,7 +158,11 @@ func (v *vectorStore) rebuildIndexLocked() error {
 	if err != nil {
 		return err
 	}
+	now := time.Now()
 	for _, d := range docs {
+		if expired(d.Metadata, now) {
+			continue
+		}
 		h := d.Metadata["hash"]
 		if h == "" {
 			h = hashKey(d.Metadata["namespace"], d.Content)
@@ -219,7 +223,7 @@ func (v *vectorStore) add(text string, meta map[string]any, memoryID string, emb
 	}
 
 	// exact hash dedup (in-memory, rebuilt from disk)
-	if existing, ok := v.hashes[h]; ok {
+	if existing, ok := v.liveHashLocked(h); ok {
 		return &AddResult{MemoryID: existing, Skipped: true, Reason: "exact_hash_duplicate"}, nil
 	}
 
@@ -233,7 +237,7 @@ func (v *vectorStore) add(text string, meta map[string]any, memoryID string, emb
 	v.noteDimLocked(len(emb))
 
 	// semantic NN dedup, within the namespace (a no-op on an empty one)
-	if hits, err := v.queryClampedWhere(emb, 1, map[string]string{"namespace": ns}); err == nil && len(hits) > 0 {
+	if hits, err := v.queryLiveWhere(emb, 1, map[string]string{"namespace": ns}); err == nil && len(hits) > 0 {
 		dist := float32(1.0 - hits[0].Similarity)
 		if dist <= v.dedupDist {
 			return &AddResult{MemoryID: hits[0].ID, Skipped: true, Reason: "semantic_duplicate"}, nil
@@ -251,6 +255,9 @@ func (v *vectorStore) add(text string, meta map[string]any, memoryID string, emb
 		sm["created_at"] = strconv.FormatFloat(float64(time.Now().UnixMilli())/1000.0, 'f', 3, 64)
 	}
 
+	// AddDocument is an upsert. Keep the dedup index consistent when an
+	// explicit ID replaces different content or moves namespaces.
+	old, _ := v.col.GetByID(context.Background(), memoryID)
 	err := v.col.AddDocument(context.Background(), chromem.Document{
 		ID:        memoryID,
 		Metadata:  sm,
@@ -259,6 +266,12 @@ func (v *vectorStore) add(text string, meta map[string]any, memoryID string, emb
 	})
 	if err != nil {
 		return nil, fmt.Errorf("chromem add: %w", err)
+	}
+	if old.ID != "" {
+		oldHash := hashKey(old.Metadata["namespace"], old.Content)
+		if oldHash != h && v.hashes[oldHash] == memoryID {
+			delete(v.hashes, oldHash)
+		}
 	}
 	v.hashes[h] = memoryID
 	return &AddResult{MemoryID: memoryID, Skipped: false}, nil
@@ -287,14 +300,14 @@ func (v *vectorStore) searchIn(query string, k int, namespaces []string) (*Searc
 	}
 
 	// chromem's where filter is an exact-match AND, so a union of
-	// namespaces is one query per namespace, merged by similarity. Twice k
-	// leaves room for expired documents the janitor has not removed yet.
+	// namespaces is one query per namespace, merged by similarity. Queries
+	// expand past expired documents until enough live results are found.
 	var docs []chromem.Result
 	if namespaces == nil {
-		docs, err = v.queryClamped(emb, 2*k)
+		docs, err = v.queryLiveWhere(emb, k, nil)
 	} else {
 		for _, ns := range uniqueStrings(namespaces) {
-			part, qerr := v.queryClampedWhere(emb, 2*k, map[string]string{"namespace": ns})
+			part, qerr := v.queryLiveWhere(emb, k, map[string]string{"namespace": ns})
 			if qerr != nil {
 				return nil, fmt.Errorf("chromem query: %w", qerr)
 			}
@@ -307,7 +320,7 @@ func (v *vectorStore) searchIn(query string, k int, namespaces []string) (*Searc
 	}
 
 	now := time.Now()
-	hits := make([]MemoryHit, 0, k)
+	hits := make([]MemoryHit, 0, min(k, len(docs)))
 	for _, d := range docs {
 		if len(hits) == k {
 			break
@@ -373,6 +386,51 @@ func (v *vectorStore) queryClampedWhere(emb []float32, k int, where map[string]s
 		k = count
 	}
 	return v.col.QueryEmbedding(context.Background(), emb, k, where, nil)
+}
+
+// queryLiveWhere widens the nearest-neighbour window when expired documents
+// occupy the top results. A fixed overfetch can hide every live memory.
+func (v *vectorStore) queryLiveWhere(emb []float32, k int, where map[string]string) ([]chromem.Result, error) {
+	count := v.col.Count()
+	if count == 0 {
+		return nil, nil
+	}
+	limit := min(k, count)
+	now := time.Now()
+	for {
+		docs, err := v.queryClampedWhere(emb, limit, where)
+		if err != nil {
+			return nil, err
+		}
+		live := make([]chromem.Result, 0, min(k, len(docs)))
+		for _, d := range docs {
+			if !expired(d.Metadata, now) {
+				live = append(live, d)
+				if len(live) == k {
+					return live, nil
+				}
+			}
+		}
+		if len(docs) < limit || limit >= count {
+			return live, nil
+		}
+		limit += min(limit, count-limit)
+	}
+}
+
+// liveHashLocked ignores expired entries even before the janitor removes
+// them. The caller holds mu, as with all dedup index updates.
+func (v *vectorStore) liveHashLocked(h string) (string, bool) {
+	id, ok := v.hashes[h]
+	if !ok {
+		return "", false
+	}
+	doc, err := v.col.GetByID(context.Background(), id)
+	if err != nil || expired(doc.Metadata, time.Now()) {
+		delete(v.hashes, h)
+		return "", false
+	}
+	return id, true
 }
 
 // ListFilter narrows listAll. Namespace nil means every namespace.
@@ -520,7 +578,7 @@ func (v *vectorStore) update(id string, text *string, meta map[string]any) (*Mem
 		delete(sm, "namespace")
 	}
 	h := hashKey(sm["namespace"], newText)
-	if other, ok := v.hashes[h]; ok && other != id {
+	if other, ok := v.liveHashLocked(h); ok && other != id {
 		return nil, fmt.Errorf("an identical memory already exists: %s", other)
 	}
 	emb := doc.Embedding

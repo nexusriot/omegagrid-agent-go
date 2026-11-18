@@ -146,3 +146,16 @@ func TestSkillSchemaFromMap(t *testing.T) {
 		})
 	}
 }
+
+func TestApprovalRulesFromEnv(t *testing.T) {
+	if r := approvalRules(""); r != nil {
+		t.Fatalf("empty spec: %v", r)
+	}
+	if r := approvalRules("shell_command: command=uptime; ssh_command: host=a && command=df"); len(r) != 2 {
+		t.Fatalf("rules %v", r)
+	}
+	// One bad rule drops the whole set: the gate then asks, the safe side.
+	if r := approvalRules("shell_command: command=uptime; broken"); r != nil {
+		t.Fatalf("bad set kept: %v", r)
+	}
+}

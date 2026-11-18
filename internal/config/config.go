@@ -109,6 +109,26 @@ type Config struct {
 	// metadata addresses are refused regardless.
 	SkillBlockPrivateNetworks bool
 
+	// Stateful / account-backed skills
+	SkillStateDB        string   // SKILL_STATE_DB: uptime_check history, todo
+	SkillSSLLabsEmail   string   // SKILL_SSLLABS_EMAIL: switches ssl_labs_grade to the v4 API
+	SkillCalendars      []string // SKILL_CALENDARS: "name=https://….ics,…"
+	SkillIMAPHost       string
+	SkillIMAPPort       int
+	SkillIMAPUser       string
+	SkillIMAPPassword   string
+	SkillIMAPInsecure   bool
+	SkillSQLDatabases   []string // SKILL_SQL_DATABASES: "name=postgres://…,name2=sqlite:/path"
+	SkillExamplesSeeded bool     // SKILLS_INSTALL_EXAMPLES (default true)
+	SkillPrometheus     []string // SKILL_PROMETHEUS: "name=http://prometheus:9090,…"
+	SkillPrometheusTok  string   // SKILL_PROMETHEUS_TOKEN: bearer token for every server
+	// SKILL_OPENAPI: "name=https://…/openapi.json,name2=specs/api.yaml"; per
+	// API, SKILL_OPENAPI_<NAME>_AUTH ("Bearer x" or "Header: value") and
+	// SKILL_OPENAPI_<NAME>_BASE_URL (overrides the spec's server).
+	SkillOpenAPI        []string
+	SkillOpenAPIAuth    map[string]string
+	SkillOpenAPIBaseURL map[string]string
+
 	// Agent loop
 	ContextTail        int
 	MemoryHits         int
@@ -116,6 +136,20 @@ type Config struct {
 	AgentParallelTools bool
 	AgentMaxParallel   int
 	AgentToolMode      string // auto | native | envelope
+
+	// Tool retrieval (AGENT_TOOL_TOP_K, AGENT_TOOLS_PINNED)
+	AgentToolTopK    int
+	AgentToolsPinned []string // nil = agent.DefaultPinnedTools
+
+	// Approval gate (APPROVAL_SKILLS, APPROVAL_TIMEOUT_SEC, APPROVAL_UNATTENDED)
+	ApprovalSkills     []string // nil = skills.DefaultApprovalSkills; ["off"] disables
+	ApprovalTimeoutSec float64
+	ApprovalUnattended string // deny | allow
+	// ApprovalAllow pre-approves matching calls: "TOOL: ARG=REGEX [&& ...]",
+	// rules separated by ";" (APPROVAL_ALLOW).
+	ApprovalAllow string
+	// ApprovalGrantTTLHours bounds "approve for this session" (default 12).
+	ApprovalGrantTTLHours float64
 
 	// Auto-memory extraction (post-turn fact distillation into vector memory)
 	AutoMemoryExtract      bool
@@ -192,6 +226,25 @@ func Load() Config {
 		AgentParallelTools:        isTruthy(os.Getenv("AGENT_PARALLEL_TOOLS")),
 		AgentMaxParallel:          atoiOr(os.Getenv("AGENT_MAX_PARALLEL"), 4),
 		AgentToolMode:             strings.ToLower(getOr(strings.TrimSpace(os.Getenv("AGENT_TOOL_MODE")), "auto")),
+		AgentToolTopK:             atoiOr(os.Getenv("AGENT_TOOL_TOP_K"), 12),
+		SkillSSLLabsEmail:         strings.TrimSpace(os.Getenv("SKILL_SSLLABS_EMAIL")),
+		SkillCalendars:            splitCSV(os.Getenv("SKILL_CALENDARS")),
+		SkillIMAPHost:             strings.TrimSpace(os.Getenv("SKILL_IMAP_HOST")),
+		SkillIMAPPort:             atoiOr(os.Getenv("SKILL_IMAP_PORT"), 993),
+		SkillIMAPUser:             os.Getenv("SKILL_IMAP_USER"),
+		SkillIMAPPassword:         os.Getenv("SKILL_IMAP_PASSWORD"),
+		SkillIMAPInsecure:         isTruthy(os.Getenv("SKILL_IMAP_INSECURE_SKIP_VERIFY")),
+		SkillSQLDatabases:         splitCSV(os.Getenv("SKILL_SQL_DATABASES")),
+		SkillExamplesSeeded:       !isFalsy(os.Getenv("SKILLS_INSTALL_EXAMPLES")),
+		AgentToolsPinned:          splitCSV(os.Getenv("AGENT_TOOLS_PINNED")),
+		ApprovalSkills:            splitCSV(os.Getenv("APPROVAL_SKILLS")),
+		ApprovalTimeoutSec:        atofOr(os.Getenv("APPROVAL_TIMEOUT_SEC"), 300),
+		ApprovalUnattended:        strings.ToLower(getOr(strings.TrimSpace(os.Getenv("APPROVAL_UNATTENDED")), "deny")),
+		ApprovalAllow:             strings.TrimSpace(os.Getenv("APPROVAL_ALLOW")),
+		SkillPrometheus:           splitCSV(os.Getenv("SKILL_PROMETHEUS")),
+		SkillPrometheusTok:        strings.TrimSpace(os.Getenv("SKILL_PROMETHEUS_TOKEN")),
+		SkillOpenAPI:              splitCSV(os.Getenv("SKILL_OPENAPI")),
+		ApprovalGrantTTLHours:     atofOr(os.Getenv("APPROVAL_GRANT_TTL_HOURS"), 12),
 		AutoMemoryExtract:         isTruthy(os.Getenv("AUTO_MEMORY_EXTRACT")),
 		AutoMemoryMaxFacts:        atoiOr(os.Getenv("AUTO_MEMORY_MAX_FACTS"), 5),
 		AutoMemoryMinAnswerLen:    atoiOr(os.Getenv("AUTO_MEMORY_MIN_ANSWER_LEN"), 80),
@@ -213,6 +266,7 @@ func Load() Config {
 	c.SchedulerDB = getOr(os.Getenv("SCHEDULER_DB"), dataDir+"/scheduler.sqlite3")
 	c.SkillSSHKnownHosts = getOr(os.Getenv("SKILL_SSH_KNOWN_HOSTS"), dataDir+"/ssh_known_hosts")
 	c.SkillWorkspaceDir = getOr(os.Getenv("SKILL_WORKSPACE_DIR"), dataDir+"/workspace")
+	c.SkillStateDB = getOr(os.Getenv("SKILL_STATE_DB"), dataDir+"/skills_state.sqlite3")
 	c.SkillWorkspaceMaxMB = atofOr(os.Getenv("SKILL_WORKSPACE_MAX_MB"), 100)
 	c.SkillGitHubToken = strings.TrimSpace(firstOf(os.Getenv("SKILL_GITHUB_TOKEN"), os.Getenv("GITHUB_TOKEN")))
 	c.NotifyTelegramChats = splitCSV(os.Getenv("NOTIFY_TELEGRAM_CHATS"))
@@ -279,10 +333,35 @@ func Load() Config {
 			c.OpenAIAPIMode = "chat_completions"
 		}
 	}
+	c.SkillOpenAPIAuth = openAPIPerName(c.SkillOpenAPI, "AUTH")
+	c.SkillOpenAPIBaseURL = openAPIPerName(c.SkillOpenAPI, "BASE_URL")
 	return c
 }
 
 // splitCSV splits a comma-separated env value into trimmed, non-empty entries.
+// openAPIPerName reads SKILL_OPENAPI_<NAME>_<suffix> for every API named in
+// SKILL_OPENAPI ("my-api" → SKILL_OPENAPI_MY_API_AUTH).
+func openAPIPerName(entries []string, suffix string) map[string]string {
+	out := map[string]string{}
+	for _, e := range entries {
+		name, _, ok := strings.Cut(e, "=")
+		name = strings.ToLower(strings.TrimSpace(name))
+		if !ok || name == "" {
+			continue
+		}
+		env := strings.Map(func(r rune) rune {
+			if (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+				return r
+			}
+			return '_'
+		}, strings.ToUpper(name))
+		if v := strings.TrimSpace(os.Getenv("SKILL_OPENAPI_" + env + "_" + suffix)); v != "" {
+			out[name] = v
+		}
+	}
+	return out
+}
+
 func splitCSV(v string) []string {
 	if strings.TrimSpace(v) == "" {
 		return nil

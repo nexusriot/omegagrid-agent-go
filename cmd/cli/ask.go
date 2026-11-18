@@ -38,6 +38,9 @@ func runAsk(args []string) {
 func runAskLocal(query, namespace string, sessionID, maxSteps int, stream, jsonOut bool) {
 	defer closeLocal()
 	svc := getLocal()
+	if svc.Agent.Approvals != nil {
+		svc.Agent.Approvals.Prompt = localApprovalPrompt
+	}
 
 	steps := resolveMaxSteps(maxSteps, localConfig().AgentMaxSteps)
 
@@ -103,6 +106,9 @@ func runAskRemote(query, namespace string, sessionID, maxSteps int, stream, json
 	if stream {
 		err := httpStream("/api/query/stream", body, func(event, data string) {
 			printSSEEvent(event, data, jsonOut)
+			if event == "approval_required" {
+				resolveRemoteApproval(data)
+			}
 		})
 		if err != nil {
 			fatalf("stream: %v", err)
@@ -142,6 +148,10 @@ func printStreamEvents(ch <-chan agent.Event, jsonOut bool) {
 			fmt.Println(green(ev.Answer))
 		case "error":
 			fmt.Fprintln(os.Stderr, yellow("error: "+ev.Error))
+		case "approval_resolved":
+			if ev.Decision != nil && !ev.Decision.Approved {
+				fmt.Fprintln(os.Stderr, yellow(fmt.Sprintf("    ✗ %s not approved (%s)", ev.Tool, ev.Decision.By)))
+			}
 		}
 	}
 }

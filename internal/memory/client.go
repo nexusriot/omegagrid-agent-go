@@ -85,6 +85,11 @@ func (c *Client) Close() error { return c.hist.close() }
 // Safe to call on every /health poll — the probe embeds a single short word.
 func (c *Client) EmbedHealthy() error { return c.vec.probeEmbed() }
 
+// Embed returns the embedding of text from the configured backend. The agent
+// uses it to rank skills against a query (tool retrieval); it bypasses the
+// vector store entirely.
+func (c *Client) Embed(text string) ([]float32, error) { return c.vec.embedClient.embed(text) }
+
 type Message struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`

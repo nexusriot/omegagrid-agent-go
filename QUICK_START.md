@@ -148,7 +148,7 @@ docker compose logs -f gateway
 ## 5. Verify
 
 ```bash
-# Health endpoint — should return {"ok":true,"version":"0.6.0", ...}
+# Health endpoint — should return {"ok":true,"version":"0.7.0", ...}
 curl -s http://localhost:8000/health | jq .
 
 # Web UI (chat, memory, skills, scheduler, activity, health)

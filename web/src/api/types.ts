@@ -27,6 +27,7 @@ export interface Skill {
   parameters: Record<string, SkillParam>
   body?: string
   kind?: 'builtin' | 'markdown' | 'remote'
+  requires_approval?: boolean
 }
 
 export interface SkillValidateResult {
@@ -237,9 +238,87 @@ export interface FinalEvent     { session_id: number; answer: string; meta: Quer
 // (401, network failure) use {"message": "..."}.
 export interface ErrorEvent     { error?: string; message?: string }
 
+export interface ApprovalRequest {
+  id: string
+  session_id: number
+  step: number
+  tool: string
+  args: Record<string, unknown>
+  why?: string
+  created_at: string
+  expires_at: string
+}
+export interface ApprovalDecision { approved: boolean; by?: string; reason?: string; scope?: string }
+
+export interface ApprovalRecord {
+  id: number
+  ts: number
+  session_id: number
+  step: number
+  tool: string
+  args: unknown
+  why?: string
+  approved: boolean
+  by: string
+  reason?: string
+  scope?: string
+  wait_ms: number
+}
+
+export interface ApprovalGrant { session_id: number; tool: string; expires_at: string }
+
+export interface RunRecord {
+  id: number
+  session_id: number
+  ts: number
+  duration_ms: number
+  query: string
+  namespace?: string
+  model: string
+  tool_mode: string
+  retrieval: string
+  offered: string[]
+  used: string[]
+  steps: number
+  llm_calls: number
+  llm_ms: number
+  tool_ms: number
+  prompt_tokens: number
+  completion_tokens: number
+  approval_wait_ms: number
+  unattended?: boolean
+  outcome: 'final' | 'fallback' | 'max_steps' | 'error' | 'cancelled'
+  error?: string
+}
+
+export interface ToolRunStats { tool: string; offered: number; used: number; used_not_offered: number }
+
+export interface RunStats {
+  since: number
+  runs: number
+  outcomes: Record<string, number>
+  avg_duration_ms: number
+  p95_duration_ms: number
+  avg_llm_calls: number
+  prompt_tokens: number
+  completion_tokens: number
+  approval_wait_ms: number
+  retrieval_runs: number
+  miss_rate: number
+  tools: ToolRunStats[]
+}
+export interface ApprovalEvent {
+  step: number
+  tool: string
+  approval: ApprovalRequest
+  decision?: ApprovalDecision
+}
+
 export type StreamEvent =
   | { event: 'thinking';    data: ThinkingEvent }
   | { event: 'tool_call';   data: ToolCallEvent }
   | { event: 'tool_result'; data: ToolResultEvent }
   | { event: 'final';       data: FinalEvent }
   | { event: 'error';       data: ErrorEvent }
+  | { event: 'approval_required'; data: ApprovalEvent }
+  | { event: 'approval_resolved'; data: ApprovalEvent }

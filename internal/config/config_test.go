@@ -1008,3 +1008,20 @@ func TestChatModelOverride(t *testing.T) {
 		})
 	}
 }
+
+func TestOpenAPIPerNameEnv(t *testing.T) {
+	t.Setenv("SKILL_OPENAPI", "github=https://x/spec.json, my-billing.v2=specs/b.yaml,broken,=nope")
+	t.Setenv("SKILL_OPENAPI_GITHUB_AUTH", "Bearer abc")
+	t.Setenv("SKILL_OPENAPI_MY_BILLING_V2_AUTH", "X-Api-Key: k")
+	t.Setenv("SKILL_OPENAPI_MY_BILLING_V2_BASE_URL", " https://billing.test/v2 ")
+	c := Load()
+	if len(c.SkillOpenAPI) != 4 {
+		t.Fatalf("entries %v", c.SkillOpenAPI)
+	}
+	if c.SkillOpenAPIAuth["github"] != "Bearer abc" || c.SkillOpenAPIAuth["my-billing.v2"] != "X-Api-Key: k" || len(c.SkillOpenAPIAuth) != 2 {
+		t.Fatalf("auth %v", c.SkillOpenAPIAuth)
+	}
+	if c.SkillOpenAPIBaseURL["my-billing.v2"] != "https://billing.test/v2" || len(c.SkillOpenAPIBaseURL) != 1 {
+		t.Fatalf("base %v", c.SkillOpenAPIBaseURL)
+	}
+}

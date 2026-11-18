@@ -205,6 +205,7 @@ func (o *OpenAIChat) post(ctx context.Context, path, label string, build func() 
 			return nil, fmt.Errorf("openai read body: %w", err)
 		}
 		if resp.StatusCode < 400 {
+			reportUsage(ctx, raw)
 			return raw, nil
 		}
 		if attempt < maxSelfHeal && o.healAfterError(resp.StatusCode, raw) {

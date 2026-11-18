@@ -7,6 +7,8 @@ import {
 import { toast } from 'sonner'
 import { fetchInvocations, fetchSkills, fetchSessions, replayInvocation } from '../api/client'
 import type { Invocation, InvocationFilter, Session } from '../api/types'
+import RunsView from '../components/RunsView'
+import ApprovalsView from '../components/ApprovalsView'
 
 function fmtTs(ts: number): string {
   return new Date(ts * 1000).toLocaleString()
@@ -147,7 +149,57 @@ function InvocationRow({ inv, onClick }: { inv: Invocation; onClick: () => void 
   )
 }
 
+type Tab = 'calls' | 'runs' | 'approvals'
+
 export default function Activity() {
+  const [tab, setTab] = useState<Tab>(() => {
+    try {
+      const t = localStorage.getItem('activity.tab')
+      if (t === 'runs' || t === 'approvals' || t === 'calls') return t
+    } catch { /* storage unavailable */ }
+    return 'calls'
+  })
+  const pick = (t: Tab) => {
+    setTab(t)
+    try { localStorage.setItem('activity.tab', t) } catch { /* ignore */ }
+  }
+  const tabs: { id: Tab; label: string }[] = [
+    { id: 'calls', label: 'Tool calls' },
+    { id: 'runs', label: 'Runs' },
+    { id: 'approvals', label: 'Approvals' },
+  ]
+  return (
+    <div className="flex h-full flex-col">
+      <header className="flex h-12 items-center gap-3 border-b border-surface-border px-5 shrink-0">
+        <History size={16} className="text-accent" />
+        <span className="text-sm font-semibold text-gray-300">Activity</span>
+        <nav className="ml-4 flex gap-1" role="tablist">
+          {tabs.map((t) => (
+            <button
+              key={t.id}
+              role="tab"
+              aria-selected={tab === t.id}
+              onClick={() => pick(t.id)}
+              className={[
+                'rounded-lg px-3 py-1 text-xs transition-colors',
+                tab === t.id ? 'bg-accent/15 text-accent' : 'text-gray-500 hover:text-gray-300',
+              ].join(' ')}
+            >
+              {t.label}
+            </button>
+          ))}
+        </nav>
+      </header>
+      <div className="min-h-0 flex-1">
+        {tab === 'calls' && <ToolCallsView />}
+        {tab === 'runs' && <RunsView />}
+        {tab === 'approvals' && <ApprovalsView />}
+      </div>
+    </div>
+  )
+}
+
+function ToolCallsView() {
   const [skill, setSkill]         = useState('')
   const [sessionId, setSessionId] = useState<number | ''>('')
   const [onlyErrors, setOnlyErrors] = useState(false)
@@ -185,15 +237,6 @@ export default function Activity() {
 
   return (
     <div className="flex h-full flex-col">
-      <header className="flex h-12 items-center gap-3 border-b border-surface-border px-5 shrink-0">
-        <History size={16} className="text-accent" />
-        <span className="text-sm font-semibold text-gray-300">Activity</span>
-        <div className="flex-1" />
-        {!isLoading && (
-          <span className="text-xs text-gray-600">{total} invocation{total !== 1 ? 's' : ''}</span>
-        )}
-      </header>
-
       {/* Filter bar */}
       <div className="flex flex-wrap items-center gap-2 border-b border-surface-border px-5 py-2 shrink-0">
         {/* Skill filter */}
@@ -236,6 +279,10 @@ export default function Activity() {
         >
           <XCircle size={11} /> Errors only
         </button>
+        <div className="flex-1" />
+        {!isLoading && (
+          <span className="text-xs text-gray-600">{total} invocation{total !== 1 ? 's' : ''}</span>
+        )}
       </div>
 
       {/* List */}

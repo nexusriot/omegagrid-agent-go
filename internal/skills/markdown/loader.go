@@ -48,7 +48,12 @@ type Skill struct {
 	method   string
 	timeout  float64
 	steps    []step
+	// approval is the frontmatter's requires_approval flag.
+	approval bool
 }
+
+// RequiresApproval reports the file's requires_approval flag.
+func (s *Skill) RequiresApproval() bool { return s.approval }
 
 // Steps returns the names of the skills this pipeline's steps call.
 func (s *Skill) Steps() []string {
@@ -383,6 +388,8 @@ type frontmatter struct {
 	Method      string                    `yaml:"method"`
 	Timeout     float64                   `yaml:"timeout"`
 	Steps       []step                    `yaml:"steps"`
+	// RequiresApproval makes the agent ask a human before running the skill.
+	RequiresApproval bool `yaml:"requires_approval"`
 }
 
 // parseFrontmatter splits a "---" delimited YAML header from the body. The
@@ -489,6 +496,7 @@ func Parse(content, source string) (*Skill, error) {
 		method:   method,
 		timeout:  timeout,
 		steps:    fm.Steps,
+		approval: fm.RequiresApproval,
 	}, nil
 }
 

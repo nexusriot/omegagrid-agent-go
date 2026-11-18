@@ -199,6 +199,14 @@ function SkillCard({ skill, onEdit }: { skill: Skill; onEdit: (name: string) => 
             <div className="flex items-center gap-2">
               <span className="font-mono text-sm font-semibold text-indigo-300">{skill.name}</span>
               <KindBadge kind={skill.kind} />
+              {skill.requires_approval && (
+                <span
+                  title="The agent asks for approval before running this skill"
+                  className="rounded px-1.5 py-0.5 text-[10px] font-medium bg-amber-500/15 text-amber-400"
+                >
+                  approval
+                </span>
+              )}
             </div>
             <div className="truncate text-xs text-gray-500">{skill.description}</div>
           </div>

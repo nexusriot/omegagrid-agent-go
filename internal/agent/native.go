@@ -93,6 +93,7 @@ func jsonSchemaType(t string) string {
 // map ("tool_call", "tool_calls" or "final"). data is nil when the reply
 // could not be understood at all; raw is the reply text for the debug log.
 func (s *Service) nextMove(ctx context.Context, state *runState) (data map[string]any, raw string, llmS float64, err error) {
+	ctx = state.llmContext(ctx)
 	if state.native {
 		tc := s.Chat.(llm.ToolChatClient)
 		comp, err := tc.CompleteTools(ctx, state.messages, state.toolSpecs)

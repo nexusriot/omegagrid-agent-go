@@ -17,7 +17,16 @@ import (
 type fakeTelegram struct {
 	mu   sync.Mutex
 	sent []string
-	srv  *httptest.Server
+	// calls records every API method with its main form value (text,
+	// callback answer, keyboard), for tests that look past sendMessage.
+	calls []string
+	srv   *httptest.Server
+}
+
+func (f *fakeTelegram) callLog() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.calls...)
 }
 
 func newFakeTelegram(t *testing.T) *fakeTelegram {
@@ -25,7 +34,14 @@ func newFakeTelegram(t *testing.T) *fakeTelegram {
 	f := &fakeTelegram{}
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		method := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
-		_ = r.ParseForm()
+		if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/") {
+			_ = r.ParseMultipartForm(8 << 20)
+		} else {
+			_ = r.ParseForm()
+		}
+		f.mu.Lock()
+		f.calls = append(f.calls, method+" "+r.FormValue("text")+r.FormValue("reply_markup"))
+		f.mu.Unlock()
 
 		switch method {
 		case "getMe":

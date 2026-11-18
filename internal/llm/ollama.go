@@ -83,6 +83,9 @@ func (o *OllamaChat) postChat(ctx context.Context, payload map[string]any) ([]by
 	if err != nil {
 		return nil, 0, fmt.Errorf("ollama read body: %w", err)
 	}
+	if resp.StatusCode < 400 {
+		reportUsage(ctx, raw)
+	}
 	return raw, resp.StatusCode, nil
 }
 

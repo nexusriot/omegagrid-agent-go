@@ -3,7 +3,7 @@
 ## 1. Overview
 
 OmegaGrid Agent Go is a pure Go rewrite of the omegagrid-agent platform.
-The gateway, agent loop, scheduler, Telegram bot, all 51 built-in skills, vector memory,
+The gateway, agent loop, scheduler, Telegram bot, all 62 built-in skills, vector memory,
 and conversation history are compiled into static Go binaries — no Python sidecar.
 A React web UI is served by a dedicated **frontend** nginx service.
 All source is self-contained in this repository, making
@@ -61,7 +61,13 @@ omegagrid-agent-go/
 │   ├── agent/
 │   │   ├── agent.go             #   Tool-calling loop (Run / RunStream); tool_calls batches + audit
 │   │   ├── native.go            #   Tool modes: native tool calling ↔ envelope mapping, auto fallback
+│   │   ├── toolindex.go         #   Skill ranking for tool retrieval (lexical + embeddings, rank fusion)
+│   │   ├── retrieval.go         #   Per-run skill selection, find_tools meta-tool
+│   │   ├── approval.go          #   Approval broker + gate for skills that need a human yes
+│   │   ├── approvalrules.go     #   APPROVAL_ALLOW rules, "approve for this session" grants
+│   │   ├── trace.go             #   Per-run trace (tools offered/used, LLM calls, tokens) → agent_runs
 │   │   └── extract.go           #   Opt-in auto-memory extraction
+│   ├── bookmark/skill.go        # Native bookmark skill (pages saved to vector memory)
 │   ├── bootstrap/
 │   │   ├── bootstrap.go         #   Single New(cfg) wires every service (gateway + cli)
 │   │   └── mcpclients.go        #   Remote MCP connection manager (parallel, retry, refresh)
@@ -74,7 +80,8 @@ omegagrid-agent-go/
 │   │   ├── memory.go            #   memory add/search/list/get/update/delete, namespaces, export/import
 │   │   ├── scheduler.go         #   scheduler task CRUD, run-now, run history
 │   │   ├── skills.go            #   skills list, playground invoke, markdown source get/validate/save/delete
-│   │   └── audit.go             #   GET /api/invocations, /invocations/{id}, /invocations/{id}/replay
+│   │   ├── audit.go             #   GET /api/invocations, /invocations/{id}, /invocations/{id}/replay
+│   │   └── runs.go              #   GET /api/runs, /runs/{id}, /runs/stats, /tools/rank
 │   ├── mcp/                     # Model Context Protocol (hand-rolled JSON-RPC 2.0, no SDK)
 │   │   ├── mcp.go               #   Shared envelope, Tool/Param types, ToolProvider interface
 │   │   ├── server.go            #   MCP server at POST /mcp — exposes skills as MCP tools
@@ -89,6 +96,7 @@ omegagrid-agent-go/
 │   │   ├── client.go            #   Public API — CreateSession / AddMemory / SearchMemory / ListMemories / GetMemory / DeleteMemory / AddInvocation / …
 │   │   ├── history.go           #   SQLite sessions + messages + usage aggregation (modernc.org/sqlite, no CGO)
 │   │   ├── audit.go             #   SQLite skill_invocations — AuditRecord / AuditFilter / record / list
+│   │   ├── runs.go              #   SQLite agent_runs (RunRecord, RunStats) + approval_log (ApprovalRecord)
 │   │   ├── vector.go            #   chromem-go store: dedup, namespaces, expiry, edit, export/import, index rebuild
 │   │   └── embeddings.go        #   Ollama (3-endpoint fallback) + OpenAI embeddings clients
 │   ├── observability/timing.go  # Mark-based timer (surfaces in RunResult.Meta)
@@ -103,7 +111,7 @@ omegagrid-agent-go/
 │   │   ├── client.go            #   Public API — List() / Execute() / Register(); wires registry
 │   │   ├── registry.go          #   Thread-safe sync.RWMutex skill map (context-aware executors, pipeline budget)
 │   │   ├── source.go            #   Markdown skill source: read / validate / save / delete
-│   │   ├── builtin/             #   Go implementations of 50 of the 51 built-in skills
+│   │   ├── builtin/             #   Go implementations of 61 of the 62 built-in skills
 │   │   │   ├── helpers.go       #     Local types (Skill/Param/Executor) + arg helpers
 │   │   │   ├── web.go           #     weather, http_request, web_scrape, http_health, ip_info
 │   │   │   ├── network.go       #     dns_lookup, ping_check, port_scan, whois_lookup
@@ -123,7 +131,20 @@ omegagrid-agent-go/
 │   │   │   ├── csvquery.go      #     csv_query
 │   │   │   ├── markdown.go      #     html_to_markdown
 │   │   │   ├── knowledge.go     #     wikipedia, currency_convert, github
-│   │   │   └── workspace.go     #     file_list, file_read, file_write, pdf_text
+│   │   │   ├── workspace.go     #     file_list, file_read, file_write, pdf_text
+│   │   │   ├── statedb.go       #     Shared SQLite file for stateful skills (SKILL_STATE_DB)
+│   │   │   ├── monitor.go       #     uptime_check, ssl_labs_grade, dns_propagation
+│   │   │   ├── calendar.go      #     calendar_ics (iCalendar parser + RRULE expansion)
+│   │   │   ├── imap.go          #     imap_search (minimal read-only IMAP4rev1 client)
+│   │   │   ├── todo.go          #     todo
+│   │   │   ├── sqlquery.go      #     sql_query (read-only PostgreSQL / SQLite)
+│   │   │   ├── sqlfiles.go      #     sql_query over CSV/TSV/JSONL (in-memory SQLite tables)
+│   │   │   ├── chart.go         #     chart_render (pure-Go PNG bar/line/pie)
+│   │   │   ├── yamlquery.go     #     yaml_query
+│   │   │   ├── prometheus.go    #     prometheus_query
+│   │   │   └── openapi.go       #     openapi (OpenAPI 3 / Swagger 2 spec → search/describe/call)
+│   │   ├── approval.go          #   APPROVAL_SKILLS patterns, NeedsApproval (pipelines inherit)
+│   │   ├── examples/            #   Bundled example pipelines (go:embed), installed into SKILLS_DIR
 │   │   ├── markdown/            #   Markdown skill loader + pipeline executor
 │   │   │   └── loader.go        #     YAML frontmatter parser, {{placeholder}} resolution
 │   │   └── netguard/            #   SSRF guard — vets every outbound skill dial after DNS
@@ -509,6 +530,75 @@ if MaxSteps exceeded:
   return "could not finish" fallback
 ```
 
+#### Tool retrieval (`toolindex.go`, `retrieval.go`)
+
+`selectTools` runs in `startSession` after the tool table is built. When
+`Service.ToolTopK > 0` and the catalogue has more than `ToolTopK` skills
+beyond `PinnedTools`, it ranks every non-pinned skill against the query plus
+the two previous user messages (`retrievalQuery`) with `ToolIndex.Rank`, and
+records the offered set in `runState.offered`: the top `ToolTopK`, the pinned
+skills, the three memory tools and `find_tools`. The prompt is built by
+`buildRetrievalPrompt`: the usual rule block with an empty skill section, then
+`retrievalAddendum` and the offered skills **at the end**, so the prefix is
+identical across runs. Native runs build `toolSpecs` from
+`offeredTools()`. `state.tools` still holds every skill, so a call by name to
+an unlisted skill executes normally.
+
+`ToolIndex.Rank` computes a lexical score per skill (`lexicalScore`: share of
+distinct query tokens found in the name, weight 2, or description/params,
+weight 1; stopwords dropped; 4+-char prefix matches) and, when
+`ToolIndex.Embed` works, the cosine of query vs. `toolDoc(skill)` embeddings.
+The two are fused by reciprocal rank (`1/(10+rank)` each; no lexical share for
+a zero lexical score), which keeps a noisy embedding model from drowning exact
+keyword hits. Skill embeddings are cached by `sha256(toolDoc)`; a dimension
+change clears the cache; an error pauses embedding for `embedBackoff` (2 min)
+and the run ranks lexically. `WarmToolIndex` embeds the catalogue at gateway
+start.
+
+`find_tools(query, k)` ranks the whole catalogue, returns name, description,
+parameters and the first 600 chars of a markdown body, and adds the hits to
+`offered` (rebuilding `toolSpecs` in native mode) under `runState.mu`, since it
+may run inside a parallel batch.
+
+`RankTools` (behind `GET /api/tools/rank`) ranks the catalogue exactly as a
+new run would, for tuning. `TestRetrievalEval` runs the queries in
+`testdata/retrieval_eval.json` through it with lexical ranking (no
+embeddings in CI — the floor every run falls back to) and requires one of
+each case's expected tools within the default top-K.
+
+#### Approval gate (`approval.go`)
+
+`runOne` asks `needsApproval(name, entry, args)` before executing: true when
+`Service.Approvals` is set and either the schema says `RequiresApproval` or
+`skills.Client.NeedsApprovalFor(name, args)` matches (`APPROVAL_SKILLS` names /
+`prefix*`, a markdown `requires_approval: true`, a pipeline with such a
+step at any depth, or the skill's own argument check — `openapi` gates every
+non-GET call and errs closed; a pipeline step calling an argument-checked
+skill gates the pipeline, since step args are templates). `awaitApproval` then:
+
+1. returns at once when `Approvals.preapproved` finds a matching allow-rule
+   (`AllowRule.Match`: every named arg must match its anchored regex and
+   contain none of `unsafeArgChars`) or an unexpired session grant for
+   (session, tool);
+2. for an `Unattended` run (scheduled prompt tasks) returns allow/deny from
+   `UnattendedApprove` without waiting;
+3. otherwise `Approvals.Open` registers an `ApprovalRequest` (random id,
+   expiry = now + timeout) and returns a `wait` func; the run emits
+   `approval_required` through `runState.emit` (set by `RunStream`; nil for
+   `Run`), blocks in `wait` on the decision channel, the expiry timer or the
+   run's context, then emits `approval_resolved`.
+
+`Approvals.Prompt` (set by the CLI's local mode) decides synchronously
+instead. A decision with `Scope: "session"` records a grant in `wait` (both
+paths), valid for `GrantTTL`. Every outcome, including rule / session /
+policy / timeout ones, is appended to `approval_log` with the wait time. A denied call is not executed: the tool result is `deniedResult`
+(`approval: denied` plus an instruction not to retry), the audit row carries
+`approval denied (<by>)`. `Resolve` delivers through a 1-buffered channel
+under the broker lock, so a decision racing the timeout never blocks.
+Consumers: the web UI (`ApprovalCard`), the Telegram bot (inline buttons;
+the callback checks the presser is authorized and the request's
+`telegram_chat_id` is this chat), `omega ask` and `/api/approvals`.
+
 #### Built-in tools
 
 | Tool | Purpose | Implementation |
@@ -786,7 +876,7 @@ in a single pass.  `openAIEmbeddings` uses Bearer authentication and parses
 
 ### 3.5 Skills (`internal/skills`)
 
-All 51 built-in skills run in-process inside the gateway binary via a thread-safe
+All 62 built-in skills run in-process inside the gateway binary via a thread-safe
 `Registry`.  The `skills.Client` wraps the registry with the public `List()`
 and `Execute()` API consumed by the agent loop and HTTP handlers.
 
@@ -813,7 +903,7 @@ parameter list) for the same reason.
 
 #### Built-in skills (`builtin/`)
 
-51 skills compiled directly into the gateway binary: 50 in `builtin/`, plus
+62 skills compiled directly into the gateway binary: 61 in `builtin/`, plus
 `skill_creator` (defined in `client.go`).  Local `Skill`/`Param` types are
 defined in `builtin/helpers.go` to avoid import cycles; `client.go` converts
 them to the top-level `skills.Skill` type via `toSkill()`.
@@ -838,6 +928,16 @@ them to the top-level `skills.Skill` type via `toSkill()`.
 | `markdown.go` | `html_to_markdown` |
 | `knowledge.go` | `wikipedia`, `currency_convert`, `github` |
 | `workspace.go` | `file_list`, `file_read`, `file_write`, `pdf_text` |
+| `monitor.go` | `uptime_check`, `ssl_labs_grade`, `dns_propagation` (history in `SKILL_STATE_DB` via `statedb.go`) |
+| `calendar.go` | `calendar_ics` — line unfolding, TZID / Outlook zones, RRULE (DAILY/WEEKLY/MONTHLY/YEARLY, INTERVAL, COUNT, UNTIL, BYDAY with ordinals, BYMONTHDAY, BYMONTH), EXDATE, RECURRENCE-ID overrides |
+| `imap.go` | `imap_search` — hand-rolled IMAP4rev1 over TLS: LOGIN, EXAMINE (read-only), UID SEARCH (UTF-8 literals), UID FETCH with `BODY.PEEK`; MIME text extraction |
+| `todo.go` | `todo` (table `todos` in `SKILL_STATE_DB`) |
+| `sqlquery.go` | `sql_query` — read-verb + single-statement check, then SQLite `mode=ro&query_only(1)` or a Postgres `READ ONLY` transaction with `statement_timeout` |
+| `chart.go` | `chart_render` — `image/draw` + `x/image/font/basicfont`, returned as `image_base64` so `ExtractAttachments` delivers it |
+| `yamlquery.go` | `yaml_query` — yaml.v3 decode to JSON shapes, then the `json_query` engine |
+| `sqlfiles.go` | `sql_query` `files` — CSV/TSV (BOM, `;` detection) and JSONL loaded into a named shared-cache in-memory SQLite DB (one connection), columns typed from their values, then `PRAGMA query_only` |
+| `prometheus.go` | `prometheus_query` — `/api/v1/query`, `query_range` (≤ 120 averaged points per series, optional line chart via the `chart.go` canvas), `alerts`, `targets`, `label/__name__/values`; plain HTTP client (operator-configured servers) |
+| `openapi.go` | `openapi` — yaml.v3 parse of OpenAPI 3.x / Swagger 2.0, local `$ref` resolution, operations indexed (cached 10 min); keyword + verb→method search; `call` validates params, path-escapes values, blocks credential headers, injects `SKILL_OPENAPI_<NAME>_AUTH`. `OpenAPINeedsApproval` is registered as the skill's argument check |
 
 Shared hardening (skill arguments come from the LLM, so treat them as
 attacker-influenced):
@@ -1448,6 +1548,16 @@ passes `r.Context()` to `Agent.RunContext`, so a client disconnect aborts the ru
 | `GET` | `/api/invocations` | `handleListInvocations` | Audit log — filter by skill, session, errors; paginated |
 | `GET` | `/api/invocations/{id}` | `handleGetInvocation` | Single audit record |
 | `POST` | `/api/invocations/{id}/replay` | `handleReplayInvocation` | Re-run skill with same args; writes a new `replay` row. Gated by `PLAYGROUND_DISABLED` and restricted to `kind=skill` rows |
+| `GET` | `/api/approvals` | `handleListApprovals` | Tool calls waiting for a human decision (`enabled:false` without a gate) |
+| `GET` | `/api/approvals/{id}` | `handleGetApproval` | One pending request; 404 once decided or expired |
+| `POST` | `/api/approvals/{id}` | `handleResolveApproval` | `{approved, reason?, by?, scope?}` (`scope: "session"` grants the tool for the rest of the session); 404 when already decided or expired |
+| `GET` | `/api/approvals/history` | `handleApprovalHistory` | Approval log — filter by session, tool, decider, denied only; paginated |
+| `GET` | `/api/approvals/grants` | `handleListGrants` | Active session grants and the configured allow-rules |
+| `DELETE` | `/api/approvals/grants` | `handleRevokeGrants` | Revoke one session's grants (`?session_id=`) or all |
+| `GET` | `/api/runs` | `handleListRuns` | Run traces — filter by session, outcome, tool used, days; paginated |
+| `GET` | `/api/runs/{id}` | `handleGetRun` | One run trace |
+| `GET` | `/api/runs/stats` | `handleRunStats` | Outcomes, p95 duration, tokens, approval wait, retrieval miss rate and per-tool offered/used counts over `days` (default 7) |
+| `GET` | `/api/tools/rank` | `handleRankTools` | `?q=` — the ranking tool retrieval would give a run with that query |
 | `POST` | `/api/scheduler/tasks` | `handleSchedulerCreate` | In-process scheduler store; the whole spec is validated up front by `scheduler.ValidateSpec` (cron, time zone, skill-or-prompt, retry bounds — 400 on any error) |
 | `GET` | `/api/scheduler/tasks` | `handleSchedulerList` | In-process scheduler store |
 | `GET` | `/api/scheduler/tasks/{id}` | `handleSchedulerGet` | In-process scheduler store |
@@ -2123,7 +2233,7 @@ POST /api/invocations/{id}/replay   → {"replayed_from":42,"skill":"weather","r
 #### Health
 
 ```
-GET /health → {"ok": true, "version": "0.6.0", "provider": "ollama",
+GET /health → {"ok": true, "version": "0.7.0", "provider": "ollama",
                "chat_base": "http://127.0.0.1:11434", "chat_model": "llama3:latest",
                "skills_dir": "/app/data/skills", "scheduler_db": "...",
                "embed_model": "nomic-embed-text", "embed_provider": "ollama",
@@ -2220,7 +2330,7 @@ which could hand two in-flight requests the same JSON-RPC id.
 - **SQLite via pure Go** — `modernc.org/sqlite` needs no CGO, simplifying
   cross-compilation and distroless deployment.
 - **Fast startup** — sub-second cold start vs Python's multi-second import chain.
-- **Single deploy unit** — one binary contains the gateway, all 51 built-in skills,
+- **Single deploy unit** — one binary contains the gateway, all 62 built-in skills,
   vector memory, history, and embeddings.  No sidecar to keep in sync.
 
 ### Why chromem-go instead of ChromaDB?

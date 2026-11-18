@@ -1,7 +1,7 @@
 # omegagrid-agent-go
 
 Pure Go rewrite of the [omegagrid-agent](https://github.com/nexusriot/omegagrid-agent) platform.
-The gateway, agent loop, scheduler, Telegram bot, all 51 built-in skills, vector memory, and conversation
+The gateway, agent loop, scheduler, Telegram bot, all 62 built-in skills, vector memory, and conversation
 history are compiled Go binaries — no Python sidecar.  A React web UI provides a browser
 interface for chat, memory, skills, and the scheduler.  All source is self-contained in this
 repository.
@@ -44,6 +44,8 @@ internal/
   config/               Env-driven configuration loader
   httpapi/              chi router + all REST handlers
     audit.go            GET /api/invocations, GET /api/invocations/{id}, POST …/replay
+    approvals.go        GET/POST /api/approvals[/{id}], history, session grants
+    runs.go             GET /api/runs, /api/runs/{id}, /api/runs/stats, /api/tools/rank
   llm/                  Ollama + OpenAI chat clients (chat_completions & responses), native tool calling
                         opencode.go reuses OpenAIChat for the opencode Zen relay
   mcp/                  MCP server (/mcp) + client for remote MCP servers (JSON-RPC 2.0)
@@ -51,6 +53,7 @@ internal/
     client.go           Public API — CreateSession / AddMemory / SearchMemory / …
     history.go          SQLite sessions + messages + usage stats (modernc.org/sqlite, no CGO)
     audit.go            SQLite skill_invocations table — record / get / list
+    runs.go             SQLite agent_runs (run traces, stats) + approval_log
     vector.go           chromem-go store: dedup, namespaces, expiry, edit, export/import
     embeddings.go       Ollama (3-endpoint fallback) + OpenAI embeddings clients
   observability/        Mark-based timer (surfaces in RunResult.Meta)
@@ -60,7 +63,7 @@ internal/
     client.go           Public API — List() / Execute() / ExecuteContext()
     source.go           Markdown skill source editing (validate / save / delete)
     registry.go         Thread-safe sync.RWMutex skill map
-    builtin/            Go implementations of 50 of the 51 built-in skills
+    builtin/            Go implementations of 61 of the 62 built-in skills
       web.go            weather, http_request, web_scrape, http_health, ip_info
       network.go        dns_lookup, ping_check, port_scan, whois_lookup
       recon.go          tls_probe, http_headers, banner_grab, ptr_lookup, email_auth
@@ -273,21 +276,23 @@ Coverage, by package:
 | `internal/observability` | 100% | |
 | `internal/skills/netguard` | 95% | dial policy, redirects, NAT64/6to4 translation |
 | `internal/search` | 94% | DuckDuckGo HTML parsing driven through a fake `http.RoundTripper` |
+| `internal/llm` | 92% | Ollama, OpenAI and opencode clients against `httptest`, including native tool calls in all three API shapes, token-usage reporting and cancellation during backoff |
 | `internal/mcp` | 91% | JSON and SSE transports, both directions; notifications, `list_changed` |
-| `internal/llm` | 91% | Ollama, OpenAI and opencode clients against `httptest`, including native tool calls in all three API shapes and cancellation during backoff |
-| `internal/skills/markdown` | 88% | |
-| `internal/bootstrap` | 87% | `New()` wires real stores; the MCP connection manager against a fake server that goes down, slows and changes its tools |
-| `internal/telegram` | 87% | handlers run against a fake Telegram API (`NewBotAPIWithAPIEndpoint`) |
-| `internal/scheduler` | 85% | two stores on one SQLite file, retries, time zones, prompt tasks, schema migration |
-| `internal/skills/builtin` | 84% | everything except `weather` and `ip_info` (hardcoded third-party URLs, no seam); the bwrap sandbox, traceroute (real ICMP error queue), WoL and subnet sweep run on loopback; SMTP and DNS against in-test servers; third-party APIs via base-URL seams |
-| `internal/agent` | 82% | the loop is driven end-to-end with scripted models, envelope and native |
-| `internal/skills` | 82% | `skill_creator` YAML output is loaded back and compared; the editor's source routes are covered from `internal/httpapi` |
-| `internal/httpapi` | 79% | router-level, real stores, scripted model, a fake embeddings server |
-| `internal/memory` | 69% | vector store with a deterministic fake embeddings client; session search/rename/delete and usage stats are exercised through `internal/httpapi` |
-| `cmd/cli` | 17% | the HTTP/parsing helpers and interspersed-flag parsing; the subcommands themselves call `os.Exit` |
+| `internal/scheduler` | 89% | two stores on one SQLite file, retries, time zones, prompt tasks, schema migration, the Telegram notice after a cron run |
+| `internal/agent` | 88% | the loop is driven end-to-end with scripted models, envelope and native; approval gate, allow-rules and session grants, run traces, tool retrieval (plus `TestRetrievalEval`), auto-memory extraction |
+| `internal/telegram` | 88% | handlers and approval buttons run against a fake Telegram API (`NewBotAPIWithAPIEndpoint`) |
+| `internal/bootstrap` | 88% | `New()` wires real stores; the MCP connection manager against a fake server that goes down, slows and changes its tools |
+| `internal/skills/markdown` | 87% | |
+| `internal/skills/examples` | 86% | every bundled pipeline parses and installs once |
+| `internal/skills` | 84% | `skill_creator` YAML output is loaded back and compared; argument-aware approval; the editor's source routes are covered from `internal/httpapi` |
+| `internal/skills/builtin` | 83% | everything except `weather` and `ip_info` (hardcoded third-party URLs, no seam); Prometheus, OpenAPI, IMAP and ICS calendars against local fakes; the bwrap sandbox, traceroute (real ICMP error queue), WoL and subnet sweep run on loopback; SMTP and DNS against in-test servers; third-party APIs via base-URL seams |
+| `internal/httpapi` | 80% | router-level, real stores, scripted model, a fake embeddings server; approvals, runs and tool ranking |
+| `internal/memory` | 74% | vector store with a deterministic fake embeddings client; run and approval logs; session search/rename/delete and usage stats are exercised through `internal/httpapi` |
+| `internal/bookmark` | 62% | |
+| `cmd/cli` | 61% | the commands run as a subprocess (`TestMain` re-exec) against an in-process gateway, remote and local mode |
 | `cmd/gateway`, `cmd/telegram-bot`, `cmd/migrate-vector` | 0% | `main()` wrappers over `internal/` — exercised by the e2e suite instead |
 
-About 1,320 Go tests and subtests (75% of statements), plus 25 end-to-end tests.
+About 1,420 Go tests and subtests (81% of statements), plus 27 end-to-end tests.
 
 `test/e2e` carries no coverage figure: it drives the gateway from outside the
 process, so nothing it exercises is attributed to the packages under test.
@@ -298,11 +303,11 @@ endpoints are hardcoded, so only their argument handling is covered.
 
 ## Versioning
 
-The current release is **0.6.0** — see [CHANGELOG.md](CHANGELOG.md). The
+The current release is **0.7.0** — see [CHANGELOG.md](CHANGELOG.md). The
 version is defined once, in `internal/version/version.go`, and reported by
 `/health` (`"version"`), the Health page, the MCP `initialize` handshake (both
 as server and as client), the gateway and bot startup logs, and
-`omega version`. Releases are tagged with the bare version (`0.6.0`). A
+`omega version`. Releases are tagged with the bare version (`0.7.0`). A
 release build can stamp a different value without editing the source:
 
 ```bash
@@ -378,7 +383,7 @@ and falls back to plain text when piped (so `omega ask … | jq` works).
 | Memory | `/ui/memory` | Semantic search, manual add (namespace, expiry), browse-all list with namespace filter, namespace / expiry badges, **edit** (text, metadata, expiry), delete, JSONL **export** (optionally with embeddings) and **import** |
 | Skills | `/ui/skills` | Browse all skills with parameter schemas and a builtin / markdown / remote badge; **skill playground** (▶ button) with pretty / raw / timing tabs; **markdown skill editor** (new / edit / delete) with live validation |
 | Scheduler | `/ui/scheduler` | Create tasks that run a skill or ask the agent, with time zone (the "Next:" preview is evaluated in it), retries, one-shot and Telegram chat; enable/disable, delete, **Run now**, per-task **run history**, pending-retry display |
-| Activity | `/ui/activity` | Skill/tool invocation audit log: filter by skill or session, errors-only toggle, JSON drawer, replay button. Auto-refreshes every 10 s |
+| Activity | `/ui/activity` | Three tabs. **Tool calls**: the skill/tool invocation audit log (filter by skill or session, errors-only, JSON drawer, replay). **Runs**: one row per agent run with outcome, tools used, LLM calls, tokens and duration, a 7-day summary (p95 latency, tokens, approval wait, retrieval miss rate, tools retrieval ranks too low). **Approvals**: every approval decision (who, how long it waited, rule / session / timeout), active session grants with revoke, configured allow-rules. Auto-refreshes every 10 s |
 | Health | `/ui/health` | Live gateway + provider status and the gateway version (auto-refreshes every 30 s) and a **usage** panel: queries and tool calls per hour/day over 24 h / 7 d / 30 d with errors highlighted, plus a top-skills table |
 
 ## What's in Go
@@ -401,7 +406,7 @@ Everything is compiled into the gateway binary (pure Go, no CGO, distroless runt
 - `VectorStore` — chromem-go cosine-similarity memory with SHA256 + semantic dedup (0.08 threshold); namespaces, expiry, in-place edits, export/import (see [Memory management API](#memory-management-api))
 - Embeddings clients — Ollama (3-endpoint fallback) + OpenAI
 
-**Built-in skills (51 total):**
+**Built-in skills (62, plus the native `bookmark`):**
 
 | Skill | Description |
 |---|---|
@@ -454,6 +459,17 @@ Everything is compiled into the gateway binary (pure Go, no CGO, distroless runt
 | `github` | Public repo facts, releases, issues (pull requests filtered out), pulls, or repository search; `SKILL_GITHUB_TOKEN` raises the rate limit |
 | `file_list` / `file_read` / `file_write` | Files in the agent's workspace (`SKILL_WORKSPACE_DIR`, default `DATA_DIR/workspace`) and nowhere else: paths are resolved through `os.Root`, so `..`, absolute paths and symlinks cannot leave it. Reads are chunked (≤ 256 KB), writes ≤ 1 MB each within a total quota (`SKILL_WORKSPACE_MAX_MB`) |
 | `pdf_text` | Text of a PDF from the workspace or a URL (≤ 20 MB), optionally a page range; scanned PDFs yield little text (no OCR) |
+| `uptime_check` | Check a URL (status, optional body text, latency limit) and **record** the result in `SKILL_STATE_DB`: uptime % over 24h/7d/30d, latency p50/p95, state since, recent history, and `changed` when up/down flipped since the last check — pair it with a scheduled task and `notify`. `action=history` reads, `action=forget` clears |
+| `ssl_labs_grade` | Qualys SSL Labs grade per endpoint (worst grade summarised) with protocol/HSTS/vulnerability warnings; uses cached assessments, polls a running one up to `wait_sec`. `SKILL_SSLLABS_EMAIL` switches to the registered v4 API |
+| `dns_propagation` | Resolve a record through 16 public resolvers worldwide; % matching `expected` (or the majority answer), per-resolver answers, distinct answer groups |
+| `calendar_ics` | Events from an iCalendar feed (https / webcal, a workspace `.ics`, or a name in `SKILL_CALENDARS`) for a window (default next 7 days): recurring events expanded (DAILY/WEEKLY/MONTHLY/YEARLY with INTERVAL, COUNT, UNTIL, BYDAY incl. `-1FR`, BYMONTHDAY), EXDATE and moved instances honoured, TZID and common Outlook zone names |
+| `imap_search` | Search one mailbox (`SKILL_IMAP_*`, implicit TLS) by sender, subject, text, unread and date; returns headers and optional plain-text excerpts. Strictly read-only (`EXAMINE` + `BODY.PEEK`: never marks mail read); credentials never reach the model |
+| `todo` | Persistent to-do list in `SKILL_STATE_DB`: add / list (open, done, all, overdue, today; by tag or text) / done / reopen / update / delete / clear_done, with due dates (`2026-11-20 15:00`, `tomorrow`, `+3d`), priority and tags |
+| `sql_query` | **Read-only** SQL against PostgreSQL / SQLite databases named in `SKILL_SQL_DATABASES`, a SQLite file in the workspace, or workspace **CSV / TSV / JSONL files** (`files: [...]`, up to 10): each file is loaded into an in-memory SQLite table named after it (`data/Orders 2025.csv` → `orders_2025`), columns typed INTEGER / REAL / TEXT from their values, so files can be joined and aggregated; `action=tables` for the schema. Enforced by the database (SQLite `mode=ro` + `query_only`, Postgres `READ ONLY` transaction with a statement timeout) as well as a single-statement / read-verb check. DSNs are never shown |
+| `chart_render` | Bar, line or pie chart (one or several series) rendered to PNG in pure Go and delivered as an image attachment (Telegram photo / web) |
+| `yaml_query` | `json_query`'s jq-style expressions over YAML (inline or a workspace file); multi-document files become an array; optional YAML output |
+| `prometheus_query` | PromQL against a server in `SKILL_PROMETHEUS`: `query` (instant; series sorted largest first), `range` (last `30m` / `6h` / `2d`, min/max/avg/last per series, ≤ 120 points each, `chart=true` adds a line-chart image), `alerts` (firing), `targets` (down targets with their scrape error), `metrics` (name search). Basic auth from `user:pass@` in the URL, or `SKILL_PROMETHEUS_TOKEN` |
+| `openapi` | Any REST API with an OpenAPI 3.x / Swagger 2.0 spec named in `SKILL_OPENAPI`: `operations` searches its endpoints by intent, `describe` shows an operation's parameters, body and response schema, `call` runs it (path/query/header params, JSON body; unknown or missing parameters are refused before the request). Credentials come from `SKILL_OPENAPI_<NAME>_AUTH` and are never shown to the model. **GET calls run freely; POST/PUT/PATCH/DELETE need approval** — so does a call whose operation cannot be resolved, and any pipeline step that calls `openapi` |
 
 **Native agent skills (registered directly into the agent's tool table):**
 
@@ -461,6 +477,7 @@ Everything is compiled into the gateway binary (pure Go, no CGO, distroless runt
 |---|---|
 | `schedule_task` | Create / list / delete / delete_all / enable / disable cron tasks against the Go scheduler. `cron_expr` is validated at creation time (UTC) — a malformed expression, or a date no calendar has (`0 0 30 2 *`), is rejected instead of creating a task that never fires. `args` may be an object or a JSON-object string. Pass `one_shot=true` for a one-time task that is disabled the moment it is claimed to run (e.g. a reminder at a specific time) |
 | `web_search` | DuckDuckGo HTML search (no API key); returns title / URL / snippet (a result with no snippet gets an empty one, never its neighbour's) |
+| `bookmark` | Save a page to vector memory (title and description fetched, plus the agent's summary, your note and tags; one entry per URL) and find it later by meaning; `search` / `list` / `delete` |
 
 Plus the tools every agent run gets: `vector_add` and `vector_search` (vector
 memory, see [Memory management API](#memory-management-api)) and
@@ -540,6 +557,92 @@ model that writes the envelope as text anyway is still understood. Each result
 goes back to the model tied to its call id. `meta.tool_mode` in every response
 says which mode ran.
 
+### Tool retrieval
+
+With 60+ skills (plus MCP tools and markdown skills) listing every one in every
+prompt costs tokens on each call and makes small models pick the wrong tool.
+When the catalogue has more than `AGENT_TOOL_TOP_K` (default 12) skills beyond
+the pinned ones, a run's prompt carries only:
+
+- the `AGENT_TOOL_TOP_K` skills ranked most relevant to the query (plus the
+  previous two user messages, so follow-ups keep their topic),
+- the pinned skills (`AGENT_TOOLS_PINNED`, default `web_search,schedule_task,skill_creator`),
+- `vector_add`, `vector_search`, `session_search`, and
+- **`find_tools(query)`**, which searches the whole catalogue and makes its
+  hits callable for the rest of the run (in native mode they are added to the
+  function list).
+
+Ranking fuses a lexical match (name weighted over description) with the
+cosine similarity of skill descriptions in the configured embeddings model, by
+reciprocal rank, so a weak embedding model cannot bury an exact keyword hit.
+Skill embeddings are cached by content hash and warmed at gateway start; if the
+embeddings backend fails, ranking is lexical for the next two minutes. The
+per-request skill list sits at the **end** of the system prompt, so the rule
+block before it stays byte-identical for prompt caching. Any skill can still be
+called by name even when it was not listed. `meta.tool_retrieval`
+(`embed+lexical` / `lexical` / `off`) and `meta.tools_offered` report what a
+run did. `AGENT_TOOL_TOP_K=0` lists every skill as before.
+
+To tune it: `GET /api/tools/rank?q=...` shows the ranking a run with that query
+would get (and which skills make the cut); the **Runs** tab of the Activity page
+reports the retrieval *miss rate* — runs that used a tool the prompt had not
+listed — and which tools were ranked too low. `internal/agent/testdata/retrieval_eval.json`
+is a regression set of queries and the tool each needs (`go test ./internal/agent -run TestRetrievalEval`);
+add a case whenever a query picks the wrong tools.
+
+### Approval gate
+
+Skills that act on the world wait for a human yes before they run:
+`shell_command`, `ssh_command` and `file_write` by default (`APPROVAL_SKILLS`,
+which takes names and `prefix*` patterns such as `github_*` for an MCP
+server's tools; `off` disables the list), any markdown skill whose frontmatter
+sets `requires_approval: true`, and any pipeline with a step that needs
+approval at any depth (so wrapping `shell_command` in a pipeline does not
+bypass the gate).
+
+When the agent calls one, the run pauses and:
+
+- the SSE stream emits `approval_required` (with the request: id, tool, args,
+  why, expiry), then `approval_resolved` with the decision;
+- the **web UI** shows an Approve / Deny card in the chat;
+- the **Telegram bot** posts the call with ✅ Approve / ❌ Deny / ✅ Approve for
+  this session buttons — only an authorized user, and only in the chat whose
+  run asked;
+- **`omega ask`** asks `[y]es / [N]o / [a]lways this session` on the terminal
+  (local mode, and remote `--stream`); without a terminal, local mode denies
+  and remote mode leaves it to the other approvers;
+- anything else can use `GET /api/approvals` and
+  `POST /api/approvals/{id}` `{"approved": true|false, "reason": "...", "scope": "once"|"session"}`.
+
+Two ways to skip the question without switching the gate off:
+
+- **Approve for this session** (`scope: "session"`): later calls to the same
+  tool in the same session run without asking until the grant expires
+  (`APPROVAL_GRANT_TTL_HOURS`, default 12). `GET /api/approvals/grants` lists
+  active grants; `DELETE /api/approvals/grants?session_id=N` revokes them.
+- **Allow-rules** (`APPROVAL_ALLOW`) pre-approve calls by their arguments:
+  `TOOL: ARG=REGEX [&& ARG=REGEX ...]`, rules separated by `;` (`\;` for a
+  literal one), e.g.
+  `shell_command: command=df( -h)?|uptime|free -m; ssh_command: host=web[0-9]+ && command=uptime`.
+  Each regex must match the **whole** value, and a value containing shell
+  metacharacters (`; & | $ < > ( ) { } * ? ! ~`, a backtick, a backslash or a newline)
+  never matches, so `uptime; rm -rf ~` is not covered by a rule for `uptime`.
+  Rules also apply to scheduled tasks, so a cron job can run `df -h` while
+  everything else stays denied.
+
+Every decision — including those made by a rule, a session grant, the
+unattended policy or the timeout — is written to the approval log
+(`GET /api/approvals/history`, the Activity page's **Approvals** tab) with who
+decided and how long the run waited.
+
+No decision within `APPROVAL_TIMEOUT_SEC` (default 300) is a denial. A denied
+call is not run; the model is told so and asked not to retry. Scheduled
+agent-prompt tasks have nobody to ask: they are denied unless
+`APPROVAL_UNATTENDED=allow`. The gate applies to agent runs only — the skill
+playground, scheduled skill tasks and the MCP server run what their caller
+explicitly invoked. `/api/skills` marks gated skills with
+`requires_approval: true` (an "approval" badge in the UI).
+
 **Markdown / pipeline skills:**
 Dynamic skills defined as `*.md` files in `SKILLS_DIR` (default `DATA_DIR/skills`).
 `skill_creator` writes new `.md` files and hot-registers them without a restart.
@@ -575,6 +678,23 @@ the playground by `PLAYGROUND_DISABLED`):
 
 Outbound skills (built-in and markdown `endpoint` steps) go through the
 `netguard` dial check — see [Security](#security).
+
+**Bundled examples.** On first start five ready-made pipelines are copied
+into `SKILLS_DIR` (`SKILLS_INSTALL_EXAMPLES=false` turns this off). They are
+ordinary markdown skills from then on: edit them freely; a deleted one is not
+reinstalled (a `.examples-installed` marker remembers).
+
+| Skill | Steps | Use |
+|---|---|---|
+| `domain_report` | `rdap_lookup`, `dns_lookup` ×2, `email_auth`, `tls_probe`, `http_headers` | One-shot domain audit with action items |
+| `site_check` | `uptime_check`, `http_timing`, `tls_probe` | Website health card |
+| `infra_digest` | `rss_fetch`, `uptime_check` | Daily digest for a scheduled agent task, delivered with `notify` |
+| `morning_briefing` | `calendar_ics`, `todo`, `weather` | Today's events, due to-dos and weather |
+| `dns_cutover_check` | `dns_propagation`, `tls_probe`, `http_health` | Verify a DNS migration |
+
+Try: *"every weekday at 8:00 Berlin time run morning_briefing for Berlin and
+send it to me"* — the agent creates a scheduled prompt task that runs the
+pipeline and delivers it with `notify`.
 
 ## MCP (Model Context Protocol)
 
@@ -923,6 +1043,23 @@ its API as privileged.
 
 ## Upgrade notes / behaviour changes
 
+Behaviour changes in 0.7.0 (upgrading from 0.6.x — the full list is in [CHANGELOG.md](CHANGELOG.md)):
+
+- **Approval gate on by default.** The agent now asks before running
+  `shell_command`, `ssh_command` and `file_write`, and scheduled agent-prompt
+  tasks that use them are denied. Set `APPROVAL_SKILLS=off` for the old
+  behaviour, or `APPROVAL_UNATTENDED=allow` to let scheduled tasks through.
+- **Tool retrieval on by default.** Runs see ~12 relevant skills plus
+  `find_tools` instead of the whole catalogue (`meta.tool_retrieval`).
+  `AGENT_TOOL_TOP_K=0` restores the full list.
+- Five example pipelines are installed into `SKILLS_DIR` on first start
+  (`SKILLS_INSTALL_EXAMPLES=false` to skip).
+- **Run traces and the approval log** are stored in the history database
+  (`agent_runs`, kept 90 days; `approval_log`, kept). The approval log holds
+  the arguments shown on the approval card — including `shell_command` /
+  `ssh_command` command lines, which the invocation audit log redacts — so put
+  `GATEWAY_API_TOKEN` in front of a gateway others can reach.
+
 Behaviour changes in 0.6.0 (upgrading from 0.5.x — the full list is in [CHANGELOG.md](CHANGELOG.md)):
 
 - `BOT_AUTH_ENABLED` now defaults to `true`. Set `BOT_ADMIN_ID`, or
@@ -1012,6 +1149,13 @@ which defaults to on, is turned off by `false`/`0`/`no`/`off`.
 | `AGENT_MAX_STEPS` | `25` | Maximum tool-call steps per agent run |
 | `AGENT_PARALLEL_TOOLS` | `false` | Allow the LLM to emit `tool_calls` batches that execute concurrently |
 | `AGENT_MAX_PARALLEL` | `4` | Max tool calls per `tool_calls` batch when `AGENT_PARALLEL_TOOLS=true` — both the concurrency limit and the batch-size cap. Extra calls in an oversized batch are dropped before execution and the model is told to re-issue them |
+| `AGENT_TOOL_TOP_K` | `12` | Tool retrieval: skills offered per run when the catalogue is larger (plus pinned ones and `find_tools`); `0` offers every skill. See [Tool retrieval](#tool-retrieval) |
+| `AGENT_TOOLS_PINNED` | `web_search,schedule_task,skill_creator` | Skills offered on every run regardless of ranking |
+| `APPROVAL_SKILLS` | `shell_command,ssh_command,file_write` | Skills that need a human yes before the agent runs them; names or `prefix*`; `off` disables. See [Approval gate](#approval-gate) |
+| `APPROVAL_TIMEOUT_SEC` | `300` | How long a paused call waits for a decision before it is denied |
+| `APPROVAL_UNATTENDED` | `deny` | `deny` or `allow` gated skills in scheduled agent-prompt tasks (no human to ask) |
+| `APPROVAL_ALLOW` | — | Allow-rules that pre-approve matching calls: `TOOL: ARG=REGEX [&& ARG=REGEX]`, `;`-separated. Whole-value match, shell metacharacters never match. See [Approval gate](#approval-gate) |
+| `APPROVAL_GRANT_TTL_HOURS` | `12` | How long "approve for this session" lasts |
 | `AGENT_TOOL_MODE` | `auto` | `auto` (native tool calling when the provider supports it, falling back to the JSON envelope once it refuses), `native` or `envelope`. See [Tool calling](#tool-calling) |
 | `AUTO_MEMORY_EXTRACT` | `false` | After each final answer, run a background LLM pass that distils the turn into durable facts and stores them in vector memory (tagged `source=auto-extract`). Existing SHA256 + cosine dedup applies. At most 2 passes run at once; extra passes are dropped |
 | `AUTO_MEMORY_MAX_FACTS` | `5` | Maximum facts stored per turn by auto-extraction |
@@ -1030,6 +1174,19 @@ which defaults to on, is turned off by `false`/`0`/`no`/`off`.
 | `SKILL_SSH_HOST_KEY_POLICY` | `accept-new` | `accept-new` (record a host's key on first contact, refuse a changed key), `strict` (only hosts already in the file) or `insecure` (no checking) |
 | `SKILL_WORKSPACE_DIR` | `{DATA_DIR}/workspace` | The one directory `file_list` / `file_read` / `file_write` / `pdf_text` / `csv_query` may use |
 | `SKILL_WORKSPACE_MAX_MB` | `100` | Total size the workspace may grow to through `file_write` |
+| `SKILL_STATE_DB` | `{DATA_DIR}/skills_state.sqlite3` | SQLite file for `uptime_check` history and the `todo` list |
+| `SKILL_SSLLABS_EMAIL` | — | Registered e-mail for the SSL Labs v4 API; unset uses the anonymous v3 API |
+| `SKILL_CALENDARS` | — | `name=https://…ics,name2=webcal://…` — calendars `calendar_ics` may read by name (the first is the default). Secret feed URLs stay out of chat history |
+| `SKILL_IMAP_HOST` / `SKILL_IMAP_PORT` | — / `993` | Mailbox for `imap_search` (implicit TLS) |
+| `SKILL_IMAP_USER` / `SKILL_IMAP_PASSWORD` | — | Its credentials (an app password); never shown to the model |
+| `SKILL_IMAP_INSECURE_SKIP_VERIFY` | `false` | Accept a self-signed IMAP certificate |
+| `SKILL_SQL_DATABASES` | — | `name=postgres://user:pw@host/db,name2=sqlite:/path/file.db` — databases `sql_query` may read (read-only). Workspace SQLite files need no entry |
+| `SKILL_PROMETHEUS` | — | `name=http://prometheus:9090,name2=https://user:pw@prom.example.com` — servers `prometheus_query` may query (the first is the default). Configured servers are reached even with `SKILL_BLOCK_PRIVATE_NETWORKS` |
+| `SKILL_PROMETHEUS_TOKEN` | — | Bearer token sent to Prometheus servers without `user:pass@` in their URL |
+| `SKILL_OPENAPI` | — | `name=https://api.example.com/openapi.json,name2=specs/billing.yaml` — APIs the `openapi` skill may call: a spec URL, an absolute path, or a workspace path (JSON or YAML) |
+| `SKILL_OPENAPI_<NAME>_AUTH` | — | Credentials for one API (`<NAME>` upper-cased, non-alphanumerics → `_`): `Bearer xyz` / `Basic …` (sent as `Authorization`) or `Header-Name: value` |
+| `SKILL_OPENAPI_<NAME>_BASE_URL` | — | Overrides the spec's server URL (needed when a file spec has a relative or no server) |
+| `SKILLS_INSTALL_EXAMPLES` | `true` | Copy the bundled example pipelines into `SKILLS_DIR` on first start |
 | `SKILL_GITHUB_TOKEN` | — (falls back to `GITHUB_TOKEN`) | Optional token for the `github` skill (higher rate limit); never shown to the model |
 | `NOTIFY_TELEGRAM_CHATS` | — | Chat ids `notify` may send to (uses `TELEGRAM_BOT_TOKEN`) |
 | `NOTIFY_TELEGRAM_DEFAULT_CHAT` | — | Chat used when the model names none (implicitly allowed) |

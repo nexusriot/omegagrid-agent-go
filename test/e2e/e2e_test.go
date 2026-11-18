@@ -429,6 +429,60 @@ func TestQueryStreamEmitsOrderedEvents(t *testing.T) {
 	}
 }
 
+// A gated skill (file_write) pauses the run until it is approved over
+// /api/approvals; the stream reports both ends, and a denial is not executed.
+func TestApprovalGate(t *testing.T) {
+	for _, approve := range []bool{true, false} {
+		name := fmt.Sprintf("e2e/approval-%v-%d.txt", approve, time.Now().UnixNano())
+		script(t,
+			fmt.Sprintf(`{"type":"tool_call","tool":"file_write","args":{"path":%q,"content":"gated"},"why":"save"}`, name),
+			`{"type":"final","answer":"done"}`,
+		)
+		decided := make(chan error, 1)
+		go func() {
+			deadline := time.Now().Add(10 * time.Second)
+			for time.Now().Before(deadline) {
+				status, raw := reqRaw(t, "GET", baseURL()+"/api/approvals", nil)
+				var body struct {
+					Pending []struct {
+						ID   string `json:"id"`
+						Tool string `json:"tool"`
+					} `json:"pending"`
+				}
+				if status == http.StatusOK && json.Unmarshal(raw, &body) == nil && len(body.Pending) > 0 {
+					if body.Pending[0].Tool != "file_write" {
+						decided <- fmt.Errorf("pending tool = %s", body.Pending[0].Tool)
+						return
+					}
+					st, b := req(t, "POST", baseURL()+"/api/approvals/"+body.Pending[0].ID, map[string]any{"approved": approve, "by": "e2e"})
+					if st != http.StatusOK {
+						decided <- fmt.Errorf("resolve: %d %v", st, b)
+						return
+					}
+					decided <- nil
+					return
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+			decided <- fmt.Errorf("no pending approval appeared")
+		}()
+		events := streamQuery(t, map[string]any{"query": "save a note"})
+		if err := <-decided; err != nil {
+			t.Fatal(err)
+		}
+		names := strings.Join(eventNames(events), ",")
+		if !strings.Contains(names, "tool_call,approval_required,approval_resolved,tool_result") {
+			t.Fatalf("approve=%v events = %s", approve, names)
+		}
+		st, body := req(t, "POST", baseURL()+"/api/skills/file_read/invoke", map[string]any{"args": map[string]any{"path": name}})
+		mustOK(t, st, body, "file_read")
+		res, _ := body["result"].(map[string]any)
+		if written := res["content"] == "gated"; written != approve {
+			t.Fatalf("approve=%v but file written=%v (%v)", approve, written, res)
+		}
+	}
+}
+
 // Binary skill output must arrive as an attachment while the heavy base64 stays
 // out of the model's context.
 func TestImageAttachmentReachesTheClient(t *testing.T) {

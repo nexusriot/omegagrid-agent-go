@@ -105,6 +105,9 @@ type Event struct {
 	Meta        map[string]any `json:"meta"`
 	Error       string         `json:"error"`
 	Attachments []Attachment   `json:"attachments,omitempty"`
+	// Approval / Decision accompany approval_required / approval_resolved.
+	Approval *ApprovalInfo     `json:"approval,omitempty"`
+	Decision *ApprovalDecision `json:"decision,omitempty"`
 }
 
 type queryRequest struct {

@@ -297,35 +297,12 @@ func firstNonEmpty(vals ...string) string {
 	return ""
 }
 
-// feedCharsetReader handles the encodings feeds actually declare besides
-// UTF-8: ASCII, ISO-8859-1 and Windows-1252 (byte → rune, with 1252's
-// 0x80-0x9F punctuation). Anything else is refused rather than garbled.
+// feedCharsetReader decodes a feed's declared encoding (any WHATWG label,
+// see decodeCharset); an unknown one is refused rather than garbled.
 func feedCharsetReader(label string, in io.Reader) (io.Reader, error) {
-	switch strings.ToLower(strings.TrimSpace(label)) {
-	case "utf-8", "utf8", "us-ascii", "ascii":
-		return in, nil
-	case "iso-8859-1", "latin1", "latin-1", "iso8859-1", "windows-1252", "cp1252":
-		raw, err := io.ReadAll(io.LimitReader(in, maxBodyBytes))
-		if err != nil {
-			return nil, err
-		}
-		var b bytes.Buffer
-		for _, c := range raw {
-			r := rune(c)
-			if c >= 0x80 && c <= 0x9f {
-				if m, ok := cp1252[c]; ok {
-					r = m
-				}
-			}
-			b.WriteRune(r)
-		}
-		return &b, nil
+	r, err := decodeCharset(label, io.LimitReader(in, maxBodyBytes))
+	if err != nil {
+		return nil, fmt.Errorf("unsupported feed encoding %q", label)
 	}
-	return nil, fmt.Errorf("unsupported feed encoding %q", label)
-}
-
-var cp1252 = map[byte]rune{
-	0x80: '€', 0x82: '‚', 0x83: 'ƒ', 0x84: '„', 0x85: '…', 0x86: '†', 0x87: '‡', 0x88: 'ˆ', 0x89: '‰',
-	0x8a: 'Š', 0x8b: '‹', 0x8c: 'Œ', 0x8e: 'Ž', 0x91: '\u2018', 0x92: '\u2019', 0x93: '\u201c', 0x94: '\u201d',
-	0x95: '•', 0x96: '–', 0x97: '—', 0x98: '˜', 0x99: '™', 0x9a: 'š', 0x9b: '›', 0x9c: 'œ', 0x9e: 'ž', 0x9f: 'Ÿ',
+	return r, nil
 }

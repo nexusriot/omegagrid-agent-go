@@ -11,11 +11,14 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
 	"github.com/nexusriot/omegagrid-agent-go/internal/config"
 	"github.com/nexusriot/omegagrid-agent-go/internal/skills/builtin"
+	"github.com/nexusriot/omegagrid-agent-go/internal/skills/examples"
 	"github.com/nexusriot/omegagrid-agent-go/internal/skills/markdown"
 	"github.com/nexusriot/omegagrid-agent-go/internal/skills/netguard"
 )
@@ -36,6 +39,9 @@ type Skill struct {
 	// Kind is "builtin", "markdown" (editable, from SKILLS_DIR) or "remote"
 	// (an MCP tool), filled in by List.
 	Kind string `json:"kind,omitempty"`
+	// RequiresApproval marks a skill the agent must not run without a human
+	// yes (see NeedsApproval), filled in by List.
+	RequiresApproval bool `json:"requires_approval,omitempty"`
 }
 
 // Client is the in-process skill manager.  Callers use the same List() and
@@ -43,12 +49,20 @@ type Skill struct {
 type Client struct {
 	reg       *Registry
 	skillsDir string
+
+	approvalMu sync.RWMutex
+	approval   []string // APPROVAL_SKILLS patterns
 }
 
 // New builds the skill registry from built-in skills and any *.md files in cfg.SkillsDir.
 func New(cfg config.Config) (*Client, error) {
 	reg := newRegistry()
 	c := &Client{reg: reg, skillsDir: cfg.SkillsDir}
+	if cfg.ApprovalSkills != nil {
+		c.SetApprovalPatterns(cfg.ApprovalSkills)
+	} else {
+		c.SetApprovalPatterns(DefaultApprovalSkills)
+	}
 
 	// Outbound policy for every skill that dials (http_request, port_scan,
 	// markdown endpoints, ...). Process-wide: the guard lives in the dialers.
@@ -57,6 +71,15 @@ func New(cfg config.Config) (*Client, error) {
 	registerBuiltins(reg, cfg)
 
 	reg.registerReserved(skillCreatorSchema(), builtin.Lift(skillCreatorFunc(cfg.SkillsDir, reg)))
+
+	// Ship the bundled pipeline examples into SKILLS_DIR once.
+	if cfg.SkillExamplesSeeded && cfg.SkillsDir != "" {
+		if written, err := examples.Install(cfg.SkillsDir); err != nil {
+			log.Printf("skills: installing example skills: %v", err)
+		} else if len(written) > 0 {
+			log.Printf("skills: installed example skills %v into %s", written, cfg.SkillsDir)
+		}
+	}
 
 	if err := c.loadMarkdownSkills(); err != nil {
 		return nil, fmt.Errorf("load markdown skills: %w", err)
@@ -92,7 +115,13 @@ func mdToSkill(ms markdown.SkillSchema) Skill {
 
 // List returns all registered skill schemas.  Called on every agent run so
 // hot-registered skills (skill_creator) are immediately visible.
-func (c *Client) List() ([]Skill, error) { return c.reg.list(), nil }
+func (c *Client) List() ([]Skill, error) {
+	list := c.reg.list()
+	for i := range list {
+		list[i].RequiresApproval = c.NeedsApproval(list[i].Name)
+	}
+	return list, nil
+}
 
 // Execute runs a skill by name with no cancellation.
 func (c *Client) Execute(name string, args map[string]any) (any, error) {
@@ -223,6 +252,41 @@ func registerBuiltins(reg *Registry, cfg config.Config) {
 	register(toSkill(builtin.FileReadSchema()), builtin.Lift(builtin.FileRead(ws)))
 	register(toSkill(builtin.FileWriteSchema()), builtin.Lift(builtin.FileWrite(ws)))
 	register(toSkill(builtin.PdfTextSchema()), builtin.PdfTextContext(ws, t))
+
+	// Monitoring
+	state := builtin.StateDB{Path: cfg.SkillStateDB}
+	register(toSkill(builtin.UptimeCheckSchema()), builtin.UptimeCheckContext(state))
+	register(toSkill(builtin.SslLabsGradeSchema()), builtin.SslLabsGradeContext(builtin.SslLabsConfig{Email: cfg.SkillSSLLabsEmail}, t))
+	register(toSkill(builtin.DnsPropagationSchema()), builtin.DnsPropagationContext())
+
+	// Productivity (bookmark is a native skill: it needs vector memory)
+	calNamed, calOrder := builtin.ParseNamedURLs(cfg.SkillCalendars)
+	register(toSkill(builtin.CalendarIcsSchema()), builtin.CalendarIcsContext(builtin.CalendarConfig{Named: calNamed, Order: calOrder, Workspace: ws}, t))
+	register(toSkill(builtin.ImapSearchSchema()), builtin.ImapSearchContext(builtin.ImapConfig{
+		Host: cfg.SkillIMAPHost, Port: cfg.SkillIMAPPort, User: cfg.SkillIMAPUser,
+		Password: cfg.SkillIMAPPassword, InsecureSkipVerify: cfg.SkillIMAPInsecure,
+	}))
+	register(toSkill(builtin.TodoSchema()), builtin.TodoContext(state))
+
+	// Data
+	sqlNamed, sqlOrder := builtin.ParseNamedURLs(cfg.SkillSQLDatabases)
+	register(toSkill(builtin.SqlQuerySchema()), builtin.SqlQueryContext(builtin.SqlConfig{Named: sqlNamed, Order: sqlOrder, Workspace: ws}))
+	register(toSkill(builtin.ChartRenderSchema()), builtin.Lift(builtin.ChartRender()))
+	register(toSkill(builtin.YamlQuerySchema()), builtin.Lift(builtin.YamlQuery(ws)))
+
+	// Integrations
+	promNamed, promOrder := builtin.ParseNamedURLs(cfg.SkillPrometheus)
+	register(toSkill(builtin.PrometheusQuerySchema()), builtin.PrometheusQueryContext(builtin.PrometheusConfig{
+		Named: promNamed, Order: promOrder, Token: cfg.SkillPrometheusTok,
+	}, t))
+	apiNamed, apiOrder := builtin.ParseNamedURLs(cfg.SkillOpenAPI)
+	apiCfg := builtin.OpenAPIConfig{
+		Specs: apiNamed, Order: apiOrder, Auth: cfg.SkillOpenAPIAuth, BaseURL: cfg.SkillOpenAPIBaseURL,
+		Workspace: ws, Timeout: time.Duration(t * float64(time.Second)),
+	}
+	register(toSkill(builtin.OpenAPISchema()), builtin.OpenAPIContext(apiCfg))
+	// GET is a read; any other method changes something and is gated.
+	reg.argApproval["openapi"] = builtin.OpenAPINeedsApproval(apiCfg)
 }
 
 func skillCreatorSchema() Skill {

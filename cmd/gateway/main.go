@@ -69,6 +69,8 @@ func main() {
 	// Expired memories (expires_at in the past) are hidden from search and
 	// listing at once; the janitor deletes them for good, hourly.
 	go svc.Memory.RunJanitor(baseCtx, time.Hour)
+	// Embed the skill catalogue for tool retrieval before the first query.
+	go svc.Agent.WarmToolIndex(baseCtx)
 
 	// Only the gateway runs scheduled tasks; bootstrap.New leaves the runner
 	// stopped so CLI local mode doesn't start a competing one.

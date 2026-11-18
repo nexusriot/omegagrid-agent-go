@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -15,6 +16,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/nexusriot/omegagrid-agent-go/internal/agent"
+	"github.com/nexusriot/omegagrid-agent-go/internal/bookmark"
 	"github.com/nexusriot/omegagrid-agent-go/internal/config"
 	"github.com/nexusriot/omegagrid-agent-go/internal/llm"
 	"github.com/nexusriot/omegagrid-agent-go/internal/mcp"
@@ -139,6 +141,7 @@ func New(cfg config.Config) (*Services, func(), error) {
 
 	schedSkill := &scheduler.ScheduleTaskSkill{Store: store}
 	searchSkill := search.NewWebSearchSkill()
+	bookmarkSkill := &bookmark.Skill{Store: mem, Timeout: time.Duration(cfg.SkillHTTPTimeout * float64(time.Second))}
 
 	native := map[string]agent.Skill{
 		"schedule_task": {
@@ -151,6 +154,12 @@ func New(cfg config.Config) (*Services, func(), error) {
 			Schema: SkillSchemaFromMap(searchSkill.SkillSchema()),
 			Execute: func(ctx context.Context, args map[string]any) (any, error) {
 				return searchSkill.ExecuteContext(ctx, args), nil
+			},
+		},
+		"bookmark": {
+			Schema: SkillSchemaFromMap(bookmarkSkill.SkillSchema()),
+			Execute: func(ctx context.Context, args map[string]any) (any, error) {
+				return bookmarkSkill.Execute(ctx, args), nil
 			},
 		},
 	}
@@ -185,6 +194,17 @@ func New(cfg config.Config) (*Services, func(), error) {
 		AutoMemoryExtract:      cfg.AutoMemoryExtract,
 		AutoMemoryMaxFacts:     cfg.AutoMemoryMaxFacts,
 		AutoMemoryMinAnswerLen: cfg.AutoMemoryMinAnswerLen,
+
+		Index:       &agent.ToolIndex{Embed: mem.Embed},
+		ToolTopK:    cfg.AgentToolTopK,
+		PinnedTools: cfg.AgentToolsPinned,
+
+		Approvals: &agent.Approvals{
+			Timeout:  time.Duration(cfg.ApprovalTimeoutSec * float64(time.Second)),
+			Rules:    approvalRules(cfg.ApprovalAllow),
+			GrantTTL: time.Duration(cfg.ApprovalGrantTTLHours * float64(time.Hour)),
+		},
+		UnattendedApprove: cfg.ApprovalUnattended == "allow",
 	}
 
 	// Prompt tasks run a whole agent query on each fire.
@@ -193,7 +213,7 @@ func New(cfg config.Config) (*Services, func(), error) {
 		if steps <= 0 {
 			steps = 25
 		}
-		res, err := ag.RunContext(ctx, agent.RunRequest{Query: prompt, MaxSteps: steps})
+		res, err := ag.RunContext(ctx, agent.RunRequest{Query: prompt, MaxSteps: steps, Unattended: true})
 		if err != nil {
 			return "", err
 		}
@@ -310,7 +330,8 @@ func sanitizeRemoteDescription(d string) string {
 // native names first, so a remote tool by one of these names would be
 // unreachable from the agent yet listed twice by tools/list.
 var nativeSkillNames = map[string]bool{
-	"schedule_task": true, "web_search": true, "vector_add": true, "vector_search": true, "session_search": true,
+	"schedule_task": true, "web_search": true, "bookmark": true, "find_tools": true,
+	"vector_add": true, "vector_search": true, "session_search": true,
 }
 
 func registerRemoteTool(sk *skills.Client, client *mcp.Client, server string, t mcp.Tool, native map[string]bool) error {
@@ -368,4 +389,19 @@ func parseMCPEntry(entry string) (name, url string, headers map[string]string, e
 		return "", "", nil, fmt.Errorf("empty url")
 	}
 	return name, url, headers, nil
+}
+
+// approvalRules parses APPROVAL_ALLOW. A bad rule set is logged and dropped
+// whole: the gate then asks as before, which is the safe direction.
+func approvalRules(spec string) []agent.AllowRule {
+	if spec == "" {
+		return nil
+	}
+	rules, err := agent.ParseAllowRules(spec)
+	if err != nil {
+		log.Printf("APPROVAL_ALLOW ignored: %v", err)
+		return nil
+	}
+	log.Printf("approval: %d allow-rule(s) loaded", len(rules))
+	return rules
 }

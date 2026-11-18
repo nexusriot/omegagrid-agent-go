@@ -1,10 +1,16 @@
 import { create } from 'zustand'
-import type { ToolCallEvent, ToolResultEvent, FinalEvent } from '../api/types'
+import type { ToolCallEvent, ToolResultEvent, FinalEvent, ApprovalEvent } from '../api/types'
 
 export interface StreamStep {
   step: number
   toolCall?: ToolCallEvent
   toolResult?: ToolResultEvent
+}
+
+export interface ApprovalItem {
+  event: ApprovalEvent
+  status: 'pending' | 'approved' | 'denied'
+  by?: string
 }
 
 export interface StreamState {
@@ -14,6 +20,7 @@ export interface StreamState {
   finalData: FinalEvent | null
   errorMsg: string | null
   abortFn: (() => void) | null
+  approvals: ApprovalItem[]
 }
 
 interface ChatStore {
@@ -28,6 +35,8 @@ interface ChatStore {
   addToolCall: (ev: ToolCallEvent) => void
   addToolResult: (ev: ToolResultEvent) => void
   setFinal: (ev: FinalEvent) => void
+  addApproval: (ev: ApprovalEvent) => void
+  resolveApprovalItem: (id: string, approved: boolean, by?: string) => void
   setStreamError: (msg: string) => void
   endStream: () => void
 
@@ -47,6 +56,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     finalData: null,
     errorMsg: null,
     abortFn: null,
+    approvals: [],
   },
 
   startStream: (abort, query) =>
@@ -58,6 +68,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         finalData: null,
         errorMsg: null,
         abortFn: abort,
+        approvals: [],
       },
     }),
 
@@ -100,6 +111,23 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       stream: { ...s.stream, finalData: ev },
     })),
 
+  addApproval: (ev) =>
+    set((s) => ({
+      stream: { ...s.stream, approvals: [...s.stream.approvals, { event: ev, status: 'pending' }] },
+    })),
+
+  resolveApprovalItem: (id, approved, by) =>
+    set((s) => ({
+      stream: {
+        ...s.stream,
+        approvals: s.stream.approvals.map((a) =>
+          a.event.approval.id === id && a.status === 'pending'
+            ? { ...a, status: approved ? 'approved' : 'denied', by }
+            : a,
+        ),
+      },
+    })),
+
   setStreamError: (msg) =>
     set((s) => ({
       stream: { ...s.stream, errorMsg: msg },
@@ -111,7 +139,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     const newSessionId = stream.finalData?.session_id
     set((s) => ({
       ...(newSessionId !== undefined ? { sessionId: newSessionId } : {}),
-      stream: { ...s.stream, isStreaming: false, pendingMessage: null, abortFn: null, steps: [] },
+      stream: { ...s.stream, isStreaming: false, pendingMessage: null, abortFn: null, steps: [], approvals: [] },
     }))
   },
 

@@ -381,6 +381,9 @@ func truncateUTF8(s string, n int) string {
 	return strings.ToValidUTF8(s, "")
 }
 
+// telegramAPIBase is the Bot API origin; tests point it at a fake.
+var telegramAPIBase = "https://api.telegram.org"
+
 func sendTelegram(token string, chatID int64, text string) {
 	text = truncateUTF8(text, 4096)
 	body, err := json.Marshal(map[string]any{"chat_id": chatID, "text": text})
@@ -388,7 +391,7 @@ func sendTelegram(token string, chatID int64, text string) {
 		log.Printf("telegram marshal error: %v", err)
 		return
 	}
-	endpoint := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token)
+	endpoint := fmt.Sprintf("%s/bot%s/sendMessage", telegramAPIBase, token)
 	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Post(endpoint, "application/json", bytes.NewReader(body))
 	if err != nil {

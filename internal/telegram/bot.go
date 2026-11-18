@@ -98,6 +98,10 @@ func (b *Bot) Run() {
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 30
 	for update := range b.api.GetUpdatesChan(u) {
+		if update.CallbackQuery != nil {
+			go b.handleCallback(update.CallbackQuery)
+			continue
+		}
 		if update.Message == nil {
 			continue
 		}
@@ -375,6 +379,8 @@ func (b *Bot) processAgentText(chatID int64, namespace, text string, askMode boo
 		lastEditMs int64
 		final      *Event
 		received   int
+		// approval message ids by approval id, to mark them resolved.
+		approvalMsgs = map[string]int{}
 	)
 	for ev := range events {
 		received++
@@ -384,6 +390,17 @@ func (b *Bot) processAgentText(chatID int64, namespace, text string, askMode boo
 			final = &evCopy
 		case "error":
 			final = &evCopy
+		case "approval_required":
+			if ev.Approval != nil {
+				approvalMsgs[ev.Approval.ID] = b.sendApprovalPrompt(chatID, ev.Approval)
+			}
+			acc = append(acc, ev)
+			b.editStatus(chatID, sent.MessageID, renderStatus(acc))
+		case "approval_resolved":
+			if ev.Approval != nil {
+				b.markApprovalResolved(chatID, approvalMsgs[ev.Approval.ID], ev.Approval, ev.Decision)
+			}
+			acc = append(acc, ev)
 		default:
 			acc = append(acc, ev)
 			now := time.Now().UnixMilli()
@@ -484,6 +501,14 @@ func renderStatus(events []Event) string {
 			lines = append(lines, fmt.Sprintf("🛠️ Calling %s%s", ev.Tool, brief))
 		case "tool_result":
 			lines = append(lines, fmt.Sprintf("✅ %s done (%.1fs)", ev.Tool, ev.ElapsedS))
+		case "approval_required":
+			lines = append(lines, fmt.Sprintf("🔐 Waiting for approval to run %s…", ev.Tool))
+		case "approval_resolved":
+			if ev.Decision != nil && ev.Decision.Approved {
+				lines = append(lines, fmt.Sprintf("🔓 %s approved", ev.Tool))
+			} else {
+				lines = append(lines, fmt.Sprintf("⛔ %s not approved", ev.Tool))
+			}
 		}
 	}
 	if len(lines) == 0 {

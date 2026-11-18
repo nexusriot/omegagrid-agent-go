@@ -29,10 +29,14 @@ type Registry struct {
 	// otherwise silently replace the real http_request for every caller, and
 	// skill_creator could overwrite — or delete — itself.
 	reserved map[string]bool
+	// argApproval decides per call for skills whose risk depends on their
+	// arguments (openapi: GET is a read, DELETE is not). Set at startup only.
+	argApproval map[string]func(args map[string]any) bool
 }
 
 func newRegistry() *Registry {
-	return &Registry{entries: make(map[string]entry), reserved: make(map[string]bool)}
+	return &Registry{entries: make(map[string]entry), reserved: make(map[string]bool),
+		argApproval: map[string]func(map[string]any) bool{}}
 }
 
 func (r *Registry) register(schema Skill, exec builtin.ContextExecutor) {

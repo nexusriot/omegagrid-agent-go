@@ -5,6 +5,7 @@ import { toast } from 'sonner'
 import SessionList from '../components/SessionList'
 import ChatBubble from '../components/ChatBubble'
 import ToolCard from '../components/ToolCard'
+import ApprovalCard from '../components/ApprovalCard'
 import { fetchMessages } from '../api/client'
 import { streamQuery } from '../api/stream'
 import { useChatStore } from '../store/chat'
@@ -14,7 +15,7 @@ export default function Chat() {
   const {
     sessionId,
     stream, startStream, addThinking, addToolCall, addToolResult,
-    setFinal, setStreamError, endStream,
+    setFinal, setStreamError, endStream, addApproval, resolveApprovalItem,
   } = useChatStore()
 
   const qc = useQueryClient()
@@ -84,6 +85,15 @@ export default function Chat() {
           case 'tool_call':   addToolCall(ev.data);        break
           case 'tool_result': addToolResult(ev.data);      break
           case 'final':       setFinal(ev.data);           break
+          case 'approval_required': addApproval(ev.data); break
+          case 'approval_resolved':
+            resolveApprovalItem(
+              ev.data.approval.id,
+              !!ev.data.decision?.approved,
+              [ev.data.decision?.by, ev.data.decision?.scope === 'session' ? 'whole session' : '']
+                .filter(Boolean).join(', ') || undefined,
+            )
+            break
           case 'error': {
             // Reading only .message made every gateway error undefined: the
             // error box stayed hidden and the sent question just vanished.
@@ -105,7 +115,7 @@ export default function Chat() {
     // in a single atomic Zustand update, so they are always consistent.
     startStream(() => ctrl.abort(), q)
   }, [input, sessionId, stream.isStreaming, addThinking, addToolCall, addToolResult,
-      setFinal, setStreamError, endStream, startStream, qc])
+      setFinal, setStreamError, endStream, startStream, qc, addApproval, resolveApprovalItem])
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -184,6 +194,9 @@ export default function Chat() {
             <div className="mb-4">
               {stream.steps.map((s) => (
                 <ToolCard key={s.step} step={s} />
+              ))}
+              {stream.approvals.map((a) => (
+                <ApprovalCard key={a.event.approval.id} item={a} />
               ))}
               {stream.steps.length === 0 && (
                 <div className="flex items-center gap-2 text-xs text-gray-600">

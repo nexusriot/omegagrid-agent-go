@@ -59,6 +59,10 @@ func newHistoryStore(path string) (*historyStore, error) {
 	// Added after the first release; the duplicate-column error is expected
 	// on every later start.
 	_, _ = db.Exec(`ALTER TABLE sessions ADD COLUMN title TEXT NOT NULL DEFAULT ''`)
+	if err := initTraceTables(db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	return &historyStore{db: db}, nil
 }
 

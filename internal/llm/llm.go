@@ -6,7 +6,10 @@
 // loop is responsible for parsing the JSON.
 package llm
 
-import "context"
+import (
+	"context"
+	"encoding/json"
+)
 
 // Message is a single chat turn. ToolCalls (on an assistant turn) and
 // ToolCallID / Name (on a role="tool" turn) are set only in native
@@ -43,4 +46,50 @@ func Complete(ctx context.Context, c ChatClient, messages []Message) (string, fl
 		return "", 0, err
 	}
 	return c.CompleteJSON(messages)
+}
+
+// Usage is the token count of one completion, when the backend reports it.
+type Usage struct {
+	PromptTokens     int64
+	CompletionTokens int64
+}
+
+type usageSinkKey struct{}
+
+// WithUsageSink returns a context whose completions report their token usage
+// to fn. The agent uses it to total a run's tokens without every client
+// method growing another return value.
+func WithUsageSink(ctx context.Context, fn func(Usage)) context.Context {
+	return context.WithValue(ctx, usageSinkKey{}, fn)
+}
+
+// reportUsage reads the token counts from a response body — OpenAI chat
+// completions (usage.prompt_tokens / completion_tokens), the Responses API
+// (usage.input_tokens / output_tokens) or Ollama (prompt_eval_count /
+// eval_count) — and hands them to ctx's sink, if it has one.
+func reportUsage(ctx context.Context, raw []byte) {
+	fn, _ := ctx.Value(usageSinkKey{}).(func(Usage))
+	if fn == nil {
+		return
+	}
+	var body struct {
+		Usage struct {
+			PromptTokens     int64 `json:"prompt_tokens"`
+			CompletionTokens int64 `json:"completion_tokens"`
+			InputTokens      int64 `json:"input_tokens"`
+			OutputTokens     int64 `json:"output_tokens"`
+		} `json:"usage"`
+		PromptEvalCount int64 `json:"prompt_eval_count"`
+		EvalCount       int64 `json:"eval_count"`
+	}
+	if json.Unmarshal(raw, &body) != nil {
+		return
+	}
+	u := Usage{
+		PromptTokens:     body.Usage.PromptTokens + body.Usage.InputTokens + body.PromptEvalCount,
+		CompletionTokens: body.Usage.CompletionTokens + body.Usage.OutputTokens + body.EvalCount,
+	}
+	if u.PromptTokens > 0 || u.CompletionTokens > 0 {
+		fn(u)
+	}
 }

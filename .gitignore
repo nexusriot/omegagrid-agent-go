@@ -36,3 +36,7 @@ data/
 
 # Frontend build artifacts (web/node_modules and web/dist are covered by web/.gitignore)
 *.tsbuildinfo
+
+# Local Claude Code / editor-tool config (per-machine)
+.claude/launch.json
+.claude/settings.local.json

@@ -226,7 +226,7 @@ func TestClientRegister(t *testing.T) {
 	}
 }
 
-// Every built-in is registered and reserved: 50 from builtin/ plus
+// Every built-in is registered and reserved: 61 from builtin/ plus
 // skill_creator. A skill added to builtin/ but not to registerBuiltins (or
 // the reverse) changes this number.
 func TestBuiltinInventory(t *testing.T) {
@@ -241,10 +241,12 @@ func TestBuiltinInventory(t *testing.T) {
 			n++
 		}
 	}
-	if n != 51 {
-		t.Fatalf("%d built-in skills registered, want 51", n)
+	if n != 62 {
+		t.Fatalf("%d built-in skills registered, want 62", n)
 	}
-	for _, name := range []string{"rss_fetch", "notify", "traceroute", "json_query", "github", "file_write", "pdf_text"} {
+	for _, name := range []string{"rss_fetch", "notify", "traceroute", "json_query", "github", "file_write", "pdf_text",
+		"uptime_check", "ssl_labs_grade", "dns_propagation", "calendar_ics", "imap_search", "todo",
+		"sql_query", "chart_render", "yaml_query", "prometheus_query", "openapi"} {
 		if !c.reg.isReserved(name) {
 			t.Errorf("%s is not reserved against markdown skills", name)
 		}

@@ -8,6 +8,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"maps"
@@ -140,6 +141,21 @@ type Service struct {
 	AutoMemoryExtract      bool
 	AutoMemoryMaxFacts     int
 	AutoMemoryMinAnswerLen int
+
+	// Tool retrieval: when the catalogue has more than ToolTopK skills (plus
+	// the pinned ones), a run's prompt lists only the ToolTopK skills Index
+	// ranks highest for the query, plus PinnedTools (nil = DefaultPinnedTools)
+	// and the find_tools meta-tool. ToolTopK <= 0 lists every skill.
+	Index       *ToolIndex
+	ToolTopK    int
+	PinnedTools []string
+
+	// Approvals gates skills that need a human yes (APPROVAL_SKILLS, or
+	// requires_approval in a markdown skill) before they run. nil = no gate.
+	Approvals *Approvals
+	// UnattendedApprove lets unattended runs (scheduled prompt tasks) run
+	// approval-gated skills (APPROVAL_UNATTENDED=allow); otherwise denied.
+	UnattendedApprove bool
 }
 
 // RunRequest is the input contract for both Run and RunStream.
@@ -152,6 +168,10 @@ type RunRequest struct {
 	// namespace, and it recalls from this namespace plus the shared default
 	// one. "" is the shared namespace.
 	Namespace string
+	// Unattended marks a run nobody watches (a scheduled prompt task): a
+	// skill that needs approval is denied, or allowed when the service's
+	// UnattendedApprove is set, instead of waiting for a human.
+	Unattended bool
 }
 
 // RunResult is what Run returns (mirrors the Python dict).
@@ -178,6 +198,9 @@ type Event struct {
 	Meta        map[string]any `json:"meta,omitempty"`
 	Error       string         `json:"error,omitempty"`
 	Attachments []Attachment   `json:"attachments,omitempty"`
+	// Approval / Decision accompany approval_required / approval_resolved.
+	Approval *ApprovalRequest  `json:"approval,omitempty"`
+	Decision *ApprovalDecision `json:"decision,omitempty"`
 }
 
 // Run executes the agent loop end-to-end and returns one final result.
@@ -188,11 +211,19 @@ func (s *Service) Run(req RunRequest) (*RunResult, error) {
 // RunContext is Run bound to ctx: once ctx is cancelled (the HTTP client
 // disconnected, the gateway is shutting down) the in-flight LLM call is
 // aborted and no further steps or tool calls are started.
-func (s *Service) RunContext(ctx context.Context, req RunRequest) (*RunResult, error) {
+func (s *Service) RunContext(ctx context.Context, req RunRequest) (res *RunResult, err error) {
 	state, err := s.startSession(ctx, req)
 	if err != nil {
 		return nil, err
 	}
+	defer func() {
+		outcome, steps := "error", 0
+		if res != nil {
+			outcome = outcomeOf(res.Meta)
+			steps, _ = res.Meta["step_count"].(int)
+		}
+		s.recordRun(state, outcome, steps, err)
+	}()
 
 	for step := 1; step <= req.MaxSteps; step++ {
 		if err := ctx.Err(); err != nil {
@@ -298,7 +329,7 @@ func (s *Service) RunContext(ctx context.Context, req RunRequest) (*RunResult, e
 
 	answer := "I could not finish within max_steps. Please refine the goal or increase max_steps."
 	_ = s.Memory.AddMessage(state.sid, "assistant", answer)
-	res := s.fallbackResult(state, answer, req.MaxSteps, false)
+	res = s.fallbackResult(state, answer, req.MaxSteps, false)
 	res.Meta["max_steps_hit"] = true
 	return res, nil
 }
@@ -330,6 +361,26 @@ func (s *Service) RunStream(ctx context.Context, req RunRequest, out chan<- Even
 		send(Event{Event: "error", Error: err.Error()})
 		return
 	}
+	var (
+		outcome  string
+		steps    int
+		traceErr error
+	)
+	defer func() { s.recordRun(state, outcome, steps, traceErr) }()
+	rawSend := send
+	send = func(ev Event) bool {
+		switch ev.Event {
+		case "final":
+			outcome = outcomeOf(ev.Meta)
+			steps, _ = ev.Meta["step_count"].(int)
+		case "error":
+			outcome, traceErr = "error", errors.New(ev.Error)
+		}
+		return rawSend(ev)
+	}
+	// Approval events come from inside tool execution, possibly from several
+	// batch goroutines at once; a channel send is safe from any of them.
+	state.emit = func(ev Event) { send(ev) }
 
 	for step := 1; step <= req.MaxSteps; step++ {
 		// Stop doing expensive LLM/tool work once the client is gone.
@@ -491,6 +542,23 @@ type runState struct {
 	// tool-calling API; toolSpecs is the tool table in that API's shape.
 	native    bool
 	toolSpecs []llm.ToolSpec
+
+	// Tool retrieval. offered is the set of tool names the model was shown
+	// (nil = all of them); find_tools adds to it mid-run. retrieval names the
+	// ranking mode ("embed+lexical", "lexical") or "" when it was off.
+	// mu guards offered and toolSpecs: find_tools may run in a parallel batch.
+	mu        sync.Mutex
+	offered   map[string]bool
+	retrieval string
+
+	// emit forwards an out-of-band event (approval_required) to a streaming
+	// consumer; nil for non-streaming runs.
+	emit func(Event)
+	// unattended runs (scheduled prompt tasks) have nobody to approve.
+	unattended     bool
+	telegramChatID *int64
+
+	trace runTrace // guarded by mu
 }
 
 func (s *Service) startSession(ctx context.Context, req RunRequest) (*runState, error) {
@@ -504,12 +572,15 @@ func (s *Service) startSession(ctx context.Context, req RunRequest) (*runState, 
 		sid = newSid
 	}
 	st := &runState{
-		ctx:       ctx,
-		namespace: req.Namespace,
-		sid:       sid,
-		timer:     timer,
-		timings:   map[string]float64{},
-		debug:     []string{},
+		trace:          runTrace{started: time.Now(), query: req.Query},
+		ctx:            ctx,
+		unattended:     req.Unattended,
+		telegramChatID: req.TelegramChatID,
+		namespace:      req.Namespace,
+		sid:            sid,
+		timer:          timer,
+		timings:        map[string]float64{},
+		debug:          []string{},
 	}
 
 	// Tail of prior conversation — loaded BEFORE the current query is stored,
@@ -658,10 +729,12 @@ func (s *Service) startSession(ctx context.Context, req RunRequest) (*runState, 
 	st.debug = append(st.debug, fmt.Sprintf("[init] tools=%v", keys(st.tools)))
 	st.debug = append(st.debug, fmt.Sprintf("[init] skills_count=%d", len(st.skillNames)))
 
-	systemPrompt := s.buildSystemPrompt(st.tools, st.skillNames)
+	// Tool retrieval: with a large catalogue only the skills relevant to
+	// this query go into the prompt; find_tools fetches the rest on demand.
+	systemPrompt := s.selectTools(ctx, st, req.Query, tail)
 	if _, ok := s.Chat.(llm.ToolChatClient); ok && s.nativeWanted() {
 		st.native = true
-		st.toolSpecs = toolSpecs(st.tools)
+		st.toolSpecs = toolSpecs(st.offeredTools())
 		systemPrompt += nativeAddendum
 	}
 	// Current time lets the LLM convert relative/local times ("at 3pm",
@@ -709,6 +782,12 @@ func (s *Service) buildMeta(st *runState, step int, fallback bool) map[string]an
 	}
 	if st.native {
 		out["tool_mode"] = "native"
+	}
+	out["tool_retrieval"] = nonempty(st.retrieval, "off")
+	if st.offered != nil {
+		st.mu.Lock()
+		out["tools_offered"] = len(st.offered)
+		st.mu.Unlock()
 	}
 	if fallback {
 		out["fallback"] = true
@@ -1266,7 +1345,17 @@ func (s *Service) runOne(state *runState, c batchCall) batchResult {
 	var result any
 	var execErr error
 	var dur time.Duration
-	if ok {
+	var denied *ApprovalDecision
+	if ok && s.needsApproval(c.Name, entry, c.Args) {
+		if d := s.awaitApproval(state, c); !d.Approved {
+			denied = &d
+		}
+	}
+	if denied != nil {
+		execErr = fmt.Errorf("approval denied (%s)", denied.By)
+		result = deniedResult(c.Name, *denied)
+	} else if ok {
+		state.addUsed(c.Name)
 		t0 := time.Now()
 		r, err := safeExecute(state.ctx, entry.Execute, c.Name, c.Args)
 		dur = time.Since(t0)

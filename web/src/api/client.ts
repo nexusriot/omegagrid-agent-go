@@ -5,6 +5,7 @@ import type {
   InvocationListResult, InvocationFilter, ReplayResult,
   MemoryNamespace, MemoryUpdateRequest, ImportReport,
   TaskRun, UsageStats, SkillValidateResult, SkillSaveResult,
+  ApprovalRequest, ApprovalRecord, ApprovalGrant, RunRecord, RunStats,
 } from './types'
 import { authHeaders, promptForToken } from './auth'
 
@@ -185,3 +186,40 @@ export const invokeSkill = (name: string, args: Record<string, unknown>) =>
     method: 'POST',
     body: JSON.stringify({ args }),
   })
+
+export const fetchApprovals = () =>
+  json<{ enabled: boolean; pending: ApprovalRequest[] }>('/api/approvals')
+
+export const resolveApproval = (id: string, approved: boolean, reason = '', scope: 'once' | 'session' = 'once') =>
+  json<{ id: string; approved: boolean; scope: string }>(`/api/approvals/${id}`, {
+    method: 'POST',
+    body: JSON.stringify({ approved, reason, by: 'web', scope }),
+  })
+
+export const fetchApprovalHistory = (f: { only_denied?: boolean; tool?: string; limit?: number; offset?: number } = {}) => {
+  const p = new URLSearchParams()
+  if (f.only_denied) p.set('only_denied', 'true')
+  if (f.tool)        p.set('tool', f.tool)
+  if (f.limit)       p.set('limit', String(f.limit))
+  if (f.offset)      p.set('offset', String(f.offset))
+  const qs = p.toString()
+  return json<{ approvals: ApprovalRecord[]; total: number }>(`/api/approvals/history${qs ? '?' + qs : ''}`)
+}
+
+export const fetchApprovalGrants = () =>
+  json<{ enabled: boolean; grants: ApprovalGrant[]; rules: string[] }>('/api/approvals/grants')
+
+export const revokeApprovalGrants = (sessionId?: number) =>
+  json<{ revoked: number }>(`/api/approvals/grants${sessionId ? `?session_id=${sessionId}` : ''}`, { method: 'DELETE' })
+
+export const fetchRuns = (f: { outcome?: string; tool?: string; limit?: number; offset?: number } = {}) => {
+  const p = new URLSearchParams()
+  if (f.outcome) p.set('outcome', f.outcome)
+  if (f.tool)    p.set('tool', f.tool)
+  if (f.limit)   p.set('limit', String(f.limit))
+  if (f.offset)  p.set('offset', String(f.offset))
+  const qs = p.toString()
+  return json<{ runs: RunRecord[]; total: number }>(`/api/runs${qs ? '?' + qs : ''}`)
+}
+
+export const fetchRunStats = (days = 7) => json<RunStats>(`/api/runs/stats?days=${days}`)
